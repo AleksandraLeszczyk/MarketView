@@ -551,49 +551,122 @@ def _prior_run_line(record: dict, selected_days: list[str]) -> str:
     return line
 
 
-def _render_already_tested(
-    personality: str, provider: str, model: str, dataset: str, days: list[str]
-) -> None:
-    """Flag an agent/model/dataset combination that is already queued or has
-    already been tested cleanly, so the same experiment isn't paid for twice.
-    Runs whose cycles hit LLM errors don't count as tested -- those are exactly
-    the ones worth running again."""
-    combo = (
+def _combo_label(combo: tuple[str, str, str, str]) -> str:
+    personality, provider, model, dataset = combo
+    return (
         f"**{AGENT_PERSONALITIES.get(personality, {}).get('label', personality)}** · "
         f"{provider}/{model} · {dataset}"
     )
-    pending = [
-        e for e in sim_experiments.list_experiments()
-        if e["status"] in sim_experiments.ACTIVE_STATUSES
-        and (e.get("config") or {}).get("personality") == personality
-        and (e.get("config") or {}).get("provider") == provider
-        and (e.get("config") or {}).get("model") == model
-        and e.get("dataset") == dataset
-    ]
-    if pending:
-        statuses = ", ".join(sorted({e["status"] for e in pending}))
-        st.warning(
-            f":material/schedule: {combo} is already in the pipeline "
-            f"({len(pending)} experiment(s): {statuses}).",
-        )
 
-    prior = sim_results.find_prior_runs(_runs(), personality, provider, model, dataset)
-    clean, degraded = prior["clean"], prior["degraded"]
-    if clean:
-        lines = "\n".join(f"- {_prior_run_line(r, days)}" for r in clean[:5])
-        more = f"\n- …and {len(clean) - 5} more" if len(clean) > 5 else ""
+
+def _render_already_tested(
+    combos: list[tuple[str, str, str, str]], days_by_dataset: dict[str, list[str]]
+) -> set[tuple[str, str, str, str]]:
+    """Flag agent/model/dataset combinations that are already queued or have
+    already been tested cleanly, so the same experiment isn't paid for twice.
+    Runs whose cycles hit LLM errors don't count as tested -- those are exactly
+    the ones worth running again. Returns the cleanly tested combinations."""
+    pending: dict[tuple[str, str, str, str], list[dict]] = {}
+    for exp in sim_experiments.list_experiments():
+        if exp["status"] not in sim_experiments.ACTIVE_STATUSES:
+            continue
+        config = exp.get("config") or {}
+        key = (config.get("personality"), config.get("provider"),
+               config.get("model"), exp.get("dataset"))
+        pending.setdefault(key, []).append(exp)
+
+    runs = _runs()
+    queued_lines, tested, tested_lines, degraded_lines = [], set(), [], []
+    for combo in combos:
+        personality, provider, model, dataset = combo
+        if combo in pending:
+            statuses = ", ".join(sorted({e["status"] for e in pending[combo]}))
+            queued_lines.append(
+                f"- {_combo_label(combo)} — {len(pending[combo])} experiment(s): {statuses}"
+            )
+        prior = sim_results.find_prior_runs(runs, personality, provider, model, dataset)
+        clean, degraded = prior["clean"], prior["degraded"]
+        if clean:
+            tested.add(combo)
+            days = days_by_dataset.get(dataset) or []
+            runs_text = "\n".join(
+                f"    - {_prior_run_line(r, days)}" for r in clean[:5]
+            )
+            more = f"\n    - …and {len(clean) - 5} more" if len(clean) > 5 else ""
+            tested_lines.append(
+                f"- {_combo_label(combo)} — {len(clean)} clean run(s)\n{runs_text}{more}"
+            )
+        elif degraded:
+            errors = sum(sim_results.cycle_error_count(r) for r in degraded)
+            degraded_lines.append(
+                f"- {_combo_label(combo)} — run {len(degraded)} time(s) before, but "
+                f"{errors} cycle(s) failed (LLM errors)"
+            )
+
+    if queued_lines:
         st.warning(
-            f":material/history: {combo} has **already been tested** — "
-            f"{len(clean)} clean run(s):\n{lines}{more}\n\n"
-            "Results are in the Results tab. Re-run only if you changed the prompt "
-            "or the settings below."
+            f":material/schedule: {len(queued_lines)} combination(s) already in the "
+            "pipeline:\n" + "\n".join(queued_lines)
         )
-    elif degraded:
-        errors = sum(sim_results.cycle_error_count(r) for r in degraded)
+    if tested_lines:
+        st.warning(
+            f":material/history: {len(tested_lines)} combination(s) have **already been "
+            "tested** cleanly — results are in the Results tab. Re-run only if you "
+            "changed the prompt or the settings below.\n" + "\n".join(tested_lines)
+        )
+    if degraded_lines:
         st.info(
-            f":material/error_outline: {combo} was run {len(degraded)} time(s) before, but "
-            f"{errors} cycle(s) failed (LLM errors) — those runs aren't a clean test."
+            ":material/error_outline: These combinations ran before but hit LLM errors, "
+            "so they aren't a clean test:\n" + "\n".join(degraded_lines)
         )
+    return tested
+
+
+def _render_dataset_scope(datasets: list) -> dict[str, dict]:
+    """Per-dataset trading days and symbols -- each selected dataset carries its
+    own, since days and symbols differ from dataset to dataset."""
+    scope: dict[str, dict] = {}
+    for ds in datasets:
+        with st.container(border=True):
+            st.markdown(f"**{ds.name}** — {ds.start} → {ds.end}")
+            col_days, col_symbols = st.columns(2)
+            day_options = ds.days or []
+            scope[ds.name] = {
+                "days": col_days.multiselect(
+                    "Trading day(s)", day_options, default=day_options[:1],
+                    key=f"sim_days_{ds.name}",
+                ),
+                "symbols": col_symbols.multiselect(
+                    "Symbols", ds.symbols, default=ds.symbols, key=f"sim_syms_{ds.name}",
+                ),
+            }
+    return scope
+
+
+def _render_model_picker() -> tuple[list[tuple[str, str]], dict[str, str]]:
+    """Models to test, across providers: returns [(provider, model), …] and the
+    API key per selected provider."""
+    providers = st.pills(
+        "Providers", list(PROVIDERS), selection_mode="multi",
+        default=[PROVIDERS[0]], key="sim_providers",
+    ) or []
+    model_choices: list[tuple[str, str]] = []
+    api_keys: dict[str, str] = {}
+    for provider in providers:
+        with st.container(border=True):
+            col_models, col_key = st.columns([2, 1])
+            picked = col_models.multiselect(
+                f"{provider} models",
+                models_for(provider, default=DEFAULT_AGENT_MODELS[provider]),
+                default=[DEFAULT_AGENT_MODELS[provider]],
+                key=f"sim_models_{provider}",
+            )
+            api_keys[provider] = col_key.text_input(
+                f"{provider} API key", value=_env_key(provider), type="password",
+                key=f"sim_key_{provider}",
+            )
+            model_choices += [(provider, model) for model in picked]
+    return model_choices, api_keys
 
 
 def render_simulate_tab() -> None:
@@ -605,20 +678,23 @@ def render_simulate_tab() -> None:
         st.info("Download a dataset first (Datasets tab).")
         return
 
-    ds = sim_data.get_dataset(st.selectbox("Dataset", [d.name for d in datasets]))
-    col_agent, col_days = st.columns(2)
-    personality = col_agent.selectbox(
-        "Agent", list(AGENT_PERSONALITIES),
-        format_func=lambda k: AGENT_PERSONALITIES[k]["label"],
+    st.caption(
+        "Pick several agents, models, and datasets — every combination is queued as "
+        "its own experiment."
     )
-    day_options = ds.days or []
-    days = col_days.multiselect("Trading day(s)", day_options, default=day_options[:1])
-    symbols = st.multiselect("Symbols", ds.symbols, default=ds.symbols)
-
-    col_provider, col_model, col_key = st.columns(3)
-    provider = col_provider.selectbox("Provider", list(PROVIDERS))
-    model = col_model.selectbox("Model", models_for(provider, default=DEFAULT_AGENT_MODELS[provider]))
-    api_key = col_key.text_input("API key", value=_env_key(provider), type="password")
+    names = [d.name for d in datasets]
+    selected_names = st.multiselect(
+        "Datasets", names, default=names[:1], key="sim_datasets"
+    )
+    by_name = {d.name: d for d in datasets}
+    dataset_scope = _render_dataset_scope([by_name[name] for name in selected_names])
+    personalities = st.multiselect(
+        "Agents", list(AGENT_PERSONALITIES),
+        default=list(AGENT_PERSONALITIES)[:1],
+        format_func=lambda k: AGENT_PERSONALITIES[k]["label"],
+        key="sim_agents",
+    )
+    model_choices, api_keys = _render_model_picker()
 
     with st.expander("Simulation settings"):
         col_cash, col_cycle, col_max = st.columns(3)
@@ -634,12 +710,15 @@ def render_simulate_tab() -> None:
             help="Grades every entry on the information available at entry time, plus an "
                  "overall strategy-adherence review.",
         )
-        judge_provider, judge_model, judge_api_key = provider, model, api_key
-        if run_judge and st.checkbox(
+        # Judging with the agent's own model is per-combination; a single
+        # explicit judge is shared by every experiment in the grid.
+        judge_override = run_judge and st.checkbox(
             "Judge with a different LLM than the agent", value=False,
-            help="By default the agent's own provider/model grades its run. Pick a "
+            help="By default each agent's own provider/model grades its run. Pick a "
                  "separate judge to avoid an agent marking its own homework.",
-        ):
+        )
+        judge_provider = judge_model = judge_api_key = None
+        if judge_override:
             col_jprov, col_jmodel, col_jkey = st.columns(3)
             judge_provider = col_jprov.selectbox("Judge provider", list(PROVIDERS))
             judge_model = col_jmodel.selectbox(
@@ -650,44 +729,84 @@ def render_simulate_tab() -> None:
                 "Judge API key", value=_env_key(judge_provider), type="password"
             )
 
-    _render_already_tested(personality, provider, model, ds.name, days)
+    combos = [
+        (personality, provider, model, name)
+        for name in selected_names
+        for personality in personalities
+        for provider, model in model_choices
+    ]
+    days_by_dataset = {name: scope["days"] for name, scope in dataset_scope.items()}
+    tested = _render_already_tested(combos, days_by_dataset)
+    skip_tested = bool(tested) and st.checkbox(
+        f"Skip the {len(tested)} combination(s) already tested cleanly", value=True,
+        key="sim_skip_tested",
+        help="Uncheck to run them again anyway — e.g. after editing a prompt.",
+    )
 
-    if sim_prompts.has_override(personality):
-        st.caption(":material/edit: This agent runs with its **modified** prompt (Agents tab).")
+    overridden = [p for p in personalities if sim_prompts.has_override(p)]
+    if overridden:
+        labels = ", ".join(AGENT_PERSONALITIES[p]["label"] for p in overridden)
+        st.caption(f":material/edit: Runs with a **modified** prompt (Agents tab): {labels}.")
     st.caption(
         ":material/monitoring: Langfuse export: "
         + ("enabled — cycles are traced and run scores registered." if obs.is_enabled()
            else "disabled (set LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY to enable).")
     )
 
-    if st.button("Run experiment", icon=":material/play_arrow:", type="primary",
-                 help="Adds the experiment to the pipeline; it starts as soon "
-                      "as a worker slot is free."):
-        if not days or not symbols:
-            st.error("Pick at least one trading day and one symbol.")
-        elif not api_key:
-            st.error(f"An API key for {provider} is required.")
-        elif run_judge and not judge_api_key:
+    to_queue = [c for c in combos if not (skip_tested and c in tested)]
+    with st.container(horizontal=True, vertical_alignment="center"):
+        run = st.button(
+            f"Run {len(to_queue)} experiment(s)", icon=":material/play_arrow:",
+            type="primary", disabled=not to_queue,
+            help="Adds every combination to the pipeline; each starts as soon "
+                 "as a worker slot is free.",
+        )
+        if combos:
+            st.caption(
+                f"{len(personalities)} agent(s) × {len(model_choices)} model(s) × "
+                f"{len(selected_names)} dataset(s) = {len(combos)} combination(s)"
+                + (f", {len(combos) - len(to_queue)} skipped" if skip_tested else "")
+            )
+        else:
+            st.caption("Pick at least one dataset, agent, and model.")
+
+    if run:
+        empty = [
+            name for name in selected_names
+            if not dataset_scope[name]["days"] or not dataset_scope[name]["symbols"]
+        ]
+        missing_keys = sorted({provider for provider, _ in model_choices
+                               if not api_keys.get(provider)})
+        if empty:
+            st.error(
+                "Pick at least one trading day and one symbol for: " + ", ".join(empty)
+            )
+        elif missing_keys:
+            st.error(f"An API key is required for: {', '.join(missing_keys)}.")
+        elif run_judge and judge_override and not judge_api_key:
             st.error(f"An API key for the judge provider ({judge_provider}) is required.")
         else:
-            sim_experiments.submit(ds.name, {
-                "personality": personality,
-                "provider": provider,
-                "model": model,
-                "api_key": api_key,
-                "symbols": symbols,
-                "days": days,
-                "starting_cash": float(starting_cash),
-                "cycle_minutes": int(cycle_minutes),
-                "max_cycles_per_day": int(max_cycles),
-                "system_prompt_override": sim_prompts.get_override(personality),
-                "run_judge": bool(run_judge),
-                "judge_provider": judge_provider,
-                "judge_model": judge_model,
-                "judge_api_key": judge_api_key,
-            })
+            for personality, provider, model, name in to_queue:
+                scope = dataset_scope[name]
+                sim_experiments.submit(name, {
+                    "personality": personality,
+                    "provider": provider,
+                    "model": model,
+                    "api_key": api_keys[provider],
+                    "symbols": scope["symbols"],
+                    "days": scope["days"],
+                    "starting_cash": float(starting_cash),
+                    "cycle_minutes": int(cycle_minutes),
+                    "max_cycles_per_day": int(max_cycles),
+                    "system_prompt_override": sim_prompts.get_override(personality),
+                    "run_judge": bool(run_judge),
+                    "judge_provider": judge_provider or provider,
+                    "judge_model": judge_model or model,
+                    "judge_api_key": judge_api_key or api_keys[provider],
+                })
             sim_experiments.tick(int(st.session_state.get(MAX_PARALLEL_KEY, 2)))
-            st.toast("Experiment queued", icon=":material/rocket_launch:")
+            st.toast(f"{len(to_queue)} experiment(s) queued",
+                     icon=":material/rocket_launch:")
             st.rerun()
 
 
