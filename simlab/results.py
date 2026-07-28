@@ -167,7 +167,10 @@ def store_signature() -> tuple:
 def breakdown(runs: list[dict], by: str) -> list[dict]:
     """Aggregate stored runs along one dimension: ``model`` (provider/model),
     ``dataset``, or ``agent`` (personality). Averages skip runs where a metric
-    is unavailable (no judge report, oracle ceiling of 0)."""
+    is unavailable (no judge report, oracle ceiling of 0). Each row also carries
+    ``best_run`` -- the identity (model, agent, dataset, run id) of the single
+    run behind ``best_return_pct``, since the other two dimensions are invisible
+    in a breakdown along the third."""
     if by not in ("model", "dataset", "agent"):
         raise ValueError(f"unknown breakdown dimension: {by}")
     groups: dict[str, dict] = {}
@@ -181,11 +184,21 @@ def breakdown(runs: list[dict], by: str) -> list[dict]:
         else:
             key = config.get("personality") or "?"
         group = groups.setdefault(
-            key, {"count": 0, "returns": [], "efficiencies": [], "scores": []}
+            key, {"count": 0, "returns": [], "efficiencies": [], "scores": [], "best": None}
         )
         group["count"] += 1
         if summary.get("return_pct") is not None:
-            group["returns"].append(float(summary["return_pct"]))
+            return_pct = float(summary["return_pct"])
+            group["returns"].append(return_pct)
+            if group["best"] is None or return_pct > group["best"]["return_pct"]:
+                group["best"] = {
+                    "return_pct": return_pct,
+                    "run_id": record.get("run_id") or "",
+                    "provider": config.get("provider") or "",
+                    "model": config.get("model") or "",
+                    "personality": config.get("personality") or "",
+                    "dataset": record.get("dataset") or "",
+                }
         if summary.get("profit_efficiency") is not None:
             group["efficiencies"].append(float(summary["profit_efficiency"]))
         judge = record.get("judge") or {}
@@ -201,6 +214,7 @@ def breakdown(runs: list[dict], by: str) -> list[dict]:
             "runs": g["count"],
             "avg_return_pct": _avg(g["returns"]),
             "best_return_pct": round(max(g["returns"]), 4) if g["returns"] else None,
+            "best_run": g["best"],
             "avg_profit_efficiency": _avg(g["efficiencies"]),
             "avg_judge_score": _avg(g["scores"]),
         }

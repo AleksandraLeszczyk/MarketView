@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import date, datetime, time, timedelta, timezone
+from html import escape
 from pathlib import Path
 
 import pandas as pd
@@ -697,6 +698,96 @@ def render_simulate_tab() -> None:
 _BREAKDOWN_DIMENSIONS = {"LLM model": "model", "Dataset": "dataset", "Agent": "agent"}
 
 
+# The breakdown table is hand-rolled HTML rather than st.dataframe: only a real
+# `title` attribute gives the best-return cell a hover tooltip naming the run
+# behind it (st.column_config's `help` only tooltips the column header).
+_BREAKDOWN_CSS = f"""
+<style>
+table.simlab-breakdown {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
+table.simlab-breakdown th, table.simlab-breakdown td {{
+    padding: 0.4rem 0.6rem; text-align: right; white-space: nowrap;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+}}
+table.simlab-breakdown th {{ font-weight: 600; opacity: 0.75; }}
+table.simlab-breakdown th:first-child, table.simlab-breakdown td:first-child {{ text-align: left; }}
+table.simlab-breakdown th[title] {{ cursor: help; text-decoration: underline dotted; }}
+table.simlab-breakdown .best {{ cursor: help; text-decoration: underline dotted; }}
+table.simlab-breakdown .up {{ color: {PALETTE["up"]}; }}
+table.simlab-breakdown .down {{ color: {PALETTE["down"]}; }}
+table.simlab-breakdown .none {{ opacity: 0.45; }}
+</style>
+"""
+
+
+def _best_run_tooltip(best: "dict | None") -> str:
+    """Which model / agent / dataset produced a group's best return."""
+    if not best:
+        return ""
+    provider, model = best.get("provider"), best.get("model")
+    lines = [
+        f"Model: {'/'.join(p for p in (provider, model) if p) or '?'}",
+        "Agent: " + AGENT_PERSONALITIES.get(best.get("personality"), {}).get(
+            "label", best.get("personality") or "?"),
+        f"Dataset: {best.get('dataset') or '(no dataset)'}",
+    ]
+    if best.get("run_id"):
+        lines.append(f"Run: {best['run_id']}")
+    return "\n".join(lines)
+
+
+def _render_breakdown_table(rows: list[dict], dim_label: str) -> None:
+    headers = [
+        (dim_label, ""),
+        ("Runs", ""),
+        ("Avg return", ""),
+        ("Best return", "Best single run in this group — hover the value for its "
+                        "model, agent, and dataset."),
+        ("Avg profit efficiency",
+         "Session return ÷ oracle best-round-trip ceiling, averaged over runs."),
+        ("Avg judge score", "LLM judge overall score (0–10), averaged over judged runs."),
+    ]
+    head = "".join(
+        f'<th title="{escape(help_text, quote=True)}">{escape(label)}</th>'
+        if help_text else f"<th>{escape(label)}</th>"
+        for label, help_text in headers
+    )
+    missing = '<span class="none">—</span>'
+
+    def _pct(value: "float | None") -> str:
+        if value is None:
+            return missing
+        return f'<span class="{"up" if value >= 0 else "down"}">{value:+.2f}%</span>'
+
+    body = []
+    for row in rows:
+        best = _pct(row["best_return_pct"])
+        tooltip = _best_run_tooltip(row.get("best_run"))
+        if tooltip and row["best_return_pct"] is not None:
+            # &#10; keeps the tooltip multi-line without a raw newline inside the
+            # attribute, which markdown would treat as a block break.
+            title = escape(tooltip, quote=True).replace("\n", "&#10;")
+            best = f'<span class="best" title="{title}">{best}</span>'
+        efficiency = row["avg_profit_efficiency"]
+        score = row["avg_judge_score"]
+        body.append(
+            "<tr>"
+            f"<td>{escape(str(row['group']))}</td>"
+            f"<td>{row['runs']}</td>"
+            f"<td>{_pct(row['avg_return_pct'])}</td>"
+            f"<td>{best}</td>"
+            f"<td>{f'{efficiency:.1%}' if efficiency is not None else missing}</td>"
+            f"<td>{f'{score:.1f}' if score is not None else missing}</td>"
+            "</tr>"
+        )
+    st.markdown(
+        _BREAKDOWN_CSS
+        + f'<table class="simlab-breakdown"><thead><tr>{head}</tr></thead>'
+        + f"<tbody>{''.join(body)}</tbody></table>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Hover a best return to see the run behind it.")
+
+
 def _breakdown_bar(labels: list[str], values: list[float], title: str, color: str,
                    tickformat: "str | None" = None) -> go.Figure:
     fig = go.Figure(go.Bar(x=labels, y=values, marker_color=color))
@@ -724,22 +815,7 @@ def render_results_tab() -> None:
         for row in rows:
             row["group"] = AGENT_PERSONALITIES.get(row["group"], {}).get(
                 "label", row["group"])
-    st.dataframe(
-        pd.DataFrame(rows),
-        hide_index=True,
-        column_config={
-            "group": dim_label,
-            "runs": "Runs",
-            "avg_return_pct": st.column_config.NumberColumn("Avg return", format="%+.2f%%"),
-            "best_return_pct": st.column_config.NumberColumn("Best return", format="%+.2f%%"),
-            "avg_profit_efficiency": st.column_config.NumberColumn(
-                "Avg profit efficiency", format="percent",
-                help="Session return ÷ oracle best-round-trip ceiling, averaged over runs."),
-            "avg_judge_score": st.column_config.NumberColumn(
-                "Avg judge score", format="%.1f",
-                help="LLM judge overall score (0–10), averaged over judged runs."),
-        },
-    )
+    _render_breakdown_table(rows, dim_label)
     col_eff, col_score = st.columns(2)
     eff_rows = [r for r in rows if r["avg_profit_efficiency"] is not None]
     if eff_rows:

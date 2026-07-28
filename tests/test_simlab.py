@@ -463,6 +463,26 @@ class TestBreakdown:
         # None-efficiency groups sort after scored ones.
         assert by_agent[-1]["group"] == "contrarian"
 
+    def test_best_run_names_the_winning_run(self):
+        rows = sim_results.breakdown(
+            [
+                self._run(model="gpt-a", dataset="ds1", personality="momentum", return_pct=2.0),
+                self._run(model="gpt-a", dataset="ds2", personality="breakout", return_pct=5.0),
+            ],
+            by="model",
+        )
+        best = rows[0]["best_run"]
+        assert rows[0]["best_return_pct"] == 5.0
+        assert best["return_pct"] == 5.0
+        assert (best["provider"], best["model"]) == ("openai", "gpt-a")
+        assert best["personality"] == "breakout"
+        assert best["dataset"] == "ds2"
+
+    def test_best_run_absent_without_returns(self):
+        rows = sim_results.breakdown([self._run(return_pct=None)], by="model")
+        assert rows[0]["best_return_pct"] is None
+        assert rows[0]["best_run"] is None
+
     def test_unknown_dimension_rejected(self):
         with pytest.raises(ValueError):
             sim_results.breakdown([], by="provider-only")
