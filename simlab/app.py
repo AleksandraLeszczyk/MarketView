@@ -18,7 +18,12 @@ import streamlit as st
 
 from agent_stonks import clock
 from agent_stonks import observability as obs
-from agent_stonks.agent import AGENT_PERSONALITIES, PERSONALITY_TOOLS, _dispatch_tool
+from agent_stonks.agent import (
+    AGENT_PERSONALITIES,
+    PERSONALITY_TOOLS,
+    _dispatch_tool,
+    selectable_personalities,
+)
 from agent_stonks.config import PALETTE
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
 from agent_stonks.market_hours import MARKET_TZ
@@ -140,7 +145,7 @@ def _render_tool_tester(personality: str) -> None:
 
 
 def render_agents_tab() -> None:
-    keys = list(AGENT_PERSONALITIES)
+    keys = selectable_personalities()
     personality = st.session_state.get("agents_selected", keys[0])
     cols = st.columns(len(keys))
     for col, key in zip(cols, keys):
@@ -689,8 +694,8 @@ def render_simulate_tab() -> None:
     by_name = {d.name: d for d in datasets}
     dataset_scope = _render_dataset_scope([by_name[name] for name in selected_names])
     personalities = st.multiselect(
-        "Agents", list(AGENT_PERSONALITIES),
-        default=list(AGENT_PERSONALITIES)[:1],
+        "Agents", selectable_personalities(),
+        default=selectable_personalities()[:1],
         format_func=lambda k: AGENT_PERSONALITIES[k]["label"],
         key="sim_agents",
     )

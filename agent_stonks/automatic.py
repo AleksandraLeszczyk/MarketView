@@ -53,6 +53,7 @@ from .agent import (
     breakout_preconditions,
     run_agent_cycle,
     run_premarket_session,
+    selectable_personalities,
 )
 from .config import AGENT_CYCLE_SEC, AGENT_MAX_TOOL_ITERS
 from .decisions import DecisionTracker
@@ -63,12 +64,12 @@ AUTOMATIC_KEY = "automatic"
 AUTOMATIC_LABEL = "Automatic (regime-adaptive orchestrator)"
 AUTOMATIC_AVATAR = "Multiavatar-18fd00dfa76e2785b7.png"
 
-# Strategies the regime cycle can choose between -- every tradeable intraday
-# personality. The Premarket Analyst is excluded: it is not a regime call, the
-# orchestrator activates it deterministically whenever the session hasn't
-# started (see `_automatic_loop`).
+# Strategies the regime cycle can choose between -- every enabled tradeable
+# intraday personality. The Premarket Analyst is excluded: it is not a regime
+# call, the orchestrator activates it deterministically whenever the session
+# hasn't started (see `_automatic_loop`).
 SELECTABLE_STRATEGIES: list[str] = [
-    key for key in AGENT_PERSONALITIES if key != PREMARKET_PERSONALITY
+    key for key in selectable_personalities() if key != PREMARKET_PERSONALITY
 ]
 
 # Regime vocabulary the orchestrator classifies into. Free-text reasoning carries

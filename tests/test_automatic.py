@@ -1,7 +1,11 @@
 import json
 from types import SimpleNamespace
 
-from agent_stonks.agent import _TOOL_STAND_DOWN, run_agent_cycle
+from agent_stonks.agent import (
+    DISABLED_PERSONALITIES,
+    _TOOL_STAND_DOWN,
+    run_agent_cycle,
+)
 from agent_stonks.automatic import (
     AUTOMATIC_KEY,
     REGIME_TOOLS,
@@ -202,10 +206,12 @@ class TestRunRegimeCycle:
         # itself selectable.
         assert AUTOMATIC_KEY not in SELECTABLE_STRATEGIES
         assert "momentum" in SELECTABLE_STRATEGIES
-        assert "smart_money" in SELECTABLE_STRATEGIES
+        assert "breakout" in SELECTABLE_STRATEGIES
         # Premarket is activated deterministically before the open, never by
         # the regime cycle.
         assert "premarket" not in SELECTABLE_STRATEGIES
+        # Switched-off personalities are never activated either.
+        assert not DISABLED_PERSONALITIES & set(SELECTABLE_STRATEGIES)
         enum = _TOOL_STAND_DOWN["function"]["parameters"]["properties"]["reasoning"]
         assert enum["type"] == "string"
 

@@ -17,6 +17,7 @@ from .agent import (
     DEFAULT_PERSONALITY,
     PREMARKET_PERSONALITY,
     launch_agent,
+    selectable_personalities,
     stop_agent,
 )
 from .automatic import AUTOMATIC_AVATAR, AUTOMATIC_KEY, AUTOMATIC_LABEL, launch_automatic
@@ -1581,7 +1582,7 @@ def _agent_panel(
     with st.expander("LLM", expanded=True):
         # Automatic first: it's the regime-adaptive orchestrator that picks and
         # switches between the individual strategies on its own.
-        personality_keys = [AUTOMATIC_KEY, *AGENT_PERSONALITIES.keys()]
+        personality_keys = [AUTOMATIC_KEY, *selectable_personalities()]
         personality = st.selectbox(
             "Personality",
             personality_keys,

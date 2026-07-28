@@ -1079,6 +1079,17 @@ DEFAULT_PERSONALITY = "momentum"
 # deterministically whenever the session hasn't started.
 PREMARKET_PERSONALITY = "premarket"
 
+# Personalities that stay wired (prompt, tools, avatar, past run labels) but are
+# switched off: not offered in the app or SimLab, and never picked by the
+# Automatic orchestrator. Re-enabling one is a one-line change here.
+DISABLED_PERSONALITIES: frozenset[str] = frozenset({"smart_money"})
+
+
+def selectable_personalities() -> list[str]:
+    """Personality keys a user (or the orchestrator) may choose, in registry order."""
+    return [key for key in AGENT_PERSONALITIES if key not in DISABLED_PERSONALITIES]
+
+
 _TOOL_GET_QUOTE = {
     "type": "function",
     "function": {
