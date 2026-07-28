@@ -1,4 +1,4 @@
-"""SimLab Streamlit UI: agents / datasets / simulate.
+"""SimLab Streamlit UI: agents / datasets / simulate / results.
 
 Run with ``streamlit run sim_main.py``. Kept separate from the live dashboard
 (``main.py``) -- this app never opens a stream or touches the live tape; it
@@ -11,6 +11,7 @@ import os
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -22,7 +23,7 @@ from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_f
 from agent_stonks.market_hours import MARKET_TZ
 
 from . import data as sim_data
-from . import judge as sim_judge
+from . import experiments as sim_experiments
 from . import prompts as sim_prompts
 from . import results as sim_results
 from .engine import SimulationConfig, SimulationEngine
@@ -38,6 +39,21 @@ _UNTESTABLE_TOOLS = {"submit_decision", "set_tactics", "stand_down"}
 
 def _env_key(provider: str) -> str:
     return os.getenv(ENV_KEYS.get(provider, ""), "")
+
+
+@st.cache_data(show_spinner=False)
+def _load_runs(signature: tuple) -> list[dict]:
+    # `signature` is unused on purpose: it is the cache key, so the store is
+    # re-read exactly when a run file is added, changed, or deleted. It must
+    # not be underscore-prefixed -- Streamlit excludes those from the key.
+    return sim_results.list_runs()
+
+
+def _runs() -> list[dict]:
+    """Stored run records, re-read only when the run store actually changes.
+    Full records carry decisions and agent logs, so parsing every one of them
+    on every rerun adds up."""
+    return _load_runs(sim_results.store_signature())
 
 
 def _chart_layout(fig: go.Figure, height: int = 380) -> go.Figure:
@@ -294,6 +310,8 @@ def _price_chart(symbol: str, bars: list[dict], decisions: list[dict]) -> go.Fig
 
 def _render_judge_report(judge_report: dict) -> None:
     st.markdown("##### :material/gavel: LLM judge")
+    if judge_report.get("judge_model"):
+        st.caption(f":material/robot_2: Judged by {judge_report['judge_model']}")
     cols = st.columns(3)
     cols[0].metric("Overall score", f"{judge_report.get('overall_score', '—')}/10")
     cols[1].metric("Strategy adherence", f"{judge_report.get('strategy_adherence', '—')}/10")
@@ -379,7 +397,199 @@ def _render_run(record: dict) -> None:
             st.markdown(f"`{ts}` **{kind}** {text}")
 
 
+# The pipeline: queued experiments, a parallelism limit, and worker processes.
+# One process = one simulation (module-global sim clock), so parallel runs are
+# separate `python -m simlab.runner` subprocesses scheduled by
+# `sim_experiments.tick()`; this section is both the status bar and the tick.
+
+MAX_PARALLEL_KEY = "pipeline_max_parallel"
+
+_STATUS_MARKUP = {
+    sim_experiments.WAITING: ":orange[:material/hourglass_top: waiting]",
+    sim_experiments.RUNNING: ":blue[:material/sync: running]",
+    sim_experiments.FINISHED: ":green[:material/check_circle: finished]",
+    sim_experiments.FAILED: ":red[:material/error: failed]",
+}
+
+
+def _experiment_label(exp: dict) -> str:
+    config = exp.get("config") or {}
+    personality = config.get("personality") or "?"
+    agent = AGENT_PERSONALITIES.get(personality, {}).get("label", personality)
+    return (
+        f"**{agent}** · {config.get('provider')}/{config.get('model')} · "
+        f"{exp.get('dataset')} · {len(config.get('days') or [])} day(s)"
+    )
+
+
+def _past_experiment_rows(past: list[dict]) -> list[dict]:
+    rows = []
+    for exp in past:
+        config = exp.get("config") or {}
+        result = exp.get("result_summary") or {}
+        personality = config.get("personality") or "?"
+        rows.append({
+            "queued": (exp.get("created_at") or "")[:16].replace("T", " "),
+            "agent": AGENT_PERSONALITIES.get(personality, {}).get("label", personality),
+            "model": f"{config.get('provider')}/{config.get('model')}",
+            "dataset": exp.get("dataset"),
+            "days": len(config.get("days") or []),
+            "status": exp.get("status"),
+            "return_pct": result.get("return_pct"),
+            "profit_efficiency": result.get("profit_efficiency"),
+            "judge": result.get("judge_overall"),
+            "run_id": exp.get("run_id"),
+            "error": exp.get("error"),
+        })
+    return rows
+
+
+def _render_pipeline_body(auto_refresh: bool) -> None:
+    col_head, col_workers = st.columns([4, 1], vertical_alignment="bottom")
+    col_head.markdown("##### :material/stacks: Experiment pipeline")
+    max_parallel = col_workers.number_input(
+        "Parallel workers", min_value=1, max_value=8, value=2, key=MAX_PARALLEL_KEY,
+        help="Experiments beyond this limit wait in the queue. Each experiment "
+             "runs in its own worker process.",
+    )
+    sim_experiments.tick(max_parallel)
+    exps = sim_experiments.list_experiments()
+    active = [e for e in exps if e["status"] in sim_experiments.ACTIVE_STATUSES]
+    if auto_refresh and not active:
+        st.rerun()  # pipeline just drained -- refresh the whole app once
+
+    counts = {
+        status: sum(1 for e in exps if e["status"] == status)
+        for status in (sim_experiments.WAITING, sim_experiments.RUNNING,
+                       sim_experiments.FINISHED, sim_experiments.FAILED)
+    }
+    cols = st.columns(4)
+    cols[0].metric("Waiting", counts[sim_experiments.WAITING])
+    cols[1].metric("Running", counts[sim_experiments.RUNNING])
+    cols[2].metric("Finished", counts[sim_experiments.FINISHED])
+    cols[3].metric("Failed", counts[sim_experiments.FAILED])
+
+    for exp in active:
+        with st.container(border=True, horizontal=True, vertical_alignment="center"):
+            st.markdown(_experiment_label(exp))
+            st.markdown(_STATUS_MARKUP[exp["status"]])
+            if exp["status"] == sim_experiments.RUNNING:
+                line = sim_experiments.last_log_line(exp["experiment_id"])
+                if line:
+                    st.caption(line)
+            elif st.button(
+                "Remove", key=f"exp_rm_{exp['experiment_id']}", icon=":material/close:"
+            ):
+                sim_experiments.delete_experiment(exp["experiment_id"])
+                st.rerun()
+
+    past = [e for e in exps
+            if e["status"] in (sim_experiments.FINISHED, sim_experiments.FAILED)]
+    if past:
+        with st.expander(f"Past experiments ({len(past)})"):
+            st.dataframe(
+                pd.DataFrame(_past_experiment_rows(past)),
+                hide_index=True,
+                column_config={
+                    "queued": "Queued (UTC)",
+                    "agent": "Agent",
+                    "model": "Model",
+                    "dataset": "Dataset",
+                    "days": "Days",
+                    "status": "Status",
+                    "return_pct": st.column_config.NumberColumn("Return", format="%+.2f%%"),
+                    "profit_efficiency": st.column_config.NumberColumn(
+                        "Profit eff.", format="percent"),
+                    "judge": st.column_config.NumberColumn("Judge", format="%.1f"),
+                    "run_id": "Run",
+                    "error": "Error",
+                },
+            )
+            if st.button("Clear history", icon=":material/delete_sweep:",
+                         help="Drops the experiment records; stored runs are kept."):
+                sim_experiments.clear_finished()
+                st.rerun()
+
+
+def _render_pipeline() -> None:
+    # While experiments are active the section refreshes itself (which also
+    # ticks the scheduler); once idle it renders statically until the next
+    # full rerun.
+    auto_refresh = sim_experiments.has_active()
+    st.fragment(run_every=2.5 if auto_refresh else None)(
+        lambda: _render_pipeline_body(auto_refresh)
+    )()
+
+
+def _prior_run_line(record: dict, selected_days: list[str]) -> str:
+    summary = record.get("summary") or {}
+    judge = record.get("judge") or {}
+    run_days = (record.get("config_summary") or {}).get("days") or []
+    parts = [
+        f"`{record['run_id']}`",
+        ", ".join(run_days) or "—",
+        f"{summary.get('return_pct', 0):+.2f}%",
+    ]
+    eff = summary.get("profit_efficiency")
+    if eff is not None:
+        parts.append(f"eff {eff:.1%}")
+    if judge.get("overall_score") is not None:
+        parts.append(f"judge {judge['overall_score']}/10")
+    line = " · ".join(parts)
+    if selected_days and set(run_days) == set(selected_days):
+        line += " — :orange[**same trading day(s)**]"
+    return line
+
+
+def _render_already_tested(
+    personality: str, provider: str, model: str, dataset: str, days: list[str]
+) -> None:
+    """Flag an agent/model/dataset combination that is already queued or has
+    already been tested cleanly, so the same experiment isn't paid for twice.
+    Runs whose cycles hit LLM errors don't count as tested -- those are exactly
+    the ones worth running again."""
+    combo = (
+        f"**{AGENT_PERSONALITIES.get(personality, {}).get('label', personality)}** · "
+        f"{provider}/{model} · {dataset}"
+    )
+    pending = [
+        e for e in sim_experiments.list_experiments()
+        if e["status"] in sim_experiments.ACTIVE_STATUSES
+        and (e.get("config") or {}).get("personality") == personality
+        and (e.get("config") or {}).get("provider") == provider
+        and (e.get("config") or {}).get("model") == model
+        and e.get("dataset") == dataset
+    ]
+    if pending:
+        statuses = ", ".join(sorted({e["status"] for e in pending}))
+        st.warning(
+            f":material/schedule: {combo} is already in the pipeline "
+            f"({len(pending)} experiment(s): {statuses}).",
+        )
+
+    prior = sim_results.find_prior_runs(_runs(), personality, provider, model, dataset)
+    clean, degraded = prior["clean"], prior["degraded"]
+    if clean:
+        lines = "\n".join(f"- {_prior_run_line(r, days)}" for r in clean[:5])
+        more = f"\n- …and {len(clean) - 5} more" if len(clean) > 5 else ""
+        st.warning(
+            f":material/history: {combo} has **already been tested** — "
+            f"{len(clean)} clean run(s):\n{lines}{more}\n\n"
+            "Results are in the Results tab. Re-run only if you changed the prompt "
+            "or the settings below."
+        )
+    elif degraded:
+        errors = sum(sim_results.cycle_error_count(r) for r in degraded)
+        st.info(
+            f":material/error_outline: {combo} was run {len(degraded)} time(s) before, but "
+            f"{errors} cycle(s) failed (LLM errors) — those runs aren't a clean test."
+        )
+
+
 def render_simulate_tab() -> None:
+    _render_pipeline()
+    st.divider()
+
     datasets = sim_data.list_datasets()
     if not datasets:
         st.info("Download a dataset first (Datasets tab).")
@@ -414,6 +624,23 @@ def render_simulate_tab() -> None:
             help="Grades every entry on the information available at entry time, plus an "
                  "overall strategy-adherence review.",
         )
+        judge_provider, judge_model, judge_api_key = provider, model, api_key
+        if run_judge and st.checkbox(
+            "Judge with a different LLM than the agent", value=False,
+            help="By default the agent's own provider/model grades its run. Pick a "
+                 "separate judge to avoid an agent marking its own homework.",
+        ):
+            col_jprov, col_jmodel, col_jkey = st.columns(3)
+            judge_provider = col_jprov.selectbox("Judge provider", list(PROVIDERS))
+            judge_model = col_jmodel.selectbox(
+                "Judge model",
+                models_for(judge_provider, default=DEFAULT_AGENT_MODELS[judge_provider]),
+            )
+            judge_api_key = col_jkey.text_input(
+                "Judge API key", value=_env_key(judge_provider), type="password"
+            )
+
+    _render_already_tested(personality, provider, model, ds.name, days)
 
     if sim_prompts.has_override(personality):
         st.caption(":material/edit: This agent runs with its **modified** prompt (Agents tab).")
@@ -423,54 +650,110 @@ def render_simulate_tab() -> None:
            else "disabled (set LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY to enable).")
     )
 
-    if st.button("Run simulation", icon=":material/play_arrow:", type="primary"):
+    if st.button("Run experiment", icon=":material/play_arrow:", type="primary",
+                 help="Adds the experiment to the pipeline; it starts as soon "
+                      "as a worker slot is free."):
         if not days or not symbols:
             st.error("Pick at least one trading day and one symbol.")
         elif not api_key:
             st.error(f"An API key for {provider} is required.")
+        elif run_judge and not judge_api_key:
+            st.error(f"An API key for the judge provider ({judge_provider}) is required.")
         else:
-            day_dates = [date.fromisoformat(d) for d in days]
-            market = SimMarket(symbols, day_dates)
-            config = SimulationConfig(
-                personality=personality,
-                provider=provider,
-                model=model,
-                api_key=api_key,
-                symbols=symbols,
-                days=day_dates,
-                starting_cash=float(starting_cash),
-                cycle_minutes=int(cycle_minutes),
-                max_cycles_per_day=int(max_cycles),
-                system_prompt_override=sim_prompts.get_override(personality),
-            )
-            with st.status("Simulating…", expanded=True) as status:
-                progress_line = st.empty()
-                engine = SimulationEngine(market, config, progress=progress_line.write)
-                result = engine.run()
-                st.write(
-                    f"Replay finished: {result.cycles_run} LLM cycle(s), "
-                    f"{len(result.decisions)} ledger entrie(s)."
-                )
-                summary = sim_results.summarize_run(result, market)
-                judge_report = None
-                if run_judge:
-                    judge_report = sim_judge.judge_run(
-                        result.decisions, summary, sim_prompts.get_prompt(personality),
-                        market, provider, api_key, model, progress=progress_line.write,
-                    )
-                record = sim_results.save_run(result, summary, judge_report, dataset_name=ds.name)
-                st.session_state["last_run_id"] = record["run_id"]
-                status.update(label=f"Run {record['run_id']} complete", state="complete")
+            sim_experiments.submit(ds.name, {
+                "personality": personality,
+                "provider": provider,
+                "model": model,
+                "api_key": api_key,
+                "symbols": symbols,
+                "days": days,
+                "starting_cash": float(starting_cash),
+                "cycle_minutes": int(cycle_minutes),
+                "max_cycles_per_day": int(max_cycles),
+                "system_prompt_override": sim_prompts.get_override(personality),
+                "run_judge": bool(run_judge),
+                "judge_provider": judge_provider,
+                "judge_model": judge_model,
+                "judge_api_key": judge_api_key,
+            })
+            sim_experiments.tick(int(st.session_state.get(MAX_PARALLEL_KEY, 2)))
+            st.toast("Experiment queued", icon=":material/rocket_launch:")
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Tab 4 — results
+# ---------------------------------------------------------------------------
+
+_BREAKDOWN_DIMENSIONS = {"LLM model": "model", "Dataset": "dataset", "Agent": "agent"}
+
+
+def _breakdown_bar(labels: list[str], values: list[float], title: str, color: str,
+                   tickformat: "str | None" = None) -> go.Figure:
+    fig = go.Figure(go.Bar(x=labels, y=values, marker_color=color))
+    fig = _chart_layout(fig, height=320)
+    fig.update_layout(title=title, showlegend=False)
+    if tickformat:
+        fig.update_yaxes(tickformat=tickformat)
+    return fig
+
+
+def render_results_tab() -> None:
+    runs = _runs()
+    if not runs:
+        st.info("No stored runs yet — queue an experiment in the Simulate tab.")
+        return
+
+    st.markdown("##### Breakdown")
+    dim_label = st.segmented_control(
+        "Break down by", list(_BREAKDOWN_DIMENSIONS), default="LLM model",
+        key="results_breakdown_dim",
+    ) or "LLM model"
+    dimension = _BREAKDOWN_DIMENSIONS[dim_label]
+    rows = sim_results.breakdown(runs, dimension)
+    if dimension == "agent":
+        for row in rows:
+            row["group"] = AGENT_PERSONALITIES.get(row["group"], {}).get(
+                "label", row["group"])
+    st.dataframe(
+        pd.DataFrame(rows),
+        hide_index=True,
+        column_config={
+            "group": dim_label,
+            "runs": "Runs",
+            "avg_return_pct": st.column_config.NumberColumn("Avg return", format="%+.2f%%"),
+            "best_return_pct": st.column_config.NumberColumn("Best return", format="%+.2f%%"),
+            "avg_profit_efficiency": st.column_config.NumberColumn(
+                "Avg profit efficiency", format="percent",
+                help="Session return ÷ oracle best-round-trip ceiling, averaged over runs."),
+            "avg_judge_score": st.column_config.NumberColumn(
+                "Avg judge score", format="%.1f",
+                help="LLM judge overall score (0–10), averaged over judged runs."),
+        },
+    )
+    col_eff, col_score = st.columns(2)
+    eff_rows = [r for r in rows if r["avg_profit_efficiency"] is not None]
+    if eff_rows:
+        col_eff.plotly_chart(_breakdown_bar(
+            [r["group"] for r in eff_rows],
+            [r["avg_profit_efficiency"] for r in eff_rows],
+            "Avg profit efficiency", PALETTE["accent"], tickformat=".0%",
+        ))
+    score_rows = [r for r in rows if r["avg_judge_score"] is not None]
+    if score_rows:
+        col_score.plotly_chart(_breakdown_bar(
+            [r["group"] for r in score_rows],
+            [r["avg_judge_score"] for r in score_rows],
+            "Avg judge score (0–10)", PALETTE["up"],
+        ))
 
     st.divider()
-    runs = sim_results.list_runs()
-    if not runs:
-        return
-    st.markdown("##### Results")
+    st.markdown("##### Runs")
     labels = {
         r["run_id"]: (
             f"{r['run_id']} · {r.get('config_summary', {}).get('personality')} · "
-            f"{r.get('dataset')} · {r.get('summary', {}).get('return_pct', 0):+.2f}%"
+            f"{r.get('config_summary', {}).get('model')} · {r.get('dataset')} · "
+            f"{r.get('summary', {}).get('return_pct', 0):+.2f}%"
         )
         for r in runs
     }
@@ -498,8 +781,9 @@ def build_ui() -> None:
         "Replay the trading agents against stored historical sessions: same prompts, same "
         "tools, same execution path as live — hours of tape in minutes of simulation."
     )
-    tab_agents, tab_datasets, tab_sim = st.tabs(
-        [":material/smart_toy: Agents", ":material/database: Datasets", ":material/play_circle: Simulate"]
+    tab_agents, tab_datasets, tab_sim, tab_results = st.tabs(
+        [":material/smart_toy: Agents", ":material/database: Datasets",
+         ":material/play_circle: Simulate", ":material/insights: Results"]
     )
     with tab_agents:
         render_agents_tab()
@@ -507,3 +791,5 @@ def build_ui() -> None:
         render_datasets_tab()
     with tab_sim:
         render_simulate_tab()
+    with tab_results:
+        render_results_tab()

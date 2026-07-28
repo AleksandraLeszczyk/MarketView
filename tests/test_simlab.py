@@ -292,3 +292,262 @@ class TestPrompts:
         monkeypatch.setattr(sim_prompts, "PROMPTS_DIR", tmp_path / "prompts")
         with pytest.raises(KeyError):
             sim_prompts.save_override("nope", "x")
+
+
+class TestExperiments:
+    @pytest.fixture(autouse=True)
+    def exp_store(self, tmp_path, monkeypatch):
+        from simlab import experiments as sim_experiments
+
+        monkeypatch.setattr(sim_experiments, "EXPERIMENTS_DIR", tmp_path / "experiments")
+        self.experiments = sim_experiments
+
+    def _submit(self, **overrides):
+        config = {
+            "personality": "momentum", "provider": "openai", "model": "gpt-test",
+            "api_key": "sk-secret", "symbols": ["TEST"], "days": [DAY.isoformat()],
+            "starting_cash": 100_000.0, "cycle_minutes": 5,
+            "max_cycles_per_day": 40, "system_prompt_override": None,
+            "run_judge": False,
+        }
+        config.update(overrides)
+        return self.experiments.submit("ds1", config)
+
+    def test_submit_and_finalize_scrubs_api_key(self):
+        exp = self._submit(judge_api_key="sk-judge")
+        assert exp["status"] == self.experiments.WAITING
+        stored = self.experiments.get_experiment(exp["experiment_id"])
+        assert stored["config"]["api_key"] == "sk-secret"
+
+        done = self.experiments.finalize(
+            exp["experiment_id"], self.experiments.FINISHED, run_id="run-1",
+            result_summary={"return_pct": 1.5},
+        )
+        assert done["status"] == self.experiments.FINISHED
+        assert done["run_id"] == "run-1"
+        assert done["config"]["api_key"] == ""
+        assert done["config"]["judge_api_key"] == ""
+        assert done["finished_at"] is not None
+
+    def test_tick_spawns_up_to_limit_oldest_first(self, monkeypatch):
+        first = self._submit()
+        second = self._submit()
+        third = self._submit()
+        spawned = []
+        monkeypatch.setattr(self.experiments, "spawn", spawned.append)
+        self.experiments.tick(max_parallel=2)
+        assert spawned == [first["experiment_id"], second["experiment_id"]]
+        assert third["experiment_id"] not in spawned
+
+    def test_tick_counts_running_against_limit(self, monkeypatch):
+        running = self._submit()
+        self.experiments.update(
+            running["experiment_id"], status=self.experiments.RUNNING, pid=99999999
+        )
+        waiting = self._submit()
+        spawned = []
+        monkeypatch.setattr(self.experiments, "spawn", spawned.append)
+        monkeypatch.setattr(self.experiments, "_pid_alive", lambda pid: True)
+        self.experiments.tick(max_parallel=1)
+        assert spawned == []
+        self.experiments.tick(max_parallel=2)
+        assert spawned == [waiting["experiment_id"]]
+
+    def test_tick_reaps_dead_workers(self, monkeypatch):
+        exp = self._submit()
+        self.experiments.update(
+            exp["experiment_id"], status=self.experiments.RUNNING, pid=99999999
+        )
+        monkeypatch.setattr(self.experiments, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(self.experiments, "spawn", lambda _id: None)
+        self.experiments.tick(max_parallel=1)
+        reaped = self.experiments.get_experiment(exp["experiment_id"])
+        assert reaped["status"] == self.experiments.FAILED
+        assert "died" in reaped["error"]
+
+    def test_clear_finished_keeps_active(self):
+        active = self._submit()
+        done = self._submit()
+        self.experiments.finalize(done["experiment_id"], self.experiments.FINISHED)
+        assert self.experiments.clear_finished() == 1
+        ids = [e["experiment_id"] for e in self.experiments.list_experiments()]
+        assert ids == [active["experiment_id"]]
+
+
+class TestBreakdown:
+    def _run(self, model="gpt-a", dataset="ds1", personality="momentum",
+             return_pct=1.0, efficiency=0.5, judge_score=7.0):
+        record = {
+            "dataset": dataset,
+            "config_summary": {"provider": "openai", "model": model, "personality": personality},
+            "summary": {"return_pct": return_pct, "profit_efficiency": efficiency},
+        }
+        if judge_score is not None:
+            record["judge"] = {"overall_score": judge_score}
+        return record
+
+    def test_groups_by_model(self):
+        rows = sim_results.breakdown(
+            [
+                self._run(model="gpt-a", return_pct=2.0, efficiency=0.8, judge_score=8.0),
+                self._run(model="gpt-a", return_pct=0.0, efficiency=0.2, judge_score=None),
+                self._run(model="gpt-b", return_pct=-1.0, efficiency=0.1),
+            ],
+            by="model",
+        )
+        assert [r["group"] for r in rows] == ["openai/gpt-a", "openai/gpt-b"]
+        top = rows[0]
+        assert top["runs"] == 2
+        assert top["avg_return_pct"] == 1.0
+        assert top["best_return_pct"] == 2.0
+        assert top["avg_profit_efficiency"] == 0.5
+        assert top["avg_judge_score"] == 8.0  # unjudged run skipped
+
+    def test_groups_by_dataset_and_agent(self):
+        runs = [
+            self._run(dataset="ds1", personality="momentum"),
+            self._run(dataset="ds2", personality="contrarian", efficiency=None),
+        ]
+        by_dataset = sim_results.breakdown(runs, by="dataset")
+        assert {r["group"] for r in by_dataset} == {"ds1", "ds2"}
+        by_agent = sim_results.breakdown(runs, by="agent")
+        assert {r["group"] for r in by_agent} == {"momentum", "contrarian"}
+        no_eff = next(r for r in by_agent if r["group"] == "contrarian")
+        assert no_eff["avg_profit_efficiency"] is None
+        # None-efficiency groups sort after scored ones.
+        assert by_agent[-1]["group"] == "contrarian"
+
+    def test_unknown_dimension_rejected(self):
+        with pytest.raises(ValueError):
+            sim_results.breakdown([], by="provider-only")
+
+
+class TestPriorRuns:
+    def _run(self, run_id="r1", personality="momentum", provider="openai",
+             model="gpt-a", dataset="ds1", agent_log=None, **fields):
+        record = {
+            "run_id": run_id,
+            "dataset": dataset,
+            "config_summary": {
+                "personality": personality, "provider": provider, "model": model,
+                "days": [DAY.isoformat()],
+            },
+            "summary": {"return_pct": 1.0, "profit_efficiency": 0.5},
+            "cycles_run": 10,
+            "agent_log": agent_log if agent_log is not None else [{"type": "cycle"}],
+        }
+        record.update(fields)
+        return record
+
+    def test_counts_only_error_log_entries(self):
+        record = self._run(agent_log=[
+            {"type": "cycle"},
+            {"type": "error", "text": "LLM call failed: Error code: 429"},
+            {"type": "error", "text": "Agent cycle failed: boom"},
+        ])
+        assert sim_results.cycle_error_count(record) == 2
+        assert sim_results.cycle_error_count(self._run()) == 0
+        assert sim_results.cycle_error_count({}) == 0
+
+    def test_matches_only_the_full_combination(self):
+        runs = [
+            self._run(run_id="match"),
+            self._run(run_id="other-agent", personality="breakout"),
+            self._run(run_id="other-model", model="gpt-b"),
+            self._run(run_id="other-provider", provider="anthropic"),
+            self._run(run_id="other-dataset", dataset="ds2"),
+        ]
+        prior = sim_results.find_prior_runs(runs, "momentum", "openai", "gpt-a", "ds1")
+        assert [r["run_id"] for r in prior["clean"]] == ["match"]
+        assert prior["degraded"] == []
+
+    def test_llm_errors_make_a_run_degraded_not_clean(self):
+        runs = [
+            self._run(run_id="clean"),
+            self._run(run_id="llm-error", agent_log=[
+                {"type": "error", "text": "LLM call failed: Error code: 429"}]),
+            self._run(run_id="engine-error", error="no simulated tape price"),
+            self._run(run_id="interrupted", interrupted=True),
+            self._run(run_id="no-cycles", cycles_run=0),
+        ]
+        prior = sim_results.find_prior_runs(runs, "momentum", "openai", "gpt-a", "ds1")
+        assert [r["run_id"] for r in prior["clean"]] == ["clean"]
+        assert [r["run_id"] for r in prior["degraded"]] == [
+            "llm-error", "engine-error", "interrupted", "no-cycles"
+        ]
+
+    def test_no_prior_runs(self):
+        prior = sim_results.find_prior_runs([], "momentum", "openai", "gpt-a", "ds1")
+        assert prior == {"clean": [], "degraded": []}
+
+    def test_store_signature_tracks_changes(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sim_results, "RUNS_DIR", tmp_path / "runs")
+        assert sim_results.store_signature() == ()
+        (tmp_path / "runs").mkdir()
+        (tmp_path / "runs" / "a.json").write_text("{}")
+        first = sim_results.store_signature()
+        assert len(first) == 1
+        (tmp_path / "runs" / "b.json").write_text("{}")
+        assert sim_results.store_signature() != first
+
+
+class TestRunnerJudgeSelection:
+    """The judge LLM is picked independently of the agent's, falling back to it."""
+
+    def _run_with(self, monkeypatch, config: dict) -> dict:
+        from simlab import runner
+
+        captured: dict = {}
+
+        def fake_judge_run(decisions, summary, prompt, market, provider, api_key,
+                           model, progress=lambda msg: None):
+            captured.update(provider=provider, api_key=api_key, model=model)
+            return {}
+
+        class FakeEngine:
+            def __init__(self, *a, **kw):
+                pass
+
+            def run(self):
+                return SimpleNamespace(cycles_run=1, decisions=[])
+
+        monkeypatch.setattr(
+            runner.experiments, "get_experiment",
+            lambda _id: {"config": config, "dataset": "ds1"},
+        )
+        monkeypatch.setattr(runner, "SimMarket", lambda *a, **kw: object())
+        monkeypatch.setattr(runner, "SimulationEngine", FakeEngine)
+        monkeypatch.setattr(runner.sim_results, "summarize_run", lambda *a, **kw: {})
+        monkeypatch.setattr(runner.sim_results, "save_run", lambda *a, **kw: {"run_id": "r1"})
+        monkeypatch.setattr(runner.sim_prompts, "get_prompt", lambda _p: "brief")
+        monkeypatch.setattr(runner.sim_judge, "judge_run", fake_judge_run)
+        runner.run_experiment("exp-1")
+        return captured
+
+    @staticmethod
+    def _config(**overrides) -> dict:
+        config = {
+            "personality": "momentum", "provider": "openai", "model": "gpt-test",
+            "api_key": "sk-agent", "symbols": ["TEST"], "days": [DAY.isoformat()],
+            "starting_cash": 100_000.0, "cycle_minutes": 5,
+            "max_cycles_per_day": 40, "system_prompt_override": None,
+            "run_judge": True,
+        }
+        config.update(overrides)
+        return config
+
+    def test_separate_judge_llm_is_used(self, monkeypatch):
+        captured = self._run_with(monkeypatch, self._config(
+            judge_provider="anthropic", judge_model="claude-sonnet-5",
+            judge_api_key="sk-judge",
+        ))
+        assert captured == {
+            "provider": "anthropic", "model": "claude-sonnet-5", "api_key": "sk-judge",
+        }
+
+    def test_falls_back_to_the_agent_llm(self, monkeypatch):
+        """Experiments queued before the judge picker existed still judge."""
+        captured = self._run_with(monkeypatch, self._config())
+        assert captured == {
+            "provider": "openai", "model": "gpt-test", "api_key": "sk-agent",
+        }

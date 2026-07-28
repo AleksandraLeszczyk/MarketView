@@ -117,6 +117,100 @@ def list_runs() -> list[dict]:
     return records
 
 
+def cycle_error_count(record: dict) -> int:
+    """Cycle-level failures logged during a run -- in practice almost always a
+    failed LLM call (rate limit, rejected key, refused request). The engine
+    logs one and carries on, so a run can finish and still be a degraded test."""
+    return sum(
+        1 for entry in (record.get("agent_log") or []) if entry.get("type") == "error"
+    )
+
+
+def find_prior_runs(
+    runs: list[dict], personality: str, provider: str, model: str, dataset: str
+) -> dict[str, list[dict]]:
+    """Stored runs for this exact (agent, provider/model, dataset) combination,
+    newest first, split into ``clean`` -- finished end to end with no failed
+    cycles, so re-running buys nothing -- and ``degraded``, which are worth
+    running again."""
+    clean, degraded = [], []
+    for record in runs:
+        config = record.get("config_summary") or {}
+        if (
+            config.get("personality") != personality
+            or config.get("provider") != provider
+            or config.get("model") != model
+            or (record.get("dataset") or "") != dataset
+        ):
+            continue
+        healthy = (
+            not record.get("error")
+            and not record.get("interrupted")
+            and (record.get("cycles_run") or 0) > 0
+            and cycle_error_count(record) == 0
+        )
+        (clean if healthy else degraded).append(record)
+    return {"clean": clean, "degraded": degraded}
+
+
+def store_signature() -> tuple:
+    """Cheap fingerprint of the run store (file name + mtime). Lets the UI cache
+    parsed run records and drop them the moment a run is added or deleted."""
+    if not RUNS_DIR.exists():
+        return ()
+    try:
+        return tuple(sorted((p.name, p.stat().st_mtime) for p in RUNS_DIR.glob("*.json")))
+    except OSError:
+        return ()
+
+
+def breakdown(runs: list[dict], by: str) -> list[dict]:
+    """Aggregate stored runs along one dimension: ``model`` (provider/model),
+    ``dataset``, or ``agent`` (personality). Averages skip runs where a metric
+    is unavailable (no judge report, oracle ceiling of 0)."""
+    if by not in ("model", "dataset", "agent"):
+        raise ValueError(f"unknown breakdown dimension: {by}")
+    groups: dict[str, dict] = {}
+    for record in runs:
+        config = record.get("config_summary") or {}
+        summary = record.get("summary") or {}
+        if by == "model":
+            key = f"{config.get('provider', '?')}/{config.get('model', '?')}"
+        elif by == "dataset":
+            key = record.get("dataset") or "(no dataset)"
+        else:
+            key = config.get("personality") or "?"
+        group = groups.setdefault(
+            key, {"count": 0, "returns": [], "efficiencies": [], "scores": []}
+        )
+        group["count"] += 1
+        if summary.get("return_pct") is not None:
+            group["returns"].append(float(summary["return_pct"]))
+        if summary.get("profit_efficiency") is not None:
+            group["efficiencies"].append(float(summary["profit_efficiency"]))
+        judge = record.get("judge") or {}
+        if judge.get("overall_score") is not None:
+            group["scores"].append(float(judge["overall_score"]))
+
+    def _avg(values: list[float]) -> Optional[float]:
+        return round(sum(values) / len(values), 4) if values else None
+
+    rows = [
+        {
+            "group": key,
+            "runs": g["count"],
+            "avg_return_pct": _avg(g["returns"]),
+            "best_return_pct": round(max(g["returns"]), 4) if g["returns"] else None,
+            "avg_profit_efficiency": _avg(g["efficiencies"]),
+            "avg_judge_score": _avg(g["scores"]),
+        }
+        for key, g in groups.items()
+    ]
+    rows.sort(key=lambda r: (r["avg_profit_efficiency"] is None,
+                             -(r["avg_profit_efficiency"] or 0.0)))
+    return rows
+
+
 def delete_run(run_id: str) -> None:
     path = RUNS_DIR / f"{run_id}.json"
     if path.exists():

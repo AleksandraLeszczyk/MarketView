@@ -132,6 +132,12 @@ is rejected and you must re-pick.
    - reversal -> a confirmed RANGE (ADX below 20, no catalyst, large-cap quiet \
 tape) where price is stretched from VWAP. Best in the quiet middle of the \
 session with no trend. Do NOT pick this when ADX shows a real trend.
+   - volume_detective -> the session has printed clear high-volume levels \
+(spike-classified demand/supply lines) and price is trading BETWEEN them, \
+pulling back toward a defended level rather than trending away from all of \
+them. Best on a two-sided tape with decent participation where structure, not \
+direction, is the story; a weaker-conviction sibling of reversal that does not \
+need an ADX-confirmed range.
    - smart_money -> price is returning to a higher-timeframe bullish demand \
 order block in a non-bearish regime -- the highest-edge, most all-conditions \
 setup when such a zone exists at/below price. When none of the above fits \

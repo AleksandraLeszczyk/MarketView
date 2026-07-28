@@ -11,6 +11,7 @@ from agent_stonks.agent import (
     PERSONALITY_TOOLS,
     REVERSAL_TOOLS,
     SMART_MONEY_TOOLS,
+    VOLUME_DETECTIVE_TOOLS,
     _dispatch_tool,
     _session_closed_addendum,
     _tool_analyze_consolidation,
@@ -243,7 +244,8 @@ class TestToolHandlers:
     def test_advanced_level_tools_dispatch_but_are_not_exposed_yet(self):
         # Steps 4-6 of the S/R plan: analyzers are dispatch-wired (so enabling
         # them is only a MOMENTUM_TOOLS + prompt-addendum uncomment away) but
-        # not yet in any personality's toolset.
+        # not yet in any personality's toolset -- except analyze_volume_profile_2,
+        # which the Volume Signal Detective is built around.
         app, state = _app()
         tracker = DecisionTracker()
         assert "note" in _dispatch_tool("analyze_swing_levels", {"symbol": "AAPL"}, app, tracker)
@@ -253,14 +255,37 @@ class TestToolHandlers:
         pivots = _dispatch_tool("get_floor_pivots", {"symbol": "AAPL"}, app, tracker)
         assert pivots["levels"]["pivot"] == 105.0
         assert pivots["nearest_resistance"]["name"] == "r1"
-        for tools in PERSONALITY_TOOLS.values():
+        for personality, tools in PERSONALITY_TOOLS.items():
             names = {t["function"]["name"] for t in tools}
             assert not {
                 "analyze_swing_levels",
                 "analyze_volume_profile",
-                "analyze_volume_profile_2",
                 "get_floor_pivots",
             } & names
+            if personality != "volume_detective":
+                assert "analyze_volume_profile_2" not in names
+
+    def test_volume_detective_personality_uses_volume_detective_tools(self):
+        assert PERSONALITY_TOOLS["volume_detective"] is VOLUME_DETECTIVE_TOOLS
+        names = {t["function"]["name"] for t in VOLUME_DETECTIVE_TOOLS}
+        # analyze_volume_profile_2 is the primary read; the rest cross-examine
+        # its levels (structure, participation, approach, timing, catalyst) and
+        # gate the geometry before any size.
+        assert {
+            "analyze_volume_profile_2",
+            "get_quote",
+            "analyze_volume",
+            "analyze_intraday_momentum",
+            "get_key_levels",
+            "get_session_clock",
+            "breakout_trade_geometry",
+            "get_news",
+            "get_position",
+            "set_tactics",
+            "submit_decision",
+        } == names
+        assert "analyze_daily_trend" not in names
+        assert "get_put_call_walls" not in names
 
     def test_reversal_personality_uses_reversal_tools(self):
         assert PERSONALITY_TOOLS["reversal"] is REVERSAL_TOOLS
