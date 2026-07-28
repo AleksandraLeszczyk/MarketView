@@ -917,10 +917,56 @@ def _breakdown_bar(labels: list[str], values: list[float], title: str, color: st
     return fig
 
 
+def _render_results_filters(runs: list[dict]) -> list[dict]:
+    """Dataset / model filters over the stored runs. Selecting nothing in a
+    filter leaves that dimension unrestricted, so the default view is all runs.
+    Everything below (breakdown, charts, run picker) works off the result."""
+    options = sim_results.filter_options(runs)
+    col_datasets, col_models = st.columns(2)
+    datasets = col_datasets.multiselect(
+        "Datasets", options["datasets"], key="results_filter_datasets",
+        placeholder="All datasets",
+    )
+    models = col_models.multiselect(
+        "LLM models", options["models"], key="results_filter_models",
+        placeholder="All models",
+    )
+    filtered = sim_results.filter_runs(runs, datasets=datasets, models=models)
+    if datasets or models:
+        st.caption(f"Showing {len(filtered)} of {len(runs)} runs.")
+    return filtered
+
+
+@st.dialog("Delete all runs?")
+def _confirm_delete_all_runs(total: int) -> None:
+    """Wiping the store is irreversible and the filters make it easy to forget
+    how much is actually in there, so the count is spelled out before it goes."""
+    st.markdown(
+        f"This permanently deletes **all {total} stored run"
+        f"{'' if total == 1 else 's'}**, including any hidden by the current "
+        "filters. Scores already exported to Langfuse are kept."
+    )
+    with st.container(horizontal=True):
+        if st.button("Delete them", type="primary", icon=":material/delete_forever:"):
+            removed = sim_results.delete_all_runs()
+            for key in ("last_run_id", "results_filter_datasets", "results_filter_models"):
+                st.session_state.pop(key, None)
+            st.toast(f"Deleted {removed} run{'' if removed == 1 else 's'}",
+                     icon=":material/delete_sweep:")
+            st.rerun()
+        if st.button("Cancel", icon=":material/close:"):
+            st.rerun()
+
+
 def render_results_tab() -> None:
-    runs = _runs()
-    if not runs:
+    all_runs = _runs()
+    if not all_runs:
         st.info("No stored runs yet — queue an experiment in the Simulate tab.")
+        return
+
+    runs = _render_results_filters(all_runs)
+    if not runs:
+        st.info("No runs match the current filters.")
         return
 
     st.markdown("##### Breakdown")
@@ -970,10 +1016,16 @@ def render_results_tab() -> None:
     )
     record = next(r for r in runs if r["run_id"] == selected)
     _render_run(record)
-    if st.button("Delete this run", icon=":material/delete:"):
-        sim_results.delete_run(selected)
-        st.session_state.pop("last_run_id", None)
-        st.rerun()
+    with st.container(horizontal=True):
+        if st.button("Delete this run", icon=":material/delete:"):
+            sim_results.delete_run(selected)
+            st.session_state.pop("last_run_id", None)
+            st.rerun()
+        if st.button(
+            "Delete all runs", icon=":material/delete_sweep:",
+            help="Clears the whole run store, not just the filtered runs.",
+        ):
+            _confirm_delete_all_runs(len(all_runs))
 
 
 # ---------------------------------------------------------------------------

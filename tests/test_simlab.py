@@ -507,6 +507,45 @@ class TestBreakdown:
             sim_results.breakdown([], by="provider-only")
 
 
+class TestRunFilters:
+    def _run(self, model="gpt-a", dataset="ds1", provider="openai"):
+        return {
+            "dataset": dataset,
+            "config_summary": {"provider": provider, "model": model},
+        }
+
+    def _runs(self):
+        return [
+            self._run(model="gpt-a", dataset="ds1"),
+            self._run(model="gpt-b", dataset="ds1"),
+            self._run(model="gpt-a", dataset="ds2"),
+        ]
+
+    def test_options_are_the_distinct_keys(self):
+        options = sim_results.filter_options(self._runs() + [self._run(dataset="")])
+        assert options["datasets"] == ["ds1", "ds2", sim_results.NO_DATASET]
+        assert options["models"] == ["openai/gpt-a", "openai/gpt-b"]
+
+    def test_empty_filters_keep_everything(self):
+        runs = self._runs()
+        assert sim_results.filter_runs(runs) == runs
+        assert sim_results.filter_runs(runs, datasets=[], models=[]) == runs
+
+    def test_filters_combine(self):
+        runs = self._runs()
+        assert len(sim_results.filter_runs(runs, datasets=["ds1"])) == 2
+        assert len(sim_results.filter_runs(runs, models=["openai/gpt-a"])) == 2
+        both = sim_results.filter_runs(runs, datasets=["ds1"], models=["openai/gpt-a"])
+        assert both == [runs[0]]
+
+    def test_filter_keys_match_breakdown_groups(self):
+        runs = self._runs()
+        by_model = {r["group"] for r in sim_results.breakdown(runs, by="model")}
+        assert by_model == set(sim_results.filter_options(runs)["models"])
+        by_dataset = {r["group"] for r in sim_results.breakdown(runs, by="dataset")}
+        assert by_dataset == set(sim_results.filter_options(runs)["datasets"])
+
+
 class TestPriorRuns:
     def _run(self, run_id="r1", personality="momentum", provider="openai",
              model="gpt-a", dataset="ds1", agent_log=None, **fields):
@@ -574,6 +613,21 @@ class TestPriorRuns:
         assert len(first) == 1
         (tmp_path / "runs" / "b.json").write_text("{}")
         assert sim_results.store_signature() != first
+
+    def test_delete_all_runs_empties_the_store(self, tmp_path, monkeypatch):
+        runs_dir = tmp_path / "runs"
+        monkeypatch.setattr(sim_results, "RUNS_DIR", runs_dir)
+        # No store yet -- nothing to delete, and no directory is created.
+        assert sim_results.delete_all_runs() == 0
+        runs_dir.mkdir()
+        for name in ("a.json", "b.json"):
+            (runs_dir / name).write_text("{}")
+        (runs_dir / "notes.txt").write_text("keep me")
+
+        assert sim_results.delete_all_runs() == 2
+        assert sim_results.list_runs() == []
+        assert sim_results.store_signature() == ()
+        assert (runs_dir / "notes.txt").exists()
 
 
 class TestRunnerJudgeSelection:

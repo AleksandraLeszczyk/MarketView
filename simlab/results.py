@@ -26,6 +26,9 @@ from .market import SimMarket
 
 RUNS_DIR = Path(__file__).resolve().parent.parent / "data" / "simlab" / "runs"
 
+# Stand-in group/filter key for runs saved without a dataset name.
+NO_DATASET = "(no dataset)"
+
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -164,6 +167,44 @@ def store_signature() -> tuple:
         return ()
 
 
+def model_key(record: dict) -> str:
+    """``provider/model`` identity of a stored run -- the same string the model
+    breakdown groups on, so filters and rows always agree."""
+    config = record.get("config_summary") or {}
+    return f"{config.get('provider', '?')}/{config.get('model', '?')}"
+
+
+def dataset_key(record: dict) -> str:
+    return record.get("dataset") or NO_DATASET
+
+
+def filter_options(runs: list[dict]) -> dict[str, list[str]]:
+    """The datasets and models actually present in the stored runs, sorted --
+    the option lists for the Results filters."""
+    return {
+        # Named datasets first, the "(no dataset)" catch-all last.
+        "datasets": sorted({dataset_key(r) for r in runs},
+                           key=lambda name: (name == NO_DATASET, name)),
+        "models": sorted({model_key(r) for r in runs}),
+    }
+
+
+def filter_runs(
+    runs: list[dict],
+    datasets: "list[str] | None" = None,
+    models: "list[str] | None" = None,
+) -> list[dict]:
+    """Runs matching every non-empty filter. An empty (or omitted) filter means
+    "no restriction on this dimension", so no selection shows everything."""
+    dataset_set, model_set = set(datasets or ()), set(models or ())
+    return [
+        record
+        for record in runs
+        if (not dataset_set or dataset_key(record) in dataset_set)
+        and (not model_set or model_key(record) in model_set)
+    ]
+
+
 def breakdown(runs: list[dict], by: str) -> list[dict]:
     """Aggregate stored runs along one dimension: ``model`` (provider/model),
     ``dataset``, or ``agent`` (personality). Averages skip runs where a metric
@@ -178,9 +219,9 @@ def breakdown(runs: list[dict], by: str) -> list[dict]:
         config = record.get("config_summary") or {}
         summary = record.get("summary") or {}
         if by == "model":
-            key = f"{config.get('provider', '?')}/{config.get('model', '?')}"
+            key = model_key(record)
         elif by == "dataset":
-            key = record.get("dataset") or "(no dataset)"
+            key = dataset_key(record)
         else:
             key = config.get("personality") or "?"
         group = groups.setdefault(
@@ -229,6 +270,21 @@ def delete_run(run_id: str) -> None:
     path = RUNS_DIR / f"{run_id}.json"
     if path.exists():
         path.unlink()
+
+
+def delete_all_runs() -> int:
+    """Drop every stored run; returns how many records were removed. Only the
+    local store is touched -- scores already exported to Langfuse stay there."""
+    if not RUNS_DIR.exists():
+        return 0
+    removed = 0
+    for path in RUNS_DIR.glob("*.json"):
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed += 1
+    return removed
 
 
 # ---------------------------------------------------------------------------
