@@ -67,6 +67,36 @@ SCORING_MIN_TOTAL_RUNTIME_SEC = 3600
 PREMARKET_LEAD_SEC = 120
 PREMARKET_WAIT_POLL_SEC = 30.0
 
+# Apple Trader: the rule-based (non-LLM) loop that scores every closed AAPL
+# minute bar with the momentum-change regressor (see agent_stonks.apple_trader).
+#
+# THRESHOLD is the size a predicted momentum change must reach, in bps/min, to
+# count as a regime call at all -- the default is the 90th percentile of
+# |prediction| on the model's own training days, i.e. "act on the most extreme
+# 10% of minutes". CONFIRM_MIN is how many consecutive closed bars must repeat
+# the same call before it is traded (the live stand-in for the model's
+# 15-minute persistence rule). VALIDATION_MIN is how long a fresh long has to
+# see the regime actually turn positive before the call is written off as false
+# and the position is cut; None follows the model bundle's own `persist`.
+APPLE_TRADER_CYCLE_SEC = 60
+APPLE_TRADER_THRESHOLD = 0.75
+APPLE_TRADER_CONFIRM_MIN = 3
+APPLE_TRADER_VALIDATION_MIN: "int | None" = None
+APPLE_TRADER_STOP_LOSS_PCT = 1.0
+APPLE_TRADER_POSITION_PCT = 95.0
+# Completed sessions pulled in behind today so the day-level features (theta,
+# previous close, 5-day return) have the history the model was trained with.
+APPLE_TRADER_HISTORY_DAYS = 6
+# Predictions inside the first hour run on half-filled trailing windows, so the
+# loop watches without trading until the session has this many closed bars.
+APPLE_TRADER_MIN_BARS_TODAY = 60
+# Flatten this many minutes before the close: momentum, regimes and the model's
+# whole feature set are intraday, and none of it survives the overnight gap.
+APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN = 5
+# Seconds after a minute boundary to score, giving the stream time to deliver
+# the bar that just closed.
+APPLE_TRADER_BAR_LAG_SEC = 5.0
+
 # Tactics executor: the stream nudges it on every tick, so this poll is only a
 # fallback cadence covering the non-stream condition fields (vix, momentum) and
 # REST-fallback sessions. The momentum window is the lookback (in minutes) for

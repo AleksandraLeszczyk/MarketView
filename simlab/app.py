@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import asdict
 from datetime import date, datetime, time, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -16,7 +17,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from agent_stonks import clock
+from agent_stonks import clock, momentum_model
 from agent_stonks import observability as obs
 from agent_stonks.agent import (
     AGENT_PERSONALITIES,
@@ -24,6 +25,15 @@ from agent_stonks.agent import (
     _dispatch_tool,
     selectable_personalities,
 )
+from agent_stonks.apple_trader import (
+    APPLE_TRADER_AVATAR,
+    APPLE_TRADER_KEY,
+    APPLE_TRADER_LABEL,
+    RULE_PROVIDER,
+    AppleTraderConfig,
+    config_signature,
+)
+from agent_stonks.apple_trader import TICKER as APPLE_TRADER_TICKER
 from agent_stonks.config import PALETTE
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
 from agent_stonks.market_hours import MARKET_TZ
@@ -41,6 +51,30 @@ AVATAR_DIR = Path(__file__).resolve().parent.parent / "data" / "avatars"
 # submit_decision / set_tactics mutate the ledger and need a full cycle around
 # them -- the hand-tester exposes only the read/analysis tools.
 _UNTESTABLE_TOOLS = {"submit_decision", "set_tactics", "stand_down"}
+
+# Agents that are not LLM personalities and so have no entry in
+# AGENT_PERSONALITIES: label + avatar for the picker and the result tables.
+_NON_LLM_AGENTS: dict[str, tuple[str, str]] = {
+    APPLE_TRADER_KEY: (APPLE_TRADER_LABEL, APPLE_TRADER_AVATAR),
+}
+
+
+def _testable_agents() -> list[str]:
+    """Every agent SimLab can replay, in picker order: the LLM personalities
+    first, the rule-based one last."""
+    return [*selectable_personalities(), APPLE_TRADER_KEY]
+
+
+def _agent_label(key: "str | None") -> str:
+    if key in _NON_LLM_AGENTS:
+        return _NON_LLM_AGENTS[key][0]
+    return AGENT_PERSONALITIES.get(key or "", {}).get("label", key or "?")
+
+
+def _agent_avatar(key: str) -> Path:
+    if key in _NON_LLM_AGENTS:
+        return AVATAR_DIR / _NON_LLM_AGENTS[key][1]
+    return AVATAR_DIR / AGENT_PERSONALITIES.get(key, {}).get("avatar", "")
 
 
 def _env_key(provider: str) -> str:
@@ -144,17 +178,80 @@ def _render_tool_tester(personality: str) -> None:
         st.json(result)
 
 
+def _render_rule_agent(personality: str) -> None:
+    """The Apple Trader's "prompt": its rules, and the model behind them.
+
+    There is nothing to edit here the way a system prompt is edited -- the
+    thresholds are per-simulation settings, picked in the Simulate tab -- so
+    this is a read-only description of what the loop does, plus the provenance
+    of the saved bundle it depends on.
+    """
+    st.subheader(_agent_label(personality))
+    st.caption(
+        ":material/function: Rule-based — no LLM, no prompt, no tools. The same tape "
+        "always produces the same trades."
+    )
+    st.markdown(
+        f"Once a minute it scores the **{APPLE_TRADER_TICKER}** bar that just closed with "
+        "the saved momentum-change regressor, which predicts Δ momentum over the next 15 "
+        "minutes in bps/min. `momentum + prediction` against the day's ±theta gives the "
+        "regime the model is pointing at:\n"
+        "- **Buy** a called change *into* the positive regime (negative → positive, "
+        "balanced → positive).\n"
+        "- **Sell** the way back out (positive → balanced, positive → negative).\n"
+        "- A call counts only if it is at least **the change threshold** big and repeats "
+        "on several consecutive closed bars.\n"
+        "- Every open position is re-checked each bar: the predicted regime has a "
+        "validation window to actually show up, and if it never does the call is written "
+        "off and the position is cut. A sustained flip to negative momentum, a hard loss "
+        "cap, and the approaching close each also close it.\n\n"
+        "Its rules are set per simulation in the **Simulate** tab, and it is never scored "
+        "by the LLM judge — it states no reasoning of its own to judge, so profit, profit "
+        "efficiency and the oracle ceiling are the whole verdict."
+    )
+
+    bundle = momentum_model.load_bundle(APPLE_TRADER_TICKER)
+    if bundle is None:
+        st.error(
+            f"No model at `{momentum_model.model_path(APPLE_TRADER_TICKER)}` (or "
+            "scikit-learn/joblib are not installed). Simulations of this agent will fail "
+            "until it is available."
+        )
+        return
+    train_days = bundle.get("train_days") or []
+    st.markdown("##### Model")
+    cols = st.columns(4)
+    cols[0].metric("Estimator", str(bundle.get("model_name", "?")))
+    cols[1].metric("Training days", len(train_days))
+    cols[2].metric("Features", len(bundle.get("feature_cols") or []))
+    cols[3].metric("Persistence (bars)", bundle["pipeline_params"]["persist"])
+    if train_days:
+        st.caption(
+            f"Fitted on {train_days[0]} → {train_days[-1]}; saved {bundle.get('saved_at', '?')}. "
+            f"{bundle.get('notes', '')}"
+        )
+    with st.expander("Pipeline parameters and held-out metrics"):
+        st.json({"pipeline_params": bundle["pipeline_params"], "metrics": bundle.get("metrics")})
+    st.warning(
+        ":material/warning: The stored metrics were measured against sampled stable "
+        "minutes, not the full minute grid. On every bar the direction survives but the "
+        "timing is close to chance — which is exactly what the per-bar re-checks above "
+        "are there to contain."
+    )
+
+
 def render_agents_tab() -> None:
-    keys = selectable_personalities()
+    keys = _testable_agents()
     personality = st.session_state.get("agents_selected", keys[0])
+    if personality not in keys:
+        personality = keys[0]
     cols = st.columns(len(keys))
     for col, key in zip(cols, keys):
-        meta = AGENT_PERSONALITIES[key]
         with col, st.container(border=True):
-            avatar = AVATAR_DIR / meta.get("avatar", "")
+            avatar = _agent_avatar(key)
             if avatar.exists():
                 st.image(str(avatar), width=72)
-            st.caption(meta["label"])
+            st.caption(_agent_label(key))
             if st.button(
                 "Selected" if key == personality else "Open",
                 key=f"agent_pick_{key}",
@@ -162,6 +259,10 @@ def render_agents_tab() -> None:
             ):
                 st.session_state["agents_selected"] = key
                 st.rerun()
+
+    if not sim_prompts.has_prompt(personality):
+        _render_rule_agent(personality)
+        return
 
     meta = AGENT_PERSONALITIES[personality]
     st.subheader(meta["label"])
@@ -359,7 +460,16 @@ def _render_run(record: dict) -> None:
     cols[3].metric("Profit efficiency", f"{eff:.1%}" if eff is not None else "—",
                    help="Session return ÷ oracle ceiling.")
     cols[4].metric("Trades filled", summary.get("trades_filled", 0))
-    cols[5].metric("LLM cycles", summary.get("cycles_run", record.get("cycles_run", 0)))
+    rule_based = bool(config.get("rule_based"))
+    cols[5].metric(
+        "Bars scored" if rule_based else "LLM cycles",
+        summary.get("cycles_run", record.get("cycles_run", 0)),
+    )
+    if rule_based:
+        st.caption(
+            f":material/function: Rule-based run — {_agent_label(config.get('personality'))}, "
+            f"no LLM and no judge. Rules: `{config.get('model')}`"
+        )
 
     equity = record.get("equity") or []
     if equity:
@@ -421,7 +531,7 @@ _STATUS_MARKUP = {
 def _experiment_label(exp: dict) -> str:
     config = exp.get("config") or {}
     personality = config.get("personality") or "?"
-    agent = AGENT_PERSONALITIES.get(personality, {}).get("label", personality)
+    agent = _agent_label(personality)
     return (
         f"**{agent}** · {config.get('provider')}/{config.get('model')} · "
         f"{exp.get('dataset')} · {len(config.get('days') or [])} day(s)"
@@ -436,7 +546,7 @@ def _past_experiment_rows(past: list[dict]) -> list[dict]:
         personality = config.get("personality") or "?"
         rows.append({
             "queued": (exp.get("created_at") or "")[:16].replace("T", " "),
-            "agent": AGENT_PERSONALITIES.get(personality, {}).get("label", personality),
+            "agent": _agent_label(personality),
             "model": f"{config.get('provider')}/{config.get('model')}",
             "dataset": exp.get("dataset"),
             "days": len(config.get("days") or []),
@@ -559,7 +669,7 @@ def _prior_run_line(record: dict, selected_days: list[str]) -> str:
 def _combo_label(combo: tuple[str, str, str, str]) -> str:
     personality, provider, model, dataset = combo
     return (
-        f"**{AGENT_PERSONALITIES.get(personality, {}).get('label', personality)}** · "
+        f"**{_agent_label(personality)}** · "
         f"{provider}/{model} · {dataset}"
     )
 
@@ -674,6 +784,49 @@ def _render_model_picker() -> tuple[list[tuple[str, str]], dict[str, str]]:
     return model_choices, api_keys
 
 
+def _render_rule_params() -> AppleTraderConfig:
+    """Apple Trader's rules for this batch. One rule set per batch, the way one
+    prompt per personality applies to every LLM combination."""
+    defaults = AppleTraderConfig()
+    with st.expander("Apple Trader rules", expanded=True):
+        st.caption(
+            "The change threshold is the headline knob: how large a predicted momentum "
+            "change must be to count as a regime call. Each distinct rule set is tracked "
+            "as its own configuration in Results, so retuning is a new test rather than a "
+            "repeat of one already run."
+        )
+        col_a, col_b = st.columns(2)
+        threshold = col_a.number_input(
+            "Change threshold (bps/min)", min_value=0.0, max_value=10.0,
+            value=defaults.threshold, step=0.05, key="sim_apple_threshold",
+            help="Default is the 90th percentile of the model's predictions on its own "
+                 "training days — act on the loudest ~10% of minutes.",
+        )
+        confirm = col_b.number_input(
+            "Confirm over (bars)", min_value=1, max_value=30,
+            value=defaults.confirm_minutes, step=1, key="sim_apple_confirm",
+        )
+        validation = col_a.number_input(
+            "Prove the regime within (bars)", min_value=1, max_value=120,
+            value=defaults.validation_minutes or 15, step=1, key="sim_apple_validation",
+        )
+        stop_loss = col_b.number_input(
+            "Loss cap (%)", min_value=0.0, max_value=20.0,
+            value=defaults.stop_loss_pct, step=0.1, key="sim_apple_stop",
+        )
+        position_pct = col_a.number_input(
+            "Position size (% of cash)", min_value=1.0, max_value=100.0,
+            value=defaults.position_pct, step=5.0, key="sim_apple_size",
+        )
+    return AppleTraderConfig(
+        threshold=float(threshold),
+        confirm_minutes=int(confirm),
+        validation_minutes=int(validation),
+        stop_loss_pct=float(stop_loss),
+        position_pct=float(position_pct),
+    )
+
+
 def render_simulate_tab() -> None:
     _render_pipeline()
     st.divider()
@@ -694,12 +847,19 @@ def render_simulate_tab() -> None:
     by_name = {d.name: d for d in datasets}
     dataset_scope = _render_dataset_scope([by_name[name] for name in selected_names])
     personalities = st.multiselect(
-        "Agents", selectable_personalities(),
-        default=selectable_personalities()[:1],
-        format_func=lambda k: AGENT_PERSONALITIES[k]["label"],
+        "Agents", _testable_agents(),
+        default=_testable_agents()[:1],
+        format_func=_agent_label,
         key="sim_agents",
     )
-    model_choices, api_keys = _render_model_picker()
+    llm_personalities = [p for p in personalities if sim_prompts.has_prompt(p)]
+    rule_personalities = [p for p in personalities if not sim_prompts.has_prompt(p)]
+    rule_config = _render_rule_params() if rule_personalities else None
+    # The model picker only sizes the LLM grid: the rule agent runs the same
+    # way whatever is selected there, so it is queued once per dataset instead.
+    model_choices, api_keys = (
+        _render_model_picker() if llm_personalities else ([], {})
+    )
 
     with st.expander("Simulation settings"):
         col_cash, col_cycle, col_max = st.columns(3)
@@ -715,9 +875,15 @@ def render_simulate_tab() -> None:
             help="Grades every entry on the information available at entry time, plus an "
                  "overall strategy-adherence review.",
         )
+        if run_judge and rule_personalities:
+            st.caption(
+                f":material/gavel: {_agent_label(rule_personalities[0])} is never judged — "
+                "it states no reasoning of its own, so profit, profit efficiency and the "
+                "oracle ceiling are its whole scorecard."
+            )
         # Judging with the agent's own model is per-combination; a single
         # explicit judge is shared by every experiment in the grid.
-        judge_override = run_judge and st.checkbox(
+        judge_override = run_judge and bool(llm_personalities) and st.checkbox(
             "Judge with a different LLM than the agent", value=False,
             help="By default each agent's own provider/model grades its run. Pick a "
                  "separate judge to avoid an agent marking its own homework.",
@@ -734,11 +900,19 @@ def render_simulate_tab() -> None:
                 "Judge API key", value=_env_key(judge_provider), type="password"
             )
 
+    # One combination per (agent, model, dataset) for the LLM agents; the rule
+    # agent has no model dimension, so its rule set stands in for one -- which
+    # also means changing a threshold queues a genuinely new combination.
+    rule_signature = config_signature(rule_config)
     combos = [
         (personality, provider, model, name)
         for name in selected_names
-        for personality in personalities
+        for personality in llm_personalities
         for provider, model in model_choices
+    ] + [
+        (personality, RULE_PROVIDER, rule_signature, name)
+        for name in selected_names
+        for personality in rule_personalities
     ]
     days_by_dataset = {name: scope["days"] for name, scope in dataset_scope.items()}
     tested = _render_already_tested(combos, days_by_dataset)
@@ -750,8 +924,28 @@ def render_simulate_tab() -> None:
 
     overridden = [p for p in personalities if sim_prompts.has_override(p)]
     if overridden:
-        labels = ", ".join(AGENT_PERSONALITIES[p]["label"] for p in overridden)
+        labels = ", ".join(_agent_label(p) for p in overridden)
         st.caption(f":material/edit: Runs with a **modified** prompt (Agents tab): {labels}.")
+    if rule_personalities:
+        missing_ticker = [
+            name for name in selected_names
+            if APPLE_TRADER_TICKER not in (dataset_scope[name]["symbols"] or [])
+        ]
+        if missing_ticker:
+            st.error(
+                f":material/error: {_agent_label(rule_personalities[0])} only trades "
+                f"{APPLE_TRADER_TICKER} (the model is fitted per ticker), which is not "
+                f"selected for: {', '.join(missing_ticker)}."
+            )
+        thin = [
+            name for name in selected_names if len(dataset_scope[name]["days"] or []) < 2
+        ]
+        if thin:
+            st.warning(
+                ":material/info: The regime threshold is derived from the *previous* "
+                "session's volatility. With a single day selected it falls back to that "
+                f"day's own — include the day before for a like-live run: {', '.join(thin)}."
+            )
     st.caption(
         ":material/monitoring: Langfuse export: "
         + ("enabled — cycles are traced and run scores registered." if obs.is_enabled()
@@ -767,11 +961,20 @@ def render_simulate_tab() -> None:
                  "as a worker slot is free.",
         )
         if combos:
+            parts = []
+            if llm_personalities:
+                parts.append(
+                    f"{len(llm_personalities)} LLM agent(s) × {len(model_choices)} model(s)"
+                )
+            if rule_personalities:
+                parts.append(f"{len(rule_personalities)} rule-based agent(s)")
             st.caption(
-                f"{len(personalities)} agent(s) × {len(model_choices)} model(s) × "
-                f"{len(selected_names)} dataset(s) = {len(combos)} combination(s)"
+                f"({' + '.join(parts)}) × {len(selected_names)} dataset(s) = "
+                f"{len(combos)} combination(s)"
                 + (f", {len(combos) - len(to_queue)} skipped" if skip_tested else "")
             )
+        elif personalities and not llm_personalities:
+            st.caption("Pick at least one dataset.")
         else:
             st.caption("Pick at least one dataset, agent, and model.")
 
@@ -782,9 +985,19 @@ def render_simulate_tab() -> None:
         ]
         missing_keys = sorted({provider for provider, _ in model_choices
                                if not api_keys.get(provider)})
+        rule_without_ticker = rule_personalities and [
+            name for name in selected_names
+            if APPLE_TRADER_TICKER not in (dataset_scope[name]["symbols"] or [])
+        ]
         if empty:
             st.error(
                 "Pick at least one trading day and one symbol for: " + ", ".join(empty)
+            )
+        elif rule_without_ticker:
+            st.error(
+                f"Add {APPLE_TRADER_TICKER} to the symbols of "
+                f"{', '.join(rule_without_ticker)}, or deselect "
+                f"{_agent_label(rule_personalities[0])}."
             )
         elif missing_keys:
             st.error(f"An API key is required for: {', '.join(missing_keys)}.")
@@ -793,21 +1006,25 @@ def render_simulate_tab() -> None:
         else:
             for personality, provider, model, name in to_queue:
                 scope = dataset_scope[name]
+                rule_based = personality in rule_personalities
                 sim_experiments.submit(name, {
                     "personality": personality,
                     "provider": provider,
                     "model": model,
-                    "api_key": api_keys[provider],
+                    "api_key": "" if rule_based else api_keys[provider],
                     "symbols": scope["symbols"],
                     "days": scope["days"],
                     "starting_cash": float(starting_cash),
                     "cycle_minutes": int(cycle_minutes),
                     "max_cycles_per_day": int(max_cycles),
                     "system_prompt_override": sim_prompts.get_override(personality),
-                    "run_judge": bool(run_judge),
+                    "rule_config": asdict(rule_config) if rule_based else None,
+                    # The rule agent is never judged: no reasoning of its own to
+                    # grade, so the profit metrics are the whole scorecard.
+                    "run_judge": bool(run_judge) and not rule_based,
                     "judge_provider": judge_provider or provider,
                     "judge_model": judge_model or model,
-                    "judge_api_key": judge_api_key or api_keys[provider],
+                    "judge_api_key": judge_api_key or api_keys.get(provider, ""),
                 })
             sim_experiments.tick(int(st.session_state.get(MAX_PARALLEL_KEY, 2)))
             st.toast(f"{len(to_queue)} experiment(s) queued",
@@ -819,7 +1036,10 @@ def render_simulate_tab() -> None:
 # Tab 4 — results
 # ---------------------------------------------------------------------------
 
-_BREAKDOWN_DIMENSIONS = {"LLM model": "model", "Dataset": "dataset", "Agent": "agent"}
+# "Model" covers both the LLM behind a personality and the rule set behind the
+# rule-based agent -- both are the thing that varies while agent and dataset
+# are held fixed.
+_BREAKDOWN_DIMENSIONS = {"Model": "model", "Dataset": "dataset", "Agent": "agent"}
 
 
 # The breakdown table is hand-rolled HTML rather than st.dataframe: only a real
@@ -850,8 +1070,7 @@ def _best_run_tooltip(best: "dict | None") -> str:
     provider, model = best.get("provider"), best.get("model")
     lines = [
         f"Model: {'/'.join(p for p in (provider, model) if p) or '?'}",
-        "Agent: " + AGENT_PERSONALITIES.get(best.get("personality"), {}).get(
-            "label", best.get("personality") or "?"),
+        "Agent: " + _agent_label(best.get("personality")),
         f"Dataset: {best.get('dataset') or '(no dataset)'}",
     ]
     if best.get("run_id"):
@@ -933,7 +1152,7 @@ def _render_results_filters(runs: list[dict]) -> list[dict]:
         placeholder="All datasets",
     )
     models = col_models.multiselect(
-        "LLM models", options["models"], key="results_filter_models",
+        "Models", options["models"], key="results_filter_models",
         placeholder="All models",
     )
     filtered = sim_results.filter_runs(runs, datasets=datasets, models=models)
@@ -976,15 +1195,14 @@ def render_results_tab() -> None:
 
     st.markdown("##### Breakdown")
     dim_label = st.segmented_control(
-        "Break down by", list(_BREAKDOWN_DIMENSIONS), default="LLM model",
+        "Break down by", list(_BREAKDOWN_DIMENSIONS), default="Model",
         key="results_breakdown_dim",
-    ) or "LLM model"
+    ) or "Model"
     dimension = _BREAKDOWN_DIMENSIONS[dim_label]
     rows = sim_results.breakdown(runs, dimension)
     if dimension == "agent":
         for row in rows:
-            row["group"] = AGENT_PERSONALITIES.get(row["group"], {}).get(
-                "label", row["group"])
+            row["group"] = _agent_label(row["group"])
     _render_breakdown_table(rows, dim_label)
     col_eff, col_score = st.columns(2)
     eff_rows = [r for r in rows if r["avg_profit_efficiency"] is not None]

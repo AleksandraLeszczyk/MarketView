@@ -20,6 +20,14 @@ requests-mock>=1.11.0
 # silently stays off without this dependency or the pack file.
 lightgbm>=4.0.0
 
+# Optional — momentum-change model behind the Apple Trader personality
+# (agent_stonks/momentum_model.py, apple_trader.py). The saved bundle is a
+# pickled sklearn pipeline, so unpickling it needs the same major version it
+# was fitted with; without these the personality reports the missing model and
+# stops instead of trading.
+scikit-learn>=1.9.0
+joblib>=1.4.0
+
 # Optional — LLM pipeline (agent_stonks/llm.py, news.py, agent.py)
 openai>=1.0.0
 anthropic>=0.34.0

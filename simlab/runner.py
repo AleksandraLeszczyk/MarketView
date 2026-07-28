@@ -27,6 +27,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 
+from agent_stonks.apple_trader import APPLE_TRADER_KEY  # noqa: E402
 from simlab import experiments  # noqa: E402
 from simlab import judge as sim_judge  # noqa: E402
 from simlab import prompts as sim_prompts  # noqa: E402
@@ -56,17 +57,25 @@ def run_experiment(experiment_id: str) -> dict:
         cycle_minutes=int(cfg["cycle_minutes"]),
         max_cycles_per_day=int(cfg["max_cycles_per_day"]),
         system_prompt_override=cfg.get("system_prompt_override"),
+        rule_config=cfg.get("rule_config"),
     )
+    rule_based = config.personality == APPLE_TRADER_KEY
     market = SimMarket(config.symbols, days)
     engine = SimulationEngine(market, config, progress=_progress)
     result = engine.run()
     _progress(
-        f"Replay finished: {result.cycles_run} LLM cycle(s), "
+        f"Replay finished: {result.cycles_run} "
+        f"{'bar(s) scored' if rule_based else 'LLM cycle(s)'}, "
         f"{len(result.decisions)} ledger entrie(s)."
     )
     summary = sim_results.summarize_run(result, market)
     judge_report = None
-    if cfg.get("run_judge"):
+    # The judge grades an agent's *reasoning* against the tape it cited. The
+    # rule agent states no reasoning of its own -- its decisions are a fixed
+    # function of the model's output -- so there is nothing for a judge to
+    # assess beyond what the profit metrics already say. It is never judged,
+    # whatever the experiment record asks for.
+    if cfg.get("run_judge") and not rule_based:
         strategy_prompt = cfg.get("system_prompt_override") or sim_prompts.get_prompt(
             config.personality
         )

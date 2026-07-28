@@ -1,5 +1,9 @@
 """Editable per-personality prompt overrides.
 
+Only the LLM personalities have a prompt at all -- the rule-based Apple Trader
+is configured by numbers, not by text -- so every function here is a no-op for
+a personality that is not in ``AGENT_PERSONALITIES``.
+
 The SimLab Agents tab lets you edit a personality's base system prompt and
 test the edited version in simulation. Overrides live as plain text files
 (``data/simlab/prompts/{personality}.txt``) -- the file is the single source
@@ -20,6 +24,11 @@ from agent_stonks.agent import AGENT_PERSONALITIES
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "data" / "simlab" / "prompts"
 
 
+def has_prompt(personality: str) -> bool:
+    """Whether this agent is prompt-driven at all."""
+    return personality in AGENT_PERSONALITIES
+
+
 def default_prompt(personality: str) -> str:
     return AGENT_PERSONALITIES[personality]["system_prompt"]
 
@@ -29,11 +38,14 @@ def _override_path(personality: str) -> Path:
 
 
 def has_override(personality: str) -> bool:
-    return _override_path(personality).exists()
+    return has_prompt(personality) and _override_path(personality).exists()
 
 
 def get_prompt(personality: str) -> str:
-    """The effective base prompt: the saved override, else the built-in."""
+    """The effective base prompt: the saved override, else the built-in.
+    Empty for an agent that has no prompt."""
+    if not has_prompt(personality):
+        return ""
     path = _override_path(personality)
     if path.exists():
         text = path.read_text()

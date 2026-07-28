@@ -22,6 +22,10 @@ duration of a simulation:
   day entirely; and a dated fetch of the simulated day would return bars from
   hours in the simulated future. Both leaks corrupted every stored
   volume_detective run before this patch existed.
+- ``momentum_model``'s cached previous sessions -> dropped on the way in and
+  on the way out. They are built from ``fetch_intraday_bars_for_date`` above
+  and keyed only by (symbol, days, date), so a cache warmed live would
+  otherwise be reused inside the simulation and vice versa.
 
 Keeping every patch point in this one module means a new live fetch added to
 the app fails loudly here (the setattr asserts the attribute exists) instead
@@ -36,7 +40,7 @@ from typing import Iterator
 import pandas as pd
 
 from agent_stonks import agent as agent_mod
-from agent_stonks import clock, historical
+from agent_stonks import clock, historical, momentum_model
 from agent_stonks.market_hours import MARKET_TZ
 
 from .market import BAR_SEC, SimMarket
@@ -129,9 +133,11 @@ def simulation_context(market: SimMarket) -> Iterator[None]:
     for module, name, replacement in patches:
         saved.append((module, name, getattr(module, name)))  # raises if renamed upstream
         setattr(module, name, replacement)
+    momentum_model.reset_history_cache()
     try:
         yield
     finally:
         for module, name, original in saved:
             setattr(module, name, original)
+        momentum_model.reset_history_cache()
         clock.clear()

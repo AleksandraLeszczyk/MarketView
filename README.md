@@ -56,6 +56,7 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
   - *Smart Money (Highest-Edge)* — **currently disabled** (listed in `agent.DISABLED_PERSONALITIES`, so it is not offered in the app or SimLab and the Automatic orchestrator never activates it; its prompt and tools stay wired for re-enabling). The composite institutional setup: identifies higher-timeframe bullish **order blocks** (`analyze_order_blocks`) and enters only when price *returns* into a demand zone during the session with intraday confirmation — a rejection candle, a filled **fair value gap** (`analyze_fair_value_gaps`), or a breaker/break-of-structure — via the composite `analyze_smart_money_setup` read. Stop sits just beyond the block; target is the next opposing structural level, sized with `smart_money_trade_geometry` to a minimum 3:1 (typically 3:1–5:1) reward/risk; long-only
   - *Premarket Analyst* — a one-shot pre-open specialist, gated to a window just before the bell and never selectable by the Automatic orchestrator once the session is live: it reads the premarket briefing and arms opening Tactics instead of trading directly, then retires once those tactics execute or the session starts
 - **Automatic (regime-adaptive orchestrator)** — a meta-agent that detects the current market regime and activates the single best-fitting strategy above for you. Before the session opens it deterministically hands off to the Premarket Analyst; during the session it reads the same analysis tools (daily trend, broad-market backdrop, intraday momentum, volume, VWAP/ADX range gate, opening range, order blocks, options walls, news) and calls `select_strategy`. It then goes to sleep and hands control to the chosen strategy, which trades normally. When that strategy judges its edge has faded (e.g. a breakout agent in a dead range, a mean-reversion agent once a trend takes hold, a momentum agent after the move and volume dry up) it calls **`stand_down`** with reasoning instead of idling on an alert — waking the orchestrator to re-assess the regime and switch to a better-suited strategy. The Agent tab status line shows the currently active strategy and detected regime
+- **🍎 Apple Trader (rule-based, no LLM)** — the one personality with no model reasoning in the loop: once a minute it scores the AAPL bar that just closed with the saved momentum-change regressor from FinNotebooks/TimeToChange (`Models/momentum_change_AAPL.joblib`) and applies fixed rules to the number that comes back, so the same tape always produces the same trades. The regressor predicts Δ momentum over the next 15 minutes in bps/min, so `momentum + prediction` against the day's ±theta gives the regime it is heading *into*: it **buys** a called change into the positive regime (negative → positive, balanced → positive) and **sells** the way back out (positive → balanced/negative). A **change threshold** parameter sets how large a predicted change must be to count at all (default 0.75 bps/min — the 90th percentile of the model's predictions on its own training days), and a call must repeat over several consecutive closed bars before it is traded, the live stand-in for the model's 15-minute persistence rule. Because the model's direction is far more reliable than its timing, every position is re-checked each bar rather than left to a static bracket: the predicted regime has a validation window to actually show up (if it never does, the call was false and the position is cut), a sustained flip into negative momentum exits, a hard loss cap exits, and everything is flattened before the close since momentum, regimes and every feature the model uses are intraday. Trades AAPL only — the model is fitted per ticker — and needs the optional `scikit-learn`/`joblib` dependencies plus the bundle (override its location with `MOMENTUM_MODEL_DIR` / `MOMENTUM_MODEL`); without them it reports the missing model instead of trading. Not selectable by the Automatic orchestrator and not available in SimLab, both of which drive LLM prompts
 - **Tactics (standing conditional trade plans)** — instead of trading at the current price, the agent can arm one or more conditional actions via `set_tactics` (e.g. "buy 10 shares if last_price below X", "sell 20% of the position if last_price above Y and vix below Z"). A background executor evaluates armed tactics against every live tick and fires the first action whose conditions all hold, through the same decision-tracker path as a manual agent decision — then disarms the set and wakes the agent to reevaluate with the fill in hand. While a sell bracket is armed on an open long position (take-profit above, protective stop below the entry price), the executor also trails the stop up mechanically: when the price's high-water mark covers a fraction of the entry→target distance, the stop rises to cover the same fraction of its own distance to the target — the take-profit never moves, and the stop only ever ratchets up
 - **Provider-agnostic** — works with Gemini, OpenAI, or Anthropic, via a unified chat-completions client
 - **Smart wake-ups** — when it doesn't want to trade, the agent sets condition alerts on any continuously-updated value (price, bid/ask, spread, day high/low, volume, relative volume, short-window momentum, portfolio value) to wake early the moment one is crossed, and always wakes early on fresh news for any symbol in the basket regardless of any alerts set — there is no idle "do nothing" decision
@@ -72,9 +73,10 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 ### 🧪 SimLab — strategy testing suite (`sim_main.py`)
 A separate app that replays the trading agents against **stored historical sessions** instead of the live tape — same prompts, same tools, same execution path (`run_agent_cycle`, `DecisionTracker`, `TacticsExecutor`), so a strategy tested here is exactly the strategy that trades live. Hours of "wait for the condition" collapse into minutes: between LLM cycles the engine fast-forwards bar by bar, firing armed tactics, condition alerts, and news wake-ups deterministically from the stored data.
 
-- **Agents tab** — every personality with its avatar, an editable system prompt (saved overrides apply only to simulations; the live app keeps the built-in), and the agent's exact tool set, each tool runnable by hand against any stored moment (pick dataset + symbol + time, see the JSON the agent would see)
+- **Agents tab** — every personality with its avatar, an editable system prompt (saved overrides apply only to simulations; the live app keeps the built-in), and the agent's exact tool set, each tool runnable by hand against any stored moment (pick dataset + symbol + time, see the JSON the agent would see). Apple Trader has no prompt or tools to edit, so its card shows its rules plus the provenance and held-out metrics of the saved model it depends on
 - **Datasets tab** — download named datasets (symbols + date range): minute bars 04:00–20:00 ET, ~1.5y of daily history, per-day news, and SPY/VIX/VIX3M context, stored as gzip JSON under `data/simlab/store/` deduplicated per (symbol, day) — overlapping datasets never re-download a day
 - **Simulate tab** — pick agent + dataset + day(s) + provider/model and run: a pinned simulated clock (`agent_stonks/clock.py`) drives real agent cycles at historical moments, `SimBroker` fills at the stored tape price, and live fetches are rerouted to the dataset (`simlab/patches.py`). Results: equity curve, per-symbol candlesticks with trade markers, the full decision ledger and agent log, an **oracle ceiling** (best single round trip available on the tape) with profit efficiency against it, and an **LLM judge** that grades every entry on the information available at entry time (outcome shown only to calibrate) plus an overall strategy-adherence review. Runs persist under `data/simlab/runs/`; with Langfuse configured, cycles are traced and run scores (`sim-return-pct`, `sim-profit-efficiency`, `sim-judge-overall`) are registered there
+- **Apple Trader in SimLab** — the rule-based agent replays on the same engine, the same tape and the same ledger, but on its own day loop: it scores *every* closed bar of the session instead of sleeping on armed conditions, so there is nothing to fast-forward past. It needs no LLM, so it is queued once per dataset rather than once per model, and its **rule set stands in for a model name** — retuning the threshold is a new configuration to test, not a repeat of one already run. **It is never scored by the LLM judge**: the judge grades an agent's stated reasoning against the tape it cited, and this one states none of its own, so profit, profit efficiency and the oracle ceiling are its whole scorecard. It requires AAPL in the dataset, and at least two days selected — the regime threshold comes from the *previous* session's volatility, and with a single day it falls back to that day's own (SimLab warns about both)
 
 ```bash
 streamlit run sim_main.py
@@ -110,6 +112,9 @@ docker run -p 8501:8501 --env-file .env agentstonks
 | `WORLD_NEWS_API_KEY` | (optional) WorldNews API key, used as a fallback news source |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | (optional) Langfuse keys — enables agent cycle tracing; no-op if unset |
 | `LANGFUSE_HOST` | (optional) Langfuse host — Langfuse Cloud is used if unset |
+| `OPEN_PROFILE_MODEL` | (optional) path to the LevelsML density-model pack — defaults to `../Models/open_profile_lgbm.json.gz` |
+| `MOMENTUM_MODEL_DIR` | (optional) directory holding `momentum_change_<TICKER>.joblib` for Apple Trader — defaults to `../FinNotebooks/Models` |
+| `MOMENTUM_MODEL` | (optional) full path to a single momentum-change bundle, overriding `MOMENTUM_MODEL_DIR` |
 
 Credentials can also be entered directly in the sidebar (Alpaca) or the Agent tab (LLM provider); env vars are used as fallback. At least one LLM provider key is required to use the Agent tab or LLM news impact scoring.
 
@@ -153,6 +158,13 @@ agent_stonks/
                   `stand_down` tool when run under Automatic
   automatic.py  — Automatic orchestrator: regime-detection cycle (`select_strategy`) that activates
                   and switches between strategy agents, handing off to the Premarket Analyst pre-open
+  momentum_model.py — momentum-change regressor (FinNotebooks/TimeToChange): mirrors momlib's
+                  momentum / adaptive regime / persistent-change definitions and feature builder,
+                  loads ../FinNotebooks/Models/momentum_change_<TICKER>.joblib, and assembles the
+                  live minute grid (yfinance sessions behind today's streamed Alpaca bars)
+  apple_trader.py — Apple Trader: rule-based (no LLM) loop that scores every closed AAPL minute
+                  with that model, trades called regime changes into/out of positive momentum,
+                  and cuts a position whose predicted regime never materializes
   scoring.py    — per-session grounding/accuracy scorecard and daily (UTC day, 1hr-runtime-gated)
                   aggregate scoring report
   performance.py— replays decisions against price bars to build the equity curve
@@ -167,12 +179,17 @@ simlab/
   market.py     — time-windowed views over a stored dataset ("as of simulated t")
   engine.py     — simulation engine: real agent cycles at a pinned clock, SimBroker
                   fills from the tape, deterministic bar-by-bar fast-forward between
-                  cycles (tactics / alerts / news wake-ups)
+                  cycles (tactics / alerts / news wake-ups); a second day loop scores
+                  every closed bar for the rule-based Apple Trader
   patches.py    — simulation context rerouting every live-fetch call site to the dataset
   judge.py      — LLM-as-judge: per-entry reasonableness + overall strategy adherence
+                  (LLM agents only; the rule-based agent is scored on profit alone)
   results.py    — run records, oracle/profit scoring, persistence, Langfuse export
-  prompts.py    — editable per-personality prompt overrides (simulation-only)
-  app.py        — the three-tab SimLab Streamlit UI
+  prompts.py    — editable per-personality prompt overrides (simulation-only; a no-op
+                  for agents that have no prompt)
+  runner.py     — worker process for one queued experiment (replay, judge, persist)
+  experiments.py— queued-experiment store and the process scheduler behind the pipeline
+  app.py        — the four-tab SimLab Streamlit UI (agents / datasets / simulate / results)
 main.py         — entry point (loads .env, launches Streamlit)
 sim_main.py     — SimLab entry point (streamlit run sim_main.py)
 tests/          — pytest suite, mirrors most modules 1:1

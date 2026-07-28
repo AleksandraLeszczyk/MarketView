@@ -20,6 +20,14 @@ from .agent import (
     selectable_personalities,
     stop_agent,
 )
+from .apple_trader import (
+    APPLE_TRADER_AVATAR,
+    APPLE_TRADER_KEY,
+    APPLE_TRADER_LABEL,
+    AppleTraderConfig,
+    launch_apple_trader,
+)
+from .apple_trader import TICKER as APPLE_TRADER_TICKER
 from .automatic import AUTOMATIC_AVATAR, AUTOMATIC_KEY, AUTOMATIC_LABEL, launch_automatic
 from .charts import (
     build_analysis_gauges,
@@ -35,6 +43,7 @@ from .config import (
     AGENT_EQUITY_HISTORY_MAXLEN,
     AGENT_LOG_POLL_SEC,
     AGENT_PERFORMANCE_POLL_SEC,
+    APPLE_TRADER_CYCLE_SEC,
     CHART_POLL_SEC,
     FEEDS,
     MAX_BARS,
@@ -128,10 +137,19 @@ def _effective_symbols(state: AppState, symbols_input: str) -> list[str]:
     return _parse_symbols(symbols_input) or list(state.symbols)
 
 
+# Agents that aren't LLM personalities and so have no entry in
+# AGENT_PERSONALITIES: the Automatic orchestrator and the rule-based Apple
+# Trader. They still need a label and a face in the picker.
+_NON_LLM_AGENTS: dict[str, tuple[str, str]] = {
+    AUTOMATIC_KEY: (AUTOMATIC_LABEL, AUTOMATIC_AVATAR),
+    APPLE_TRADER_KEY: (APPLE_TRADER_LABEL, APPLE_TRADER_AVATAR),
+}
+
+
 def _personality_label(key: str) -> str:
-    """Display label for a personality key, including the Automatic orchestrator."""
-    if key == AUTOMATIC_KEY:
-        return AUTOMATIC_LABEL
+    """Display label for a personality key, including the non-LLM agents."""
+    if key in _NON_LLM_AGENTS:
+        return _NON_LLM_AGENTS[key][0]
     entry = AGENT_PERSONALITIES.get(key) or AGENT_PERSONALITIES[DEFAULT_PERSONALITY]
     return entry["label"]
 
@@ -142,8 +160,8 @@ AVATAR_DIR = Path(__file__).resolve().parent.parent / "data" / "avatars"
 @lru_cache(maxsize=None)
 def _avatar_data_uri(key: str) -> Optional[str]:
     """Base64 data URI for a personality's avatar PNG, or None if the file is missing."""
-    if key == AUTOMATIC_KEY:
-        filename = AUTOMATIC_AVATAR
+    if key in _NON_LLM_AGENTS:
+        filename = _NON_LLM_AGENTS[key][1]
     else:
         entry = AGENT_PERSONALITIES.get(key) or AGENT_PERSONALITIES[DEFAULT_PERSONALITY]
         filename = entry["avatar"]
@@ -1561,6 +1579,76 @@ def _agent_report_section(symbols: list[str]) -> None:
         )
 
 
+def _apple_trader_params() -> AppleTraderConfig:
+    """Apple Trader's tunables. `threshold` is the headline one: how large a
+    predicted momentum change has to be before it counts as a regime call."""
+    defaults = AppleTraderConfig()
+    with st.expander("Apple Trader rules", expanded=True):
+        c1, c2 = st.columns(2)
+        threshold = c1.number_input(
+            "Change threshold (bps/min)",
+            min_value=0.0,
+            max_value=10.0,
+            value=defaults.threshold,
+            step=0.05,
+            key="apple_trader_threshold",
+            help=(
+                "Minimum |predicted Δ momentum| for a bar to count as a regime call. "
+                "The default is the 90th percentile of the model's predictions on its own "
+                "training days, i.e. act on the loudest ~10% of minutes; raise it to trade "
+                "less often and only on the strongest calls."
+            ),
+        )
+        confirm = c2.number_input(
+            "Confirm over (bars)",
+            min_value=1,
+            max_value=30,
+            value=defaults.confirm_minutes,
+            step=1,
+            key="apple_trader_confirm",
+            help=(
+                "How many consecutive closed minutes must repeat the same call before it is "
+                "traded — the live stand-in for the model's persistence rule."
+            ),
+        )
+        validation = c1.number_input(
+            "Prove the regime within (bars)",
+            min_value=1,
+            max_value=120,
+            value=defaults.validation_minutes or 15,
+            step=1,
+            key="apple_trader_validation",
+            help=(
+                "After buying, how long momentum has to actually turn positive. If it "
+                "hasn't by then the call was false and the position is cut at market."
+            ),
+        )
+        stop_loss = c2.number_input(
+            "Loss cap (%)",
+            min_value=0.0,
+            max_value=20.0,
+            value=defaults.stop_loss_pct,
+            step=0.1,
+            key="apple_trader_stop_loss",
+            help="Hard stop below the entry, checked every bar. 0 disables it.",
+        )
+        position_pct = c1.number_input(
+            "Position size (% of cash)",
+            min_value=1.0,
+            max_value=100.0,
+            value=defaults.position_pct,
+            step=5.0,
+            key="apple_trader_position_pct",
+        )
+    return AppleTraderConfig(
+        threshold=float(threshold),
+        confirm_minutes=int(confirm),
+        validation_minutes=int(validation),
+        stop_loss_pct=float(stop_loss),
+        position_pct=float(position_pct),
+    )
+
+
 def _agent_panel(
     symbols: list[str], alpaca_key: str = "", alpaca_secret: str = "", feed: str = "iex"
 ) -> None:
@@ -1577,12 +1665,15 @@ def _agent_panel(
         "continuously-updated values to wake up early the moment one is crossed, and it "
         "always wakes up early when fresh news breaks for any of its tickers. No real "
         "orders are ever placed. "
-        f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
+        f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}. "
+        "The one exception is Apple Trader, which has no LLM at all: it is a fixed loop "
+        "over a saved momentum-change model."
     )
     with st.expander("LLM", expanded=True):
         # Automatic first: it's the regime-adaptive orchestrator that picks and
-        # switches between the individual strategies on its own.
-        personality_keys = [AUTOMATIC_KEY, *selectable_personalities()]
+        # switches between the individual strategies on its own; the rule-based
+        # Apple Trader last, since it is the odd one out (no model reasoning).
+        personality_keys = [AUTOMATIC_KEY, *selectable_personalities(), APPLE_TRADER_KEY]
         personality = st.selectbox(
             "Personality",
             personality_keys,
@@ -1609,6 +1700,17 @@ def _agent_panel(
                 "(simulated at the opening prints), the analyst retires and the agent "
                 "disables itself."
             )
+        if personality == APPLE_TRADER_KEY:
+            st.caption(
+                f"🍎 Apple Trader runs no LLM. Once a minute it scores the "
+                f"{APPLE_TRADER_TICKER} bar that just closed with the saved momentum-change "
+                "regressor, buys when the model calls a persistent change into the positive "
+                "momentum regime (from negative or balanced) and sells when it calls the way "
+                "back out. Every open position is re-checked each bar: if the predicted "
+                "regime never actually shows up the call is written off and the position is "
+                f"cut. It trades {APPLE_TRADER_TICKER} only — the model is fitted per ticker. "
+                "The provider/model settings below do not apply to it."
+            )
         provider = st.selectbox(
             "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
         )
@@ -1627,8 +1729,10 @@ def _agent_panel(
         state.llm_provider = provider
         state.llm_model = model
         env_var = ENV_KEYS[provider]
-        if not os.getenv(env_var):
+        if not os.getenv(env_var) and personality != APPLE_TRADER_KEY:
             st.caption(f"⚠️ {env_var} is not set.")
+
+    apple_config = _apple_trader_params() if personality == APPLE_TRADER_KEY else None
 
     c1, c2, c3 = st.columns([1.2, 1, 1])
     starting_budget = c1.number_input(
@@ -1646,10 +1750,16 @@ def _agent_panel(
 
     if start_clicked:
         syms = list(symbols or state.symbols)
+        is_apple_trader = personality == APPLE_TRADER_KEY
         stream_ready = False
         if not syms:
             st.error("Enter at least one symbol in the sidebar first.")
-        elif not llm_key:
+        elif is_apple_trader and APPLE_TRADER_TICKER not in syms:
+            st.error(
+                f"Apple Trader only trades {APPLE_TRADER_TICKER} (the momentum-change model is "
+                f"fitted per ticker); add {APPLE_TRADER_TICKER} to the symbols in the sidebar."
+            )
+        elif not llm_key and not is_apple_trader:
             st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")
         else:
             # The live stream feeds every tool the agent reads. If it isn't
@@ -1679,13 +1789,26 @@ def _agent_panel(
                     "market is closed and adapts: the Premarket Analyst prepares opening "
                     "tactics, other strategies study structure and arm plans for the "
                     "open instead of trading the stale tape."
+                    + (
+                        " Apple Trader simply idles until the bell — it scores closed "
+                        "minute bars and there are none."
+                        if is_apple_trader
+                        else ""
+                    )
                 )
             state.starting_budget = starting_budget
             state.decision_tracker = DecisionTracker(starting_cash=starting_budget, trade_cost=TRADE_FIXED_COST)
             state.agent_log = []
             state.agent_start_time = datetime.now(tz=timezone.utc)
             state.agent_equity_history = []
-            if personality == AUTOMATIC_KEY:
+            if is_apple_trader:
+                launch_apple_trader(
+                    state,
+                    state.decision_tracker,
+                    config=apple_config or AppleTraderConfig(),
+                    cycle_sec=APPLE_TRADER_CYCLE_SEC,
+                )
+            elif personality == AUTOMATIC_KEY:
                 launch_automatic(
                     state,
                     state.decision_tracker,
