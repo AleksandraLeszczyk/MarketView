@@ -15,6 +15,13 @@ duration of a simulation:
   honest "not available in simulation" notes (point-in-time histories of
   these aren't stored; a note keeps the agent reasoning on real data instead
   of on today's targets leaking into the past)
+- ``historical.fetch_intraday_volume_bars`` / ``fetch_intraday_bars_for_date``
+  / ``fetch_daily_volume_bars`` (the volume tools' consolidated-tape reads)
+  -> stored minute/daily bars clipped to the simulated clock. Live these hit
+  yfinance for *wall-clock today*, which inside a simulation is a different
+  day entirely; and a dated fetch of the simulated day would return bars from
+  hours in the simulated future. Both leaks corrupted every stored
+  volume_detective run before this patch existed.
 
 Keeping every patch point in this one module means a new live fetch added to
 the app fails loudly here (the setattr asserts the attribute exists) instead
@@ -23,14 +30,16 @@ of silently leaking real-time data into simulated sessions.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from typing import Iterator
 
 import pandas as pd
 
 from agent_stonks import agent as agent_mod
 from agent_stonks import clock, historical
+from agent_stonks.market_hours import MARKET_TZ
 
-from .market import SimMarket
+from .market import BAR_SEC, SimMarket
 
 
 def _series(pairs: list[tuple[str, float]]) -> pd.Series:
@@ -71,12 +80,50 @@ def simulation_context(market: SimMarket) -> Iterator[None]:
             )
         }
 
+    def _bars_for_day(symbol: str, day, now: datetime) -> list[dict]:
+        """Stored minute bars for one ET `day`, completed by `now` -- a full
+        day for a past session, clipped mid-day for the simulated one."""
+        series = market.series.get(str(symbol).upper())
+        if series is None:
+            return []
+        return [
+            bar
+            for bar, ts in zip(series.minute_bars, series.minute_ts)
+            if ts.astimezone(MARKET_TZ).date() == day
+            and ts + timedelta(seconds=BAR_SEC) <= now
+        ]
+
+    def fake_intraday_volume_bars(symbol, interval="1m", ttl_sec=0):
+        now = clock.now()
+        return _bars_for_day(symbol, now.astimezone(MARKET_TZ).date(), now)
+
+    def fake_intraday_bars_for_date(symbol, date, interval="1m"):
+        # Same contract as the live fetch: bad format raises ValueError, a day
+        # with no stored bars returns [] (the tool turns that into its honest
+        # "no intraday bars for <day>" note).
+        try:
+            day = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError(f"date must be 'YYYY-MM-DD', got {date!r}") from exc
+        return _bars_for_day(symbol, day, clock.now())
+
+    def fake_daily_volume_bars(symbol, days=90, ttl_sec=0):
+        # Live shape: {"t": "YYYY-MM-DD", "v": volume}, today's partial row
+        # included (downstream ADV helpers exclude today themselves).
+        return [
+            {"t": str(bar.get("t", ""))[:10], "v": float(bar.get("v") or 0.0)}
+            for bar in market.daily_bars_at(str(symbol).upper(), clock.now())
+        ]
+
     patches = [
         (agent_mod, "fetch_bars_window", fake_bars_window),
         (agent_mod, "fetch_corporate_actions", fake_corporate_actions),
         (historical, "fetch_market_indicators", fake_market_indicators),
         (historical, "fetch_analyst_targets", fake_analyst_targets),
         (historical, "fetch_smart_money_flow", fake_smart_money_flow),
+        (historical, "fetch_intraday_volume_bars", fake_intraday_volume_bars),
+        (historical, "fetch_intraday_bars_for_date", fake_intraday_bars_for_date),
+        (historical, "fetch_daily_volume_bars", fake_daily_volume_bars),
     ]
     saved = []
     for module, name, replacement in patches:

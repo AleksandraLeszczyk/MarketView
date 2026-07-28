@@ -13,10 +13,14 @@ from __future__ import annotations
 import logging
 import sys
 from datetime import date
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load the project-root .env by explicit path: find_dotenv()'s stack-walking
+# does not reliably resolve it under ``python -m`` in a detached session, and
+# a worker without the API keys dies on its first LLM call.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 logging.basicConfig(
     level=logging.INFO,

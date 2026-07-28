@@ -690,3 +690,57 @@ class TestRunnerJudgeSelection:
         assert captured == {
             "provider": "openai", "model": "gpt-test", "api_key": "sk-agent",
         }
+
+
+class TestVolumeFetchPatches:
+    """The volume tools' yfinance fetches must serve stored bars clipped to the
+    simulated clock -- live they would return wall-clock-today data (a
+    different day entirely inside a simulation) or a full day including the
+    simulated future."""
+
+    def test_intraday_volume_bars_clip_to_sim_now(self, store):
+        from agent_stonks import historical
+
+        with simulation_context(SimMarket(["TEST"], [DAY])):
+            clock.set_simulated(OPEN_UTC + timedelta(minutes=30))
+            bars = historical.fetch_intraday_volume_bars("TEST")
+            # Bar stamped T is visible once T+60s <= now: bars 0..29.
+            assert len(bars) == 30
+            assert bars[-1]["t"] == (OPEN_UTC + timedelta(minutes=29)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+
+    def test_dated_fetch_of_sim_day_clips_to_sim_now(self, store):
+        from agent_stonks import historical
+
+        with simulation_context(SimMarket(["TEST"], [DAY])):
+            clock.set_simulated(OPEN_UTC + timedelta(minutes=10))
+            bars = historical.fetch_intraday_bars_for_date("TEST", DAY.isoformat())
+            assert len(bars) == 10  # not the stored day's full 60
+
+    def test_dated_fetch_of_unstored_day_is_empty(self, store):
+        from agent_stonks import historical
+
+        with simulation_context(SimMarket(["TEST"], [DAY])):
+            clock.set_simulated(OPEN_UTC)
+            assert historical.fetch_intraday_bars_for_date("TEST", "2026-06-12") == []
+
+    def test_dated_fetch_rejects_bad_format(self, store):
+        from agent_stonks import historical
+
+        with simulation_context(SimMarket(["TEST"], [DAY])):
+            clock.set_simulated(OPEN_UTC)
+            with pytest.raises(ValueError):
+                historical.fetch_intraday_bars_for_date("TEST", "yesterday")
+
+    def test_daily_volume_bars_shape_and_clip(self, store):
+        from agent_stonks import historical
+
+        with simulation_context(SimMarket(["TEST"], [DAY])):
+            clock.set_simulated(OPEN_UTC + timedelta(minutes=30))
+            daily = historical.fetch_daily_volume_bars("TEST")
+            assert daily, "expected prior daily bars plus today's partial"
+            assert set(daily[0]) == {"t", "v"}
+            # Last row is the sim day's partial; nothing beyond the sim day.
+            assert daily[-1]["t"] == DAY.isoformat()
+            assert all(row["t"] <= DAY.isoformat() for row in daily)

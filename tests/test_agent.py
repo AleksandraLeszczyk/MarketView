@@ -1,6 +1,6 @@
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from agent_stonks import historical as agent_historical
@@ -12,6 +12,7 @@ from agent_stonks.agent import (
     PERSONALITY_TOOLS,
     REVERSAL_TOOLS,
     SMART_MONEY_TOOLS,
+    VOLUME_DETECTIVE_SYSTEM_PROMPT,
     VOLUME_DETECTIVE_TOOLS,
     _dispatch_tool,
     _session_closed_addendum,
@@ -281,6 +282,7 @@ class TestToolHandlers:
         # gate the geometry before any size.
         assert {
             "analyze_volume_profile_2",
+            "detect_regime_shift",
             "get_quote",
             "analyze_volume",
             "analyze_intraday_momentum",
@@ -294,6 +296,47 @@ class TestToolHandlers:
         } == names
         assert "analyze_daily_trend" not in names
         assert "get_put_call_walls" not in names
+
+    def test_volume_detective_prompt_gates_levels_on_the_trajectory_read(self):
+        # The tool and the guidance that makes it binding ship together: a
+        # level map alone keeps bidding demand into a tape that has turned.
+        prompt = VOLUME_DETECTIVE_SYSTEM_PROMPT
+        assert "detect_regime_shift" in prompt
+        assert "THE TRAJECTORY OVERRIDES THE LEVEL" in prompt
+        # The trajectory read runs before the level map, not after it.
+        assert prompt.index("READ THE TRAJECTORY FIRST") < prompt.index("MAP THE LEVELS")
+        # Reacting while asleep: resting bids carry a momentum guard, and a
+        # held position carries a trajectory-based exit.
+        assert "REGIME EXIT" in prompt and "REGIME WAKE" in prompt
+        assert "momentum_pct" in prompt
+
+    def test_detect_regime_shift_dispatches_and_reads_live_bars(self):
+        app, state = _app()
+        # Live streamed buffer (not the delayed consolidated feed): 30 minutes
+        # up, then a slide -- the turn the detective has to catch.
+        base = datetime(2026, 7, 17, 13, 30, tzinfo=timezone.utc)
+        closes = [100.0 + 0.10 * i for i in range(30)] + [103.0 - 0.14 * i for i in range(1, 16)]
+        for i, c in enumerate(closes):
+            state.bars.append(
+                {
+                    "t": (base + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "o": c,
+                    "h": c + 0.05,
+                    "l": c - 0.05,
+                    "c": c,
+                    "v": 1000.0 if i < 30 else 3000.0,
+                }
+            )
+        state.last_price = closes[-1]
+        result = _dispatch_tool("detect_regime_shift", {"symbol": "AAPL"}, app, DecisionTracker())
+        assert result["shift_detected"] is True
+        assert result["bias"] == "exit_or_stand_aside"
+        assert result["levels_stale"] is True
+
+    def test_detect_regime_shift_without_bars_returns_note(self):
+        app, _ = _app()
+        result = _dispatch_tool("detect_regime_shift", {"symbol": "AAPL"}, app, DecisionTracker())
+        assert "note" in result
 
     def test_reversal_personality_uses_reversal_tools(self):
         assert PERSONALITY_TOOLS["reversal"] is REVERSAL_TOOLS
@@ -906,3 +949,38 @@ class TestOpeningRangeTool:
         result = _tool_analyze_opening_range(state, minutes=15)
         assert "opening_range_high" not in result
         assert "note" in result
+
+
+class TestParticipationUnification:
+    def _bars(self):
+        return [
+            {"t": f"2026-07-21T14:{m:02d}:00Z", "o": 100.0, "h": 101.0, "l": 99.0,
+             "c": 100.5, "v": 10_000.0 + m}
+            for m in range(30)
+        ]
+
+    def test_analyze_volume_reports_armable_pace(self, monkeypatch):
+        # The executor evaluates armed rvol_pace conditions from the trading
+        # feed's counters, not the consolidated tape -- the tool must surface
+        # that exact value so the agent arms thresholds against it.
+        import agent_stonks.agent as agent_module
+
+        _, state = _app()
+        monkeypatch.setattr(agent_historical, "fetch_intraday_volume_bars", lambda symbol: self._bars())
+        monkeypatch.setattr(agent_historical, "fetch_daily_volume_bars", lambda symbol: [])
+        monkeypatch.setattr(agent_module, "rvol_pace", lambda day_volume, daily_bars: 1.234)
+        result = _tool_analyze_volume(state)
+        assert result["rvol_pace_armable"] == 1.23
+        assert "rvol_pace" in result
+        assert "Armed tactic conditions" in result["summary"]
+
+    def test_armable_pace_none_when_unavailable(self, monkeypatch):
+        import agent_stonks.agent as agent_module
+
+        _, state = _app()
+        monkeypatch.setattr(agent_historical, "fetch_intraday_volume_bars", lambda symbol: self._bars())
+        monkeypatch.setattr(agent_historical, "fetch_daily_volume_bars", lambda symbol: [])
+        monkeypatch.setattr(agent_module, "rvol_pace", lambda day_volume, daily_bars: None)
+        result = _tool_analyze_volume(state)
+        assert result["rvol_pace_armable"] is None
+        assert "Armed tactic conditions" not in (result.get("summary") or "")

@@ -17,6 +17,16 @@ from agent_stonks.tactics import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _mid_session(monkeypatch):
+    """Pin the entry-window guard to mid-session: buys are refused outside the
+    regular session and in its final minutes, and these tests must not depend
+    on the wall-clock moment the suite happens to run."""
+    monkeypatch.setattr(
+        tactics_mod.market_hours, "seconds_to_close", lambda now=None: 3 * 3600.0
+    )
+
+
 class FakeBroker(Broker):
     def __init__(self, price: float = 100.0):
         self.price = price
@@ -727,3 +737,123 @@ class TestHoldSec:
         raw = [{**_entry_action(), "trail": "yes"}]
         tactics, error = normalize_tactics("AAPL", raw, "x")
         assert tactics is None and "trail" in error
+
+
+class TestEntryWindow:
+    def _executor(self, last_price=85.0):
+        state = _armed_state(raw_actions=[_entry_action(quantity=5)], last_price=last_price)
+        tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker(price=last_price))
+        return state, TacticsExecutor(state, tracker)
+
+    def test_buy_dormant_when_market_closed(self, monkeypatch):
+        monkeypatch.setattr(tactics_mod.market_hours, "seconds_to_close", lambda now=None: None)
+        state, executor = self._executor()
+        assert executor.check_now() is None
+        assert state.tactics is not None  # still armed, not destroyed
+
+    def test_buy_dormant_in_final_minutes(self, monkeypatch):
+        monkeypatch.setattr(tactics_mod.market_hours, "seconds_to_close", lambda now=None: 10 * 60.0)
+        state, executor = self._executor()
+        assert executor.check_now() is None
+        assert state.tactics is not None
+
+    def test_buy_fires_outside_the_cutoff(self, monkeypatch):
+        monkeypatch.setattr(tactics_mod.market_hours, "seconds_to_close", lambda now=None: 16 * 60.0)
+        state, executor = self._executor()
+        fired = executor.check_now()
+        assert fired is not None and fired.action == "buy"
+
+    def test_sell_still_live_near_the_close(self, monkeypatch):
+        monkeypatch.setattr(tactics_mod.market_hours, "seconds_to_close", lambda now=None: 5 * 60.0)
+        raw = [
+            {
+                "action": "sell",
+                "quantity": 3,
+                "conditions": [{"field": "last_price", "condition": "below", "value": 90}],
+            }
+        ]
+        state = _armed_state(raw_actions=raw, last_price=85.0)
+        broker = FakeBroker(price=85.0)
+        tracker = DecisionTracker(starting_cash=10_000, broker=broker)
+        tracker.record_trade("AAPL", "buy", 3, "seed position", "k", "s")
+        fired = TacticsExecutor(state, tracker).check_now()
+        assert fired is not None and fired.action == "sell"
+
+
+class TestExpiry:
+    def test_normalize_accepts_iso_expiry(self):
+        raw = [{**_entry_action(), "expires_at": "2026-07-27T15:30:00+00:00"}]
+        tactics, error = normalize_tactics("AAPL", raw, "x")
+        assert error is None
+        assert tactics.actions[0].expires_at == "2026-07-27T15:30:00+00:00"
+
+    def test_normalize_rejects_garbage_expiry(self):
+        raw = [{**_entry_action(), "expires_at": "soon"}]
+        tactics, error = normalize_tactics("AAPL", raw, "x")
+        assert tactics is None and "expires_at" in error
+
+    def test_naive_expiry_is_taken_as_utc(self):
+        raw = [{**_entry_action(), "expires_at": "2026-07-27T15:30:00"}]
+        tactics, error = normalize_tactics("AAPL", raw, "x")
+        assert error is None
+        assert tactics.actions[0].expires_at == "2026-07-27T15:30:00+00:00"
+
+    def test_expired_action_is_retired_siblings_stay(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        monkeypatch.setattr(
+            tactics_mod.clock,
+            "now",
+            lambda: datetime(2026, 7, 27, 16, 0, tzinfo=timezone.utc),
+        )
+        raw = [
+            {**_entry_action(quantity=5), "expires_at": "2026-07-27T15:30:00+00:00"},
+            {
+                "action": "sell",
+                "quantity": 5,
+                "conditions": [{"field": "last_price", "condition": "above", "value": 200}],
+            },
+        ]
+        state = _armed_state(raw_actions=raw, last_price=95.0)
+        tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker())
+        assert TacticsExecutor(state, tracker).check_now() is None
+        assert state.tactics is not None
+        assert [a.action for a in state.tactics.actions] == ["sell"]
+        entry = state.agent_log[-1]
+        assert entry["type"] == "tactics_execution" and entry["status"] == "expired"
+        assert not state.agent_wake_event.is_set()
+
+    def test_set_emptied_by_expiry_disarms_and_wakes(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        monkeypatch.setattr(
+            tactics_mod.clock,
+            "now",
+            lambda: datetime(2026, 7, 27, 16, 0, tzinfo=timezone.utc),
+        )
+        raw = [{**_entry_action(quantity=5), "expires_at": "2026-07-27T15:30:00+00:00"}]
+        state = _armed_state(raw_actions=raw, last_price=95.0)
+        tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker())
+        assert TacticsExecutor(state, tracker).check_now() is None
+        assert state.tactics is None
+        assert state.agent_wake_event.is_set()
+        assert "expired" in state.agent_wake_reason
+
+    def test_unexpired_action_still_fires(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        monkeypatch.setattr(
+            tactics_mod.clock,
+            "now",
+            lambda: datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc),
+        )
+        raw = [{**_entry_action(quantity=5), "expires_at": "2026-07-27T15:30:00+00:00"}]
+        state = _armed_state(raw_actions=raw, last_price=85.0)
+        tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker(price=85.0))
+        fired = TacticsExecutor(state, tracker).check_now()
+        assert fired is not None and fired.action == "buy"
+
+    def test_format_mentions_expiry(self):
+        raw = [{**_entry_action(), "expires_at": "2026-07-27T15:30:00+00:00"}]
+        tactics, _ = normalize_tactics("AAPL", raw, "x")
+        assert "[expires 2026-07-27T15:30:00+00:00]" in format_tactic_action(tactics.actions[0])

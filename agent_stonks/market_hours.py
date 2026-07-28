@@ -60,3 +60,15 @@ def seconds_until_next_open(now: "datetime | None" = None) -> float:
     """Seconds from `now` to the next regular-session open (always > 0)."""
     base = (now or clock.now()).astimezone(timezone.utc)
     return max(0.0, (next_market_open(now) - base).total_seconds())
+
+
+def seconds_to_close(now: "datetime | None" = None) -> "float | None":
+    """Seconds from `now` to today's regular-session close, or None when the
+    market is closed."""
+    if not is_market_open(now):
+        return None
+    et = _as_market_time(now)
+    close = et.replace(
+        hour=MARKET_CLOSE.hour, minute=MARKET_CLOSE.minute, second=0, microsecond=0
+    )
+    return (close - et).total_seconds()

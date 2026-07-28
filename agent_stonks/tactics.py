@@ -37,7 +37,9 @@ import threading
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Optional
 
-from . import clock, historical
+from datetime import datetime, timezone
+
+from . import clock, historical, market_hours
 from .config import TACTICS_POLL_SEC
 from .state import (
     ALERTABLE_FIELDS,
@@ -95,6 +97,10 @@ class TacticAction:
     # Whether the automatic trailing-stop ratchet may move this action's
     # protective-stop conditions (sell stops only). False = leave my levels alone.
     trail: bool = True
+    # Optional ISO-8601 timestamp after which this action is retired unfired --
+    # a stale entry bid stops lying in wait for a tape that has moved on.
+    # None = armed until executed or replaced.
+    expires_at: Optional[str] = None
 
 
 @dataclass
@@ -109,6 +115,18 @@ class Tactics:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _parse_expiry(raw: object) -> "datetime | None":
+    """Parse an expires_at value into an aware datetime, or None if unusable.
+    A naive timestamp is taken as UTC (the convention every tool output uses)."""
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def normalize_tactics(symbol: str, raw_actions: object, reasoning: str) -> "tuple[Tactics | None, str | None]":
@@ -178,6 +196,17 @@ def normalize_tactics(symbol: str, raw_actions: object, reasoning: str) -> "tupl
         trail = raw.get("trail", True)
         if not isinstance(trail, bool):
             return None, f"actions[{i}].trail must be a boolean."
+
+        expires_at = raw.get("expires_at")
+        if expires_at is not None:
+            parsed = _parse_expiry(expires_at)
+            if parsed is None:
+                return None, (
+                    f"actions[{i}].expires_at must be an ISO-8601 timestamp "
+                    f"(e.g. '2026-07-27T15:30:00-04:00'), got {expires_at!r}."
+                )
+            expires_at = parsed.isoformat()
+
         actions.append(
             TacticAction(
                 action=action,
@@ -186,6 +215,7 @@ def normalize_tactics(symbol: str, raw_actions: object, reasoning: str) -> "tupl
                 conditions=conditions,
                 note=str(raw.get("note") or ""),
                 trail=trail,
+                expires_at=expires_at,
             )
         )
 
@@ -217,6 +247,8 @@ def format_tactic_action(action: TacticAction, symbol: "str | None" = None) -> s
     conds = " and ".join(format_condition(c) for c in action.conditions)
     sym = f" {symbol}" if symbol else ""
     text = f"{action.action} {size}{sym} when {conds}"
+    if action.expires_at:
+        text += f" [expires {action.expires_at}]"
     if action.note:
         text += f" ({action.note})"
     return text
@@ -349,12 +381,54 @@ class TacticsExecutor:
         tactics = self.state.tactics
         if tactics is None or tactics.status != "armed":
             return None
+        self._retire_expired(tactics)
+        if self.state.tactics is None:
+            return None
         for action in tactics.actions:
             if self._conditions_met(action) and self._executable_now(action):
                 self._execute(tactics, action)
                 return action
         self._ratchet_trailing_stop(tactics)
         return None
+
+    def _retire_expired(self, tactics: Tactics) -> None:
+        """Drop every action whose expires_at has passed, leaving its siblings
+        armed; disarm (and wake the agent) only if the set empties out."""
+        now = clock.now()
+        app = self.state.app
+        expired = [
+            a
+            for a in tactics.actions
+            if a.expires_at and (exp := _parse_expiry(a.expires_at)) and now >= exp
+        ]
+        for action in expired:
+            summary = format_tactic_action(action, symbol=tactics.symbol)
+            try:
+                tactics.actions.remove(action)
+            except ValueError:
+                continue
+            entry = {
+                "type": "tactics_execution",
+                "ts": now.isoformat(),
+                "action": action.action,
+                "symbol": tactics.symbol,
+                "tactic": summary,
+                "status": "expired",
+                "error": f"expired unfired at {action.expires_at}",
+            }
+            with app.lock:
+                app.agent_log.append(entry)
+            logger.info("%s tactic expired unfired: %s", tactics.symbol, summary)
+        if expired and not tactics.actions:
+            tactics.status = "executed"
+            self.state.tactics = None
+            app.agent_wake_reason = "All armed tactics expired unfired."
+            app.agent_wake_event.set()
+
+    # Entry fills are refused inside the final stretch of the session: a buy
+    # filled minutes before the close has no session left to work in and just
+    # converts a stale resting bid into an overnight position.
+    ENTRY_CUTOFF_SEC = 15 * 60
 
     def _executable_now(self, action: TacticAction) -> bool:
         """Whether this action could actually transact at this moment.
@@ -366,10 +440,17 @@ class TacticsExecutor:
         sitting next to it, so a breakout buy could be wiped out by its own
         stop before the breakout ever happened. Skipping it here leaves both
         armed: the stop stays available for the fill that is still to come.
+
+        Buys are additionally dormant outside the regular session and in its
+        final ENTRY_CUTOFF_SEC (sells stay live to the bell: getting flat is
+        always allowed).
         """
         snap = self.tracker.snapshot()
         if action.action == "sell":
             return snap["positions"].get(self.state.symbol, 0.0) > 0
+        remaining = market_hours.seconds_to_close()
+        if remaining is None or remaining <= self.ENTRY_CUTOFF_SEC:
+            return False
         return (snap["cash"] - self.tracker.trade_cost) > 0
 
     def _entry_price(self, snap: dict) -> "float | None":

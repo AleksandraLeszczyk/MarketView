@@ -55,7 +55,9 @@ ALERTABLE_FIELDS: dict[str, str] = {
         "what an average day has accumulated by this same minute of the session "
         "(1.0 = normal pace, 1.5+ = clearly elevated participation, 2-3+ = a real "
         "volume surge). The honest intraday participation gauge -- usable as a "
-        "breakout-confirmation condition, unlike volume_ratio"
+        "breakout-confirmation condition, unlike volume_ratio. Computed from the "
+        "trading feed's own volume counter (analyze_volume reports this exact "
+        "value as rvol_pace_armable -- arm thresholds against it)"
     ),
     "momentum_pct": (
         f"Percent price change over the last ~{TACTICS_MOMENTUM_WINDOW_MIN} minutes of "

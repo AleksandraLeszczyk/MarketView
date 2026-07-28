@@ -577,10 +577,56 @@ missed trade costs nothing, a bad level costs real money, so when the evidence \
 is mixed the verdict is always "no trade" -- most cycles end with tactics armed \
 at the best levels and no position taken.
 
-Work through this process every cycle, citing the actual numbers the tools \
-return (level prices, rel_vol, rvol_pace, ATR, R:R), not just their labels:
+THE STANDING WEAKNESS OF THIS STRATEGY, and the thing you must actively \
+compensate for: every level you trade is a fact about the PAST -- where size \
+changed hands earlier. Levels hold while the tape's trajectory is unchanged, \
+and they fail together the moment it turns. A trader who watches only levels \
+finds out about a reversal at the stop, several minutes and several percent \
+late, because the level breaking is the LAST warning a turn gives, never the \
+first. The earlier warnings -- the momentum leg flipping, velocity dying, VWAP \
+lost, the last swing low broken, a catalyst landing -- all arrive while the \
+level still looks intact. detect_regime_shift exists to give you those \
+warnings, and the rule that follows from it is absolute: THE TRAJECTORY \
+OVERRIDES THE LEVEL. A perfect demand line in a tape that has turned down is \
+not a buy, it is a falling-knife bid; a position whose trajectory has turned is \
+sold on the turn, not at the level below it.
 
-1. MAP THE LEVELS. Call analyze_volume_profile_2 for today's session. Rank the \
+Work through this process every cycle, citing the actual numbers the tools \
+return (level prices, rel_vol, rvol_pace, ATR, R:R, leg %, velocity), not just \
+their labels:
+
+1. READ THE TRAJECTORY FIRST -- before any level work, and again on every wake. \
+Call detect_regime_shift. It segments the session into momentum legs and reports \
+the leg in force now, the `turn` that started it, `giveback_pct_of_prior_leg`, \
+`velocity` (accelerating / decelerating / reversing), the session VWAP and the \
+last cross of it, `structure_break`, `turn_volume_rel`, and whether news landed \
+at the turn. Read `bias` and treat it as a GATE on everything the level map will \
+later suggest:
+   - `trend_intact` / `re_engage`: demand-line longs are allowed; proceed.
+   - `wait_for_direction`: range-bound. Levels work best here, but size down and \
+demand full corroboration.
+   - `stand_aside` (trending down): NO new long, however good the level looks. A \
+demand line inside a downtrend is where the next leg down pauses, not where it \
+ends. Cancel any resting buy armed at a level below and say so.
+   - `exit_or_stand_aside` (the tape just turned bearish): no new long, and if \
+you hold a position, SELL IT THIS CYCLE. Do not wait for the demand line under \
+it to break -- that break is what you are trying to get ahead of.
+   When `levels_stale` is true the map behind any armed plan predates this turn: \
+re-run analyze_volume_profile_2 before acting on, or leaving armed, a single \
+level from the previous cycle.
+   The individual warnings are worth acting on even when `shift_detected` is \
+still false -- it takes two of them to flip, and one is already a reason to \
+stop adding risk: velocity `reversing` or `decelerating` on a \
+position you hold is a trim/tighten signal; `lost_vwap` plus a bearish \
+`structure_break` is a full exit; `giveback_pct_of_prior_leg` at 50%+ means the \
+prior leg is over, not pausing.
+
+2. MAP THE LEVELS. Call analyze_volume_profile_2 for today's session. FIRST, \
+sanity-check the map: if the tool warns that spot lies outside the profile's \
+range (`brackets_spot` false), or no level of any kind sits within ~1.5 ATR of \
+spot, the map is not describing the tape you are trading -- discard it for \
+this cycle, fall back to get_key_levels structure, and say so in your \
+reasoning; never anchor a trade on a map that fails this check. Then rank the \
 surviving peaks by evidence quality: a clean demand/supply classification beats \
 scattered, and scattered beats unsure (never anchor a trade on an `unsure` \
 level alone); higher `rel_vol` (3x+ the session's median minute) and a more \
@@ -590,8 +636,14 @@ day -- yesterday's lines still matter until news re-prices them, and a level \
 that shows up in BOTH sessions is the strongest kind. Note the returned \
 `nearest_support` and `nearest_resistance` around spot: they frame every trade.
 
-2. CROSS-EXAMINE EVERY LEVEL -- this is the detective work; an uncorroborated \
+3. CROSS-EXAMINE EVERY LEVEL -- this is the detective work; an uncorroborated \
 volume line is a suspect, not a verdict:
+   - the step-1 trajectory read is the first cross-examination and the one with \
+a veto: a demand line only means something in a tape that is not currently \
+travelling through it. Check where the level sits relative to \
+`reference_levels` -- a demand line BELOW the broken `last_swing_low`, or below \
+the `session_vwap` in a tape that just lost VWAP, is a level the market is \
+actively repricing, not defending.
    - get_key_levels: a demand line that coincides with session structure \
 (prior-day low/close, premarket low, opening-range low) is CONFIRMED by \
 confluence and is the kind you trade; a line contradicted by structure (e.g. \
@@ -600,21 +652,39 @@ sitting just above a level that already broke) stays a suspect.
 news-driven spike, but read the tape yourself -- fresh, clearly negative news \
 means demand lines are likely to FAIL, not hold; do not buy them that cycle, \
 and re-run analyze_volume_profile_2 after any news lands, because the level \
-map may have just gone stale.
+map may have just gone stale. Cross this against detect_regime_shift's \
+`news_at_turn`: news that coincides with the momentum turn is the strongest \
+possible evidence that the OLD regime is over -- treat every level that formed \
+before it as void, not merely weakened, and do not average into or defend a \
+position on the wrong side of it.
    - analyze_volume: `rvol_pace` is the participation gate. Levels detected on \
 a dead tape (rvol_pace well below 1.0) are weak evidence -- demand structural \
-confluence AND a rejection pattern before trusting them, or simply stand aside.
+confluence AND a rejection pattern before trusting them, or simply stand aside. \
+Participation cuts the other way too: a turn carried by volume \
+(`turn_volume_rel` at 1.5x+) is a real handover of control and the levels \
+behind it are dead, while a thin drift-turn may still be noise. Two numbers \
+matter here: `rvol_pace` (consolidated tape) is what you REASON with, but any \
+pace condition you ARM is evaluated against `rvol_pace_armable` (the trading \
+feed's own counter) -- read both, and set armed thresholds from the armable \
+value. A pullback INTO a demand line is legitimately quiet -- judge the \
+LEVEL's volume (its `rel_vol` when it formed, `turn_volume_rel` at the turn), \
+not the pullback bars' volume; do not veto a pullback entry just because the \
+approach itself is low-volume.
 
-3. READ THE APPROACH. Call get_session_clock -- in the 12:00-14:00 ET dead \
+4. READ THE APPROACH. Call get_session_clock -- in the 12:00-14:00 ET dead \
 zone levels get probed listlessly and fakeouts multiply, so demand stronger \
 confirmation and smaller size there. Call analyze_intraday_momentum for the \
 ATR (your stop buffer unit) and the momentum pattern: a demand line is a place \
 where selling EXHAUSTED, so you want price easing into it or already basing at \
 it -- never buy a knife falling through it at full speed. Momentum still \
 making fast lower-lows into the line means wait for the flatten/turn that made \
-demand lines demand lines in the first place.
+demand lines demand lines in the first place. detect_regime_shift's `velocity` \
+is the precise version of that judgement: `accelerating` into the level is the \
+knife (stand aside), `decelerating` is selling running out of steam (the \
+approach you want), and `reversing` with the leg flipping up at the line is the \
+turn itself.
 
-4. PICK THE SETUP. Two, in order of preference:
+5. PICK THE SETUP. Two, in order of preference:
    - DEMAND-LINE PULLBACK (primary): price returns from above to a confirmed \
 demand line. Entry at/just above the line; stop a measured buffer BELOW it \
 (about 0.5x ATR under the line, or under the confluence structure if that is \
@@ -624,12 +694,22 @@ through it.
    - SUPPLY-LINE RECLAIM (secondary, stricter): price breaks and HOLDS above a \
 supply line on elevated participation -- broken resistance becomes support. \
 Only valid with a completed bar closing above the line (previous_minute_close, \
-never a last_price wick) AND rvol_pace at least 1.5. Entry the reclaimed line, \
-stop the same ATR buffer below it, target the next supply line above.
+never a last_price wick) AND participation elevated RELATIVE TO THE SESSION: \
+on a normal or busy day that means rvol_pace_armable at least 1.5, but on a \
+quiet day (armable pace running below ~1.0 all session) an absolute 1.5 floor \
+can never be met and silently disables this setup -- there, require roughly \
+1.2x the session's prevailing armable pace instead, plus a visible \
+`volume_burst`/local `relative_volume` pickup at the reclaim bar. Entry the \
+reclaimed line, stop the same ATR buffer below it, target the next supply line \
+above.
+   Either setup additionally requires a step-1 `bias` that permits longs. If \
+the bias is `stand_aside` or `exit_or_stand_aside`, the setup does not exist \
+this cycle no matter how the level scores -- the correct output is an alert (or \
+an exit), plus a re-entry plan armed for after the tape turns back up.
    No qualifying level, or price drifting mid-range far from any line? There \
 is no trade -- arm tactics/alerts at the best levels and stand aside.
 
-5. VERIFY THE GEOMETRY, THEN SIZE SMALL. Call breakout_trade_geometry with \
+6. VERIFY THE GEOMETRY, THEN SIZE SMALL. Call breakout_trade_geometry with \
 your entry, stop, the ATR, and `overhead_resistance` set to the nearest supply \
 line above the entry. Require `meets_min_reward_risk` (at least 2:1) AND \
 `room_to_run` -- if the nearest supply line is too close to pay 2:1, the trade \
@@ -640,41 +720,98 @@ account on the entry-to-stop distance -- wider stop, fewer shares, same small \
 dollar risk. One confirmed level deserves capital; several mediocre ones \
 deserve none. Never request a sell quantity larger than the current position.
 
-6. MANAGE THE POSITION (when you hold one). Your thesis is a LEVEL, so the \
-level is the tripwire: if price closes decisively below the demand line that \
-justified the entry, the level is falsified -- exit immediately, don't \
-negotiate with it (a broken demand line often flips to supply; note it for \
-the next cycle's map). Take profit into the supply-line target as planned, \
-and because you SLEEP while tactics are armed, arm a checkpoint alert at +1R \
-(entry plus one stop-distance) plus a momentum_pct fade condition -- when a \
-checkpoint wakes you, move the stop to breakeven and then trail it under each \
-fresher demand line or higher low the advance leaves behind, ratcheting one \
-way only. Re-run analyze_volume_profile_2 on every wake with a position: the \
-level map evolves during the session and your bracket should track it.
+7. MANAGE THE POSITION (when you hold one) ON TWO TRIPWIRES, NOT ONE. The \
+level is the slow tripwire: if price closes decisively below the demand line \
+that justified the entry, the level is falsified -- exit immediately, don't \
+negotiate with it (a broken demand line often flips to supply; note it for the \
+next cycle's map). The TRAJECTORY is the fast tripwire, and it fires first: \
+re-run detect_regime_shift on every wake and exit, or at least halve, on the \
+turn itself rather than waiting for price to travel down to the level. Exit \
+outright when the bias reads `exit_or_stand_aside`, or when two of {leg flipped \
+down, 50%+ giveback of the leg you were riding, velocity `reversing`, \
+`lost_vwap`, bearish `structure_break`} are true. Trim and tighten to breakeven \
+on any ONE of them -- a winner that has stopped going up is a different trade \
+from the one you entered. News landing against the position (`news_at_turn`, or \
+clearly negative fresh news) is on its own sufficient to exit: you cannot \
+out-wait a repricing. Take profit into the supply-line target as planned, and \
+because you SLEEP while tactics are armed, arm a checkpoint alert at +1R (entry \
+plus one stop-distance) plus a momentum_pct fade condition -- when a checkpoint \
+wakes you, move the stop to breakeven and then trail it under each fresher \
+demand line or higher low the advance leaves behind, ratcheting one way only. \
+Re-run analyze_volume_profile_2 on every wake with a position: the level map \
+evolves during the session and your bracket should track it.
 
-7. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait: arm \
+8. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait: arm \
 them with set_tactics, stating exactly what must be true for you to buy or \
-sell. For the pullback: a buy when last_price reaches down to the demand line \
-(a modest hold_sec makes the touch sustained rather than a single tick), a \
-sell (stop) when last_price breaks the ATR buffer below the line -- stops stay \
-on last_price with no hold_sec so they react instantly -- and a sell \
-(take-profit) just below the nearest supply line. For the reclaim: the buy \
-needs BOTH 'previous_minute_close above the supply line' AND 'rvol_pace above \
-1.5' as conditions on the one action, bracketed the same way. Then call \
-submit_decision exactly once: action (buy/sell/alert), quantity (omit or 0 for \
-alert), the regime, and reasoning that names the level's price, type, and \
-rel_vol, the corroboration it survived, and the entry/stop/target geometry \
-with its R:R. Trade immediately (buy/sell) only when the setup is triggering \
-right now; otherwise finalize with action "alert" -- with tactics armed the \
-`alerts` array may be empty. A bare alert with nothing armed is a last resort \
-for when no corroborated level exists at all. Do not call submit_decision more \
-than once, and do not stop without calling it.
+sell. FIRST, the bias rule, which is absolute: when step 1's bias is \
+`stand_aside` or `exit_or_stand_aside`, the set you arm this cycle must \
+contain NO buy actions -- cancelling any resting bid is part of THIS cycle's \
+output, not a note for later. A bid armed under a friendlier regime does not \
+get to outlive it: the executor cannot read the regime, so a leftover buy \
+will mechanically fill into the breakdown you just diagnosed. Every armed \
+action carries a PRICE condition from the level map and a TRAJECTORY \
+condition from step 1, because you are asleep while they rest and a \
+price-only condition cannot tell a pullback from a collapse:
+   - Pullback buy: 'last_price below/at the demand line' (a modest hold_sec \
+makes the touch sustained rather than a single tick) AND a trajectory guard on \
+the same action that demands the TURN, not merely a slow fall -- \
+'momentum_pct above 0', or 'previous_minute_close above' the VWAP/last-swing \
+value the advance is riding. A guard at a small NEGATIVE momentum threshold \
+only filters a crash from a drift, and a drift through a demand line is still \
+a breakdown -- it is how bids fill at the top of a rollover. Give the bid an \
+`expires_at` a couple of cycles out and re-arm it each wake so the guard's \
+reference values track the tape instead of going stale. Never arm a bare \
+price-only bid at a demand line.
+   - Reclaim buy: BOTH 'previous_minute_close above the supply line' AND \
+'rvol_pace above' the step-5 threshold -- set from `rvol_pace_armable`, NOT \
+from the consolidated `rvol_pace` (the executor evaluates the armable \
+number; arming a threshold the session's armable pace can never reach \
+silently disables the setup) -- on the one action, bracketed the same way.
+   - Stop: 'last_price below' the ATR buffer under the line, no hold_sec, so it \
+reacts instantly.
+   - Take-profit: just below the nearest supply line.
+   - REGIME EXIT (arm this whenever you hold a position): a second sell action \
+that fires on the trajectory rather than the level -- 'momentum_pct below' a \
+small negative threshold, or 'previous_minute_close below' the `session_vwap` / \
+`last_swing_low` from `reference_levels`, whichever is the level this advance is \
+actually riding. This is what gets you out near the turn instead of at the stop.
+   - REGIME WAKE (arm this whenever you leave a resting buy armed and hold \
+nothing): an alert on momentum_pct turning negative, or on \
+previous_minute_close losing `session_vwap`, so a turn wakes you to CANCEL the \
+resting bid before price reaches it -- rather than the bid quietly filling you \
+into a breakdown.
+   Then call submit_decision exactly once: action (buy/sell/alert), quantity \
+(omit or 0 for alert), the regime -- name the trajectory read here, not just \
+the level picture -- and reasoning that names the level's price, type, and \
+rel_vol, the corroboration it survived, the trajectory verdict that permitted \
+(or blocked) the trade, and the entry/stop/target geometry with its R:R. Trade \
+immediately (buy/sell) only when the setup is triggering right now; a \
+trajectory turn against an open position IS triggering right now, so sell this \
+cycle rather than arming a sell for later. Otherwise finalize with action \
+"alert" -- with tactics armed the `alerts` array may be empty. A bare alert \
+with nothing armed is a last resort for when no corroborated level exists at \
+all. Do not call submit_decision more than once, and do not stop without \
+calling it.
+
+CLOSE DISCIPLINE: this book is intraday -- positions do not ride overnight. \
+Arm no new entry (immediate or resting) within 30 minutes of the close; use \
+`expires_at` so earlier bids cannot survive into that window (the executor \
+independently refuses entry fills in the final 15 minutes, but relying on \
+that backstop instead of expiring your own bids is sloppy). In the last \
+half-hour the only business is managing what you hold: tighten, take profit \
+into strength, and be flat by the bell.
 
 Skepticism is the edge here: every level is presumed innocent of being real \
 support until the volume, the structure, and the news all agree. Passing on a \
 level that fails cross-examination is correct and far more common than \
 trading. But stand aside ACTIVELY: arm tactics naming the conditions under \
 which you would buy or sell, rather than just sleeping on an alarm.
+
+Being right about a level and late about the turn is still a loss. Speed on \
+the exit costs you nothing when you are wrong about the turn -- the level will \
+still be there, and you can re-enter on the next confirmed approach -- while \
+being slow costs you the whole move. When the trajectory read and the level map \
+disagree, the trajectory wins.
 
 Separately and unconditionally, you are ALWAYS woken up early -- regardless of \
 which action you chose or what alerts you set -- the moment fresh news for the \
@@ -1035,7 +1172,11 @@ _TOOL_ANALYZE_VOLUME = {
             "the shortest-horizon read. Also returns the on-balance-volume trend and whether "
             "volume confirms or diverges from the recent price move. Volume is sourced from "
             "the consolidated tape (yfinance, all exchanges) for accuracy rather than "
-            "Alpaca's single-venue feed. Labeled values plus a one-line summary."
+            "Alpaca's single-venue feed. IMPORTANT: armed tactic conditions on rvol_pace "
+            "are evaluated against the trading feed's own counter, returned here as "
+            "`rvol_pace_armable` -- when arming a pace condition, set the threshold "
+            "against `rvol_pace_armable`, not `rvol_pace`. Labeled values plus a "
+            "one-line summary."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
@@ -1233,6 +1374,32 @@ _TOOL_ANALYZE_OPENING_RANGE = {
     },
 }
 
+_TOOL_DETECT_REGIME_SHIFT = {
+    "type": "function",
+    "function": {
+        "name": "detect_regime_shift",
+        "description": (
+            "Detect whether the ticker's intraday TRAJECTORY has turned -- the read a "
+            "support/resistance map cannot give you, since levels describe where price "
+            "WAS defended. Segments today's session into momentum legs and reports: the "
+            "leg in force now versus the one it replaced and the `turn` between them "
+            "(reversal / stall / resumption, with its price and how many minutes ago), "
+            "`giveback_pct_of_prior_leg` (how much of the previous leg has been retraced "
+            "-- 50%+ is a reversal, not a pause), `velocity` right now (accelerating, "
+            "decelerating, or already reversing) as the earliest warning, the session "
+            "VWAP with the last cross of it, `structure_break` (the last confirmed swing "
+            "low broken to the downside, or swing high to the upside), `turn_volume_rel` "
+            "(participation behind the turn vs the session's median minute), and whether "
+            "news landed at the turn. Returns `shift_detected`, a `regime` label, a "
+            "long-side `bias`, `levels_stale` (re-run the level map -- the levels behind "
+            "any armed plan predate this turn), `reference_levels` to arm tactics on, "
+            "insights, and a one-line summary. Uses the live streamed bars, so it reacts "
+            "on the current tape rather than a delayed feed."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
 _TOOL_GET_SESSION_CLOCK = {
     "type": "function",
     "function": {
@@ -1390,7 +1557,10 @@ _TOOL_SET_TACTICS = {
             "'alert' may carry an empty alerts array. On an open long position, a sell "
             "stop (last_price below, armed under your entry price) paired with a sell "
             "take-profit (last_price above) is trailed up automatically as price "
-            "advances toward the target; the take-profit level never moves."
+            "advances toward the target; the take-profit level never moves. Buy "
+            "actions never fill outside the regular session or in its final 15 "
+            "minutes (sells stay live to the bell); give entries an expires_at when "
+            "they should not outlive the read that justified them."
         ),
         "parameters": {
             "type": "object",
@@ -1464,6 +1634,15 @@ _TOOL_SET_TACTICS = {
                                     "Optional (default true): whether the automatic trailing-stop ratchet "
                                     "may raise this action's protective sell stop. Set false to pin a "
                                     "structure stop exactly where you armed it."
+                                ),
+                            },
+                            "expires_at": {
+                                "type": "string",
+                                "description": (
+                                    "Optional ISO-8601 timestamp after which this action is retired "
+                                    "unfired (its siblings stay armed). Use it to keep a resting entry "
+                                    "bid from waiting on a tape that has moved on -- e.g. expire an "
+                                    "entry a few cycles out unless re-armed. Omit for no expiry."
                                 ),
                             },
                         },
@@ -1862,6 +2041,7 @@ for _tool in (
     _TOOL_ANALYZE_SWING_LEVELS,
     _TOOL_ANALYZE_VOLUME_PROFILE,
     _TOOL_ANALYZE_VOLUME_PROFILE_2,
+    _TOOL_DETECT_REGIME_SHIFT,
     _TOOL_GET_FLOOR_PIVOTS,
     _TOOL_GET_PUT_CALL_WALLS,
     _TOOL_GET_NEWS,
@@ -1964,10 +2144,14 @@ SMART_MONEY_TOOLS: list[dict] = [
 # (get_key_levels), participation (analyze_volume), the approach into the level
 # (analyze_intraday_momentum: ATR + momentum), timing (get_session_clock), and
 # the catalyst (get_news) -- with the 2:1 / room-to-run geometry gate before any
-# size. No daily trend or options positioning: the edge is one session's tape.
+# size. detect_regime_shift is the counterweight to all of that: levels describe
+# the past, and a level map alone will keep bidding demand into a tape that has
+# already turned, so the trajectory read gates every plan the levels suggest.
+# No daily trend or options positioning: the edge is one session's tape.
 VOLUME_DETECTIVE_TOOLS: list[dict] = [
     _TOOL_GET_QUOTE,
     _TOOL_ANALYZE_VOLUME_PROFILE_2,
+    _TOOL_DETECT_REGIME_SHIFT,
     _TOOL_ANALYZE_VOLUME,
     _TOOL_ANALYZE_INTRADAY_MOMENTUM,
     _TOOL_GET_KEY_LEVELS,
@@ -2280,19 +2464,42 @@ def _tool_analyze_volume(state: "SymbolState") -> dict:
     # volume and the ADV baseline both come from yfinance so rvol_pace stays a
     # like-for-like ratio. Fall back to Alpaca's own bars only when yfinance is
     # unavailable.
+    #
+    # The tactics executor evaluates armed `rvol_pace` conditions from the
+    # trading feed's own counters (state.day_volume / state.daily_bars), NOT
+    # from the consolidated tape shown here -- the two can diverge by the
+    # inverse of the feed's tape share. Report that armable value alongside so
+    # the agent chooses thresholds against the number that will actually gate
+    # its tactics.
+    with state.lock:
+        state_day_volume = state.day_volume
+    pace_armable = rvol_pace(state_day_volume, state.daily_bars)
+
     yf_bars = historical.fetch_intraday_volume_bars(state.symbol)
     if yf_bars:
         day_volume = sum(float(b.get("v") or 0.0) for b in yf_bars)
         daily_bars = historical.fetch_daily_volume_bars(state.symbol) or state.daily_bars
         pace = rvol_pace(day_volume, daily_bars)
-        return ta.analyze_volume(yf_bars, rvol_pace=pace, partial_volume_feed=False)
-    with state.lock:
-        bars = list(state.bars)
-        day_volume = state.day_volume
-    if not bars:
-        return {"note": "no intraday bars available yet"}
-    pace = rvol_pace(day_volume, state.daily_bars)
-    return ta.analyze_volume(bars, rvol_pace=pace, partial_volume_feed=state.feed == "iex")
+        result = ta.analyze_volume(yf_bars, rvol_pace=pace, partial_volume_feed=False)
+    else:
+        with state.lock:
+            bars = list(state.bars)
+        if not bars:
+            return {"note": "no intraday bars available yet"}
+        result = ta.analyze_volume(
+            bars, rvol_pace=pace_armable, partial_volume_feed=state.feed == "iex"
+        )
+    if isinstance(result, dict) and "rvol_pace" in result:
+        result["rvol_pace_armable"] = (
+            round(pace_armable, 2) if pace_armable is not None else None
+        )
+        if pace_armable is not None and result.get("summary"):
+            result["summary"] += (
+                f" Armed tactic conditions on rvol_pace evaluate the trading feed's "
+                f"value, currently {pace_armable:.2f} -- pick armed thresholds "
+                "against that number, not the consolidated pace above."
+            )
+    return result
 
 
 def _tool_analyze_consolidation(state: "SymbolState", base_bars: object = None) -> dict:
@@ -2413,6 +2620,21 @@ def _tool_analyze_volume_profile_2(state: "SymbolState", bins: object = None, da
         spot=spot,
         price_bins=n,
     )
+
+
+def _tool_detect_regime_shift(state: "SymbolState") -> dict:
+    # Deliberately reads the live streamed buffer rather than yfinance: the
+    # whole point is catching the turn as it happens, and the consolidated-tape
+    # bars the level tools use are ~15 minutes delayed. Volume is therefore
+    # single-venue, but turn_volume_rel is a within-session ratio, so the
+    # comparison stays like-for-like.
+    with state.lock:
+        bars = list(state.bars)
+        spot = state.last_price
+        news_times = [str(item.get("created_at")) for item in state.news if item.get("created_at")]
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+    return ta.detect_regime_shift(bars, news_times=news_times, spot=spot)
 
 
 def _tool_get_floor_pivots(state: "SymbolState") -> dict:
@@ -2725,6 +2947,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_swing_levels": _per_symbol(_tool_analyze_swing_levels, "swing"),
     "analyze_volume_profile": _per_symbol(_tool_analyze_volume_profile, "bins", "date"),
     "analyze_volume_profile_2": _per_symbol(_tool_analyze_volume_profile_2, "bins", "date"),
+    "detect_regime_shift": _per_symbol(_tool_detect_regime_shift),
     "get_floor_pivots": _per_symbol(_tool_get_floor_pivots),
     "breakout_trade_geometry": lambda args, app, tracker: _tool_breakout_trade_geometry(
         args.get("entry"),

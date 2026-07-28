@@ -69,3 +69,21 @@ class TestSecondsUntilNextOpen:
 
     def test_always_positive(self):
         assert seconds_until_next_open(_et(2026, 7, 6, 12, 0)) > 0
+
+
+class TestSecondsToClose:
+    def test_mid_session(self):
+        from agent_stonks.market_hours import seconds_to_close
+
+        assert seconds_to_close(_et(2026, 7, 6, 15, 0)) == 3600.0
+
+    def test_final_minutes(self):
+        from agent_stonks.market_hours import seconds_to_close
+
+        assert seconds_to_close(_et(2026, 7, 6, 15, 50)) == 600.0
+
+    def test_closed_returns_none(self):
+        from agent_stonks.market_hours import seconds_to_close
+
+        assert seconds_to_close(_et(2026, 7, 6, 16, 30)) is None
+        assert seconds_to_close(_et(2026, 7, 4, 12, 0)) is None  # Saturday

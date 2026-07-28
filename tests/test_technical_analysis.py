@@ -16,6 +16,7 @@ from agent_stonks.technical_analysis import (
     analyze_vwap_bands,
     atr,
     breakout_trade_geometry,
+    detect_regime_shift,
     find_fair_value_gaps,
     find_order_blocks,
     floor_pivots,
@@ -721,6 +722,101 @@ class TestAnalyzeVolumeProfile2:
             assert p["date"] == "2026-07-17"
 
 
+class TestDetectRegimeShift:
+    def test_too_few_bars_returns_note(self):
+        assert "note" in detect_regime_shift(_session_bars([100.0] * 5, [1000] * 5))
+
+    def test_steady_uptrend_has_no_shift_and_keeps_the_trend_bias(self):
+        bars = _session_bars([100.0 + 0.08 * i for i in range(45)], [1000] * 45)
+        result = detect_regime_shift(bars)
+        assert result["regime"] == "trending_up"
+        assert result["shift_detected"] is False
+        assert result["bias"] == "trend_intact"
+        assert result["levels_stale"] is False
+
+    def test_rally_then_reversal_is_detected_as_bearish_with_giveback(self):
+        # 30 minutes up, then a faster 15-minute slide on heavy volume: the
+        # exact tape a level-only read keeps buying demand lines into.
+        up = [100.0 + 0.10 * i for i in range(30)]
+        down = [up[-1] - 0.14 * i for i in range(1, 16)]
+        result = detect_regime_shift(_session_bars(up + down, [1000] * 30 + [3000] * 15))
+        assert result["shift_detected"] is True
+        assert result["shift_direction"] == "bearish"
+        assert result["regime"] == "turning_down"
+        assert result["bias"] == "exit_or_stand_aside"
+        assert result["turn"]["transition"] == "reversal_down"
+        assert result["giveback_pct_of_prior_leg"] > 50
+        assert result["last_vwap_cross"]["direction"] == "lost_vwap"
+        # The turn was carried by volume, so the pre-turn level map is stale.
+        assert result["turn_volume_rel"] >= 1.5
+        assert result["levels_stale"] is True
+
+    def test_selloff_then_recovery_is_detected_as_bullish(self):
+        down = [110.0 - 0.12 * i for i in range(30)]
+        up = [down[-1] + 0.14 * i for i in range(1, 16)]
+        result = detect_regime_shift(_session_bars(down + up, [1000] * 45))
+        assert result["shift_direction"] == "bullish"
+        assert result["regime"] == "turning_up"
+        assert result["bias"] == "re_engage"
+        assert result["turn"]["transition"] == "reversal_up"
+
+    def test_thin_turn_without_volume_leaves_the_level_map_valid(self):
+        # Same shape, but the turn drifts on below-median volume: a provisional
+        # turn should not by itself void the levels.
+        up = [100.0 + 0.10 * i for i in range(30)]
+        down = [up[-1] - 0.14 * i for i in range(1, 16)]
+        result = detect_regime_shift(_session_bars(up + down, [3000] * 30 + [800] * 15))
+        assert result["shift_detected"] is True
+        assert result["turn_volume_rel"] < 1.5
+        assert result["levels_stale"] is False
+
+    def test_news_at_the_turn_marks_the_level_map_stale(self):
+        up = [100.0 + 0.10 * i for i in range(30)]
+        down = [up[-1] - 0.14 * i for i in range(1, 16)]
+        bars = _session_bars(up + down, [1000] * 45)
+        # 10:00 ET, the minute the up leg ends and the slide begins.
+        result = detect_regime_shift(bars, news_times=["2026-07-17T14:00:00Z"])
+        assert result["news_at_turn"] is True
+        assert result["levels_stale"] is True
+
+    def test_decelerating_velocity_is_reported_before_the_leg_flips(self):
+        # An advance that flattens out: velocity fades while the leg is still up.
+        closes = [100.0 + 0.10 * i for i in range(30)] + [103.0 + 0.005 * i for i in range(1, 11)]
+        result = detect_regime_shift(_session_bars(closes, [1000] * 40))
+        assert result["velocity"]["state"] == "decelerating"
+        assert result["velocity"]["recent_pct"] < result["velocity"]["previous_pct"]
+
+    def test_reference_levels_are_present_for_arming_tactics(self):
+        closes = [100.0 + 0.10 * i for i in range(30)] + [103.0 - 0.10 * i for i in range(1, 16)]
+        result = detect_regime_shift(_session_bars(closes, [1000] * 45))
+        levels = result["reference_levels"]
+        assert set(levels) == {
+            "price",
+            "session_vwap",
+            "turn_price",
+            "last_swing_high",
+            "last_swing_low",
+            "session_high",
+            "session_low",
+        }
+        assert levels["session_high"] >= levels["price"] >= levels["session_low"]
+        assert levels["session_vwap"] is not None
+
+    def test_bearish_structure_break_when_the_last_swing_low_gives_way(self):
+        # Up, a pullback that prints a confirmed swing low, a bounce, then a
+        # break of that low.
+        closes = (
+            [100.0 + 0.10 * i for i in range(20)]        # advance
+            + [102.0 - 0.10 * i for i in range(1, 8)]    # pullback to ~101.3
+            + [101.3 + 0.10 * i for i in range(1, 8)]    # bounce
+            + [102.0 - 0.15 * i for i in range(1, 12)]   # break the swing low
+        )
+        result = detect_regime_shift(_session_bars(closes, [1000] * len(closes)))
+        assert result["structure_break"] == "bearish"
+        assert result["last_swing_low"]["price"] > result["reference_levels"]["price"]
+        assert any("break of structure" in i for i in result["insights"])
+
+
 class TestFloorPivots:
     PRIOR_DAILY = {"t": "2026-07-16T04:00:00Z", "o": 102.0, "h": 110.0, "l": 100.0, "c": 105.0, "v": 1e6}
     TODAY_DAILY = {"t": "2026-07-17T04:00:00Z", "o": 104.0, "h": 108.0, "l": 103.0, "c": 106.0, "v": 5e5}
@@ -1084,3 +1180,34 @@ class TestOpeningRange:
         result = key_levels(bars, daily_bars=None, opening_range=cached)
         assert result["levels"]["opening_range_high"] == 102.0
         assert result["levels"]["opening_range_low"] == 100.0
+
+
+class TestProfile2BracketsSpot:
+    def _result(self, spot):
+        closes = [100.0] * 15
+        closes += [100.0 + 0.1 * i for i in range(1, 16)]
+        closes += [closes[-1] - 0.1 * i for i in range(1, 16)]
+        vols = [5000] * 15 + [1000] * 30
+        vols[30] = 6000
+        return analyze_volume_profile_2(_session_bars(closes, vols), spot=spot)
+
+    def test_in_range_spot_brackets(self):
+        result = self._result(spot=100.5)
+        assert result["brackets_spot"] is True
+        assert result["warning"] is None
+
+    def test_out_of_range_spot_warns_loudly(self):
+        # A spot several percent outside the session's range means the map is
+        # describing some other tape (wrong day, stale fetch) -- the result
+        # must say so instead of returning a normal-looking level list.
+        result = self._result(spot=110.0)
+        assert result["brackets_spot"] is False
+        assert "WARNING" in result["warning"]
+        assert "WARNING" in result["summary"]
+
+    def test_slightly_beyond_range_is_tolerated(self):
+        # ~15-min delayed source bars: a genuine breakout just past the mapped
+        # high must not read as a corrupt map.
+        top = self._result(spot=100.5)["range_high"]
+        result = self._result(spot=top * 1.005)
+        assert result["brackets_spot"] is True
