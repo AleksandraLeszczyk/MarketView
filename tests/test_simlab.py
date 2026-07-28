@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_stonks import clock
+from agent_stonks.agent import MOMENTUM_SYSTEM_PROMPT
 from simlab import data as sim_data
 from simlab import prompts as sim_prompts
 from simlab import results as sim_results
@@ -214,6 +215,24 @@ class TestEngine:
     def test_clock_restored_after_run(self, store):
         _run_sim(store)
         assert not clock.is_simulated()
+
+    def test_result_records_the_prompt_and_tools_that_produced_it(self, store):
+        # `prompt_overridden` alone can't distinguish two revisions of the
+        # built-in prompt, so the run has to carry the resolved text itself.
+        _, result = _run_sim(store)
+        assert result.prompt_used == MOMENTUM_SYSTEM_PROMPT
+        assert "get_quote" in result.tool_names
+        assert "analyze_swing_levels" in result.tool_names
+
+    def test_result_records_an_overriding_prompt(self, store):
+        market = SimMarket(["TEST"], [DAY])
+        config = SimulationConfig(
+            personality="momentum", provider="openai", model="fake", api_key="",
+            symbols=["TEST"], days=[DAY], starting_cash=10_000.0, cycle_minutes=5,
+            system_prompt_override="custom plan",
+        )
+        result = SimulationEngine(market, config).run(client=_scripted_client())
+        assert result.prompt_used == "custom plan"
 
     def test_summary_and_oracle(self, store):
         market, result = _run_sim(store)

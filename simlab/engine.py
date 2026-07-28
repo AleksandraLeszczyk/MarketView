@@ -28,7 +28,14 @@ from datetime import date, datetime, timedelta
 from typing import Any, Callable, Optional
 
 from agent_stonks import clock
-from agent_stonks.agent import PREMARKET_PERSONALITY, run_agent_cycle
+from agent_stonks.agent import (
+    AGENT_PERSONALITIES,
+    DEFAULT_PERSONALITY,
+    MOMENTUM_TOOLS,
+    PERSONALITY_TOOLS,
+    PREMARKET_PERSONALITY,
+    run_agent_cycle,
+)
 from agent_stonks.broker import Broker
 from agent_stonks.config import PREMARKET_LEAD_SEC
 from agent_stonks.decisions import DecisionTracker
@@ -177,7 +184,22 @@ class SimulationEngine:
             starting_cash=self.config.starting_cash,
             error=error,
             interrupted=self._stop_requested,
+            # Resolved exactly as run_agent_cycle resolves them, so a stored
+            # run says which prompt and which tools actually produced it --
+            # `prompt_overridden` alone can't tell two built-in prompt
+            # revisions apart when comparing runs weeks later.
+            prompt_used=self._resolved_prompt(),
+            tool_names=self._resolved_tool_names(),
         )
+
+    def _resolved_prompt(self) -> str:
+        return self.config.system_prompt_override or AGENT_PERSONALITIES.get(
+            self.config.personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY]
+        )["system_prompt"]
+
+    def _resolved_tool_names(self) -> list[str]:
+        tools = PERSONALITY_TOOLS.get(self.config.personality, MOMENTUM_TOOLS)
+        return [t["function"]["name"] for t in tools]
 
     # ------------------------------------------------------------- stepping
 

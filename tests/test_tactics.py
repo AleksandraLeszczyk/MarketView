@@ -284,7 +284,9 @@ class TestTacticsExecutor:
         assert broker.orders and broker.orders[0][0] == "buy"
         assert broker.orders[0][1] == 50.0  # 50% of $10k at $100/sh
 
-    def test_unfillable_sell_logs_error_and_wakes_agent(self):
+    def test_sell_is_dormant_while_flat(self):
+        """A sell whose condition holds but which owns no position must not
+        fire: it transacts nothing, and firing it used to disarm the set."""
         raw = [
             {
                 "action": "sell",
@@ -295,12 +297,84 @@ class TestTacticsExecutor:
         state = _armed_state(raw_actions=raw, last_price=125.0)
         tracker = DecisionTracker(starting_cash=100, broker=FakeBroker(price=125.0))  # no position
 
+        assert TacticsExecutor(state, tracker).check_now() is None
+
+        assert state.tactics is not None  # still armed, for the position to come
+        assert not state.agent_wake_event.is_set()
+        assert not state.agent_log
+
+    def test_protective_stop_while_flat_does_not_kill_the_entry_trigger(self):
+        """The regression this guard exists for: price dips through the stop
+        before the breakout entry fires. The entry must survive."""
+        raw = [
+            _entry_action(quantity=5),  # buy when last_price below 90
+            {
+                "action": "sell",
+                "quantity_pct": 100,
+                "conditions": [{"field": "last_price", "condition": "below", "value": 95}],
+            },
+        ]
+        state = _armed_state(raw_actions=raw, last_price=93.0)  # stop met, entry not
+        tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker(price=93.0))
+
+        assert TacticsExecutor(state, tracker).check_now() is None
+        assert state.tactics is not None
+        assert len(state.tactics.actions) == 2  # nothing dropped
+
+        # ...and the entry still fires when its own level finally trades.
+        state.last_price = 85.0
+        fired = TacticsExecutor(state, tracker).check_now()
+        assert fired is not None and fired.action == "buy"
+
+    def test_action_resolving_to_zero_is_dropped_not_disarming(self):
+        """A percent-of-cash buy triggered on a completed bar while no trade
+        price is known sizes to nothing. It is retired on its own, leaving the
+        sibling stop armed rather than disarming the set."""
+        raw = [
+            {
+                "action": "buy",
+                "quantity_pct": 50,
+                "conditions": [
+                    {"field": "previous_minute_close", "condition": "above", "value": 90}
+                ],
+            },
+            {
+                "action": "sell",
+                "quantity": 5,
+                "conditions": [{"field": "last_price", "condition": "below", "value": 10}],
+            },
+        ]
+        state = _armed_state(raw_actions=raw, last_price=None)
+        state.previous_minute_close = 95.0  # buy condition met, but price unknown
+        tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker())
+
+        TacticsExecutor(state, tracker).check_now()
+
+        assert state.tactics is not None
+        assert [a.action for a in state.tactics.actions] == ["sell"]
+        entry = state.agent_log[-1]
+        assert entry["type"] == "tactics_execution" and entry["status"] == "skipped"
+        assert not state.agent_wake_event.is_set()
+
+    def test_last_action_dropped_disarms_and_wakes(self):
+        raw = [
+            {
+                "action": "buy",
+                "quantity_pct": 50,
+                "conditions": [
+                    {"field": "previous_minute_close", "condition": "above", "value": 90}
+                ],
+            }
+        ]
+        state = _armed_state(raw_actions=raw, last_price=None)
+        state.previous_minute_close = 95.0
+        tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker())
+
         TacticsExecutor(state, tracker).check_now()
 
         assert state.tactics is None
         assert state.agent_wake_event.is_set()
-        entry = state.agent_log[-1]
-        assert entry["type"] == "tactics_execution" and entry["status"] == "error"
+        assert "Tactics exhausted" in state.agent_wake_reason
 
     def test_first_matching_action_wins_and_disarms_rest(self):
         raw = [

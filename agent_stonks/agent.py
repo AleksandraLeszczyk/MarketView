@@ -63,11 +63,20 @@ return (levels, ratios, RSI, ATR), not just their labels:
 
 1. SCREEN FOR A MOMENTUM CONDITION. Call get_quote (price vs prior close -- a \
 5-20% gap is the sweet spot; bigger than that is often already parabolic and \
-late) and analyze_volume (relative volume -- you want it clearly elevated, \
-2x+ is the kind of move worth your attention; flat/declining volume means \
-there's no real participation behind the move). Call get_news to find the \
-catalyst -- earnings beat, upgrade, FDA news, M&A. A move with no catalyst \
-and no volume is noise, not momentum; default to standing aside with an alert.
+late, but a small gap is NOT a veto: an intraday trend that builds after a \
+flat open is a perfectly good momentum condition) and analyze_volume. \
+Participation must clear BOTH bars, and they measure different things: \
+`rvol_pace` (time-of-day-adjusted session pace) must be at least 2.0, AND \
+`relative_volume` (the last 10 bars against the prior 10 -- participation \
+RIGHT NOW) must be at least 1.2. The tool combines them for you as \
+`participation_ok`; treat that being false as a veto on entering. Pace alone \
+is not confirmation: it stays elevated all session on any busy day and will \
+happily wave through a move that buyers have already abandoned. If pace is \
+high but local relative volume is under 1.2, the move is being carried by \
+earlier volume, not current volume -- stand aside. \
+Call get_news to find the catalyst -- earnings beat, \
+upgrade, FDA news, M&A. A move with no catalyst and no volume is noise, not \
+momentum; default to standing aside with an alert.
 
 2. IDENTIFY THE SETUP. Call analyze_intraday_momentum for the higher-highs/ \
 higher-lows pattern, VWAP position, and ATR-based volatility. Match what you \
@@ -86,21 +95,31 @@ side of VWAP price is on right now.
 3. ENTRY DISCIPLINE. Never chase, and never buy mid-air. Require: a \
 recognizable setup from step 2, a clear breakout/reclaim level to anchor the \
 entry (analyze_consolidation's `base_high`, or VWAP -- a MEASURED level, \
-never one you eyeballed), and volume confirmation of at least 1.5x average \
--- analyze_volume's `relative_volume` speaks to this directly. Know your \
-stop before you size the trade: for a bull flag, just below `base_low`; for \
-a VWAP reclaim, just below VWAP.
-   Then check the ROOM OVERHEAD: call get_key_levels and take the nearest \
-resistance ABOVE your entry (prior-day high, premarket high, opening-range \
-high, session high). Feed it to breakout_trade_geometry as \
-`overhead_resistance`, with your entry, stop, atr, and base_height: if \
-`room_to_run` is false, the ceiling is too close to pay 2:1 on the stop -- \
-do NOT buy into it; arm the buy at a break of THAT level instead, so the \
-trade only triggers once the ceiling is cleared. An entry sitting within \
-about 1 ATR below an untested overhead level is chasing into resistance \
-even when the flag itself looks clean. No overhead level at all (blue sky \
-above the prior-day and session highs) is the highest-quality momentum \
-condition.
+never one you eyeballed), and the two-part volume confirmation from step 1. \
+Know your stop before you size the trade: for a bull flag, just below \
+`base_low`; for a VWAP reclaim, just below VWAP.
+   NOT-ALREADY-EXTENDED CHECK, before anything else -- this is the single \
+most common way a clean-looking setup loses money. If \
+analyze_intraday_momentum's `pct_change_in_window` is already above about \
+2%, or price sits more than 1 ATR above `base_high`, the move has ALREADY \
+run and you would be buying the top of it. Stand aside and wait for the next \
+base to form; do not arm an entry into an extended move.
+   VOLATILITY CAP. If `atr` is more than about 0.8% of price (check \
+analyze_intraday_momentum's `volatility_pct_of_price`), the name is too wide \
+for a same-day momentum trade: either halve the size or stand aside. Wide-ATR \
+names produce stops so far away that a normal wiggle takes out the trade.
+   Then check the ROOM OVERHEAD: call get_key_levels and look at the levels \
+ABOVE your entry (prior-day high, premarket high, opening-range high, \
+session high). Do NOT automatically take the nearest one. A level within \
+about 0.5 ATR of your entry is noise, not a ceiling -- price is already \
+trading through it; ignore it. Your real ceiling is the first level that \
+leaves at least 1.5 ATR of room above the entry. Feed THAT level to \
+breakout_trade_geometry as `overhead_resistance`, with your entry, stop, \
+atr, and base_height, and require 2:1 against it. If even that level is too \
+close to pay 2:1 (`room_to_run` false), do not buy into it -- arm the buy at \
+a break of THAT level instead, so the trade only triggers once the ceiling is \
+cleared. No overhead level at all (blue sky above the prior-day and session \
+highs) is the highest-quality momentum condition.
 
 4. SIZE THE TRADE. Call get_position for current cash and share count. Risk \
 a small, fixed slice of the account on the distance between entry and your \
@@ -135,14 +154,19 @@ clears the measured `base_high` / reclaim level (or the overhead resistance \
 level itself, when `room_to_run` failed below it), a sell (stop) when \
 last_price drops below `base_low` or VWAP, and a sell (take-profit) into \
 your target -- the nearest overhead level from get_key_levels is the \
-natural first take-profit. Volume confirmation (step 3) can be encoded \
-mechanically: add an 'rvol_pace above 1.5' condition to the entry (the \
+natural first take-profit. Volume confirmation (step 1) is encoded \
+mechanically: add an 'rvol_pace above 2.0' condition to the entry (the \
 time-of-day-adjusted pace field built for this) and prefer \
 'previous_minute_close' over last_price for the entry cross so a completed \
-bar must CLOSE through the level rather than a single wick tick. Do NOT use \
-the volume_ratio field as a pace condition -- it is today's CUMULATIVE \
-volume vs a full average day's and stays far below any intraday-pace \
-threshold for most of the session. Then call submit_decision \
+bar must CLOSE through the level rather than a single wick tick. Note that \
+`relative_volume`, the other half of the step-1 gate, is NOT a tactic \
+condition field -- so an armed entry is only ever pace-filtered. That is \
+exactly why you must satisfy the local-participation half YOURSELF before \
+arming: if relative_volume is under 1.2 right now, arming the entry hands a \
+trade you would have rejected to a filter that cannot see the difference. \
+Do NOT use the volume_ratio field as a pace condition -- it is today's \
+CUMULATIVE volume vs a full average day's and stays far below any \
+intraday-pace threshold for most of the session. Then call submit_decision \
 exactly once: action (buy/sell/alert), quantity (omit or 0 for alert), the \
 regime, and reasoning that names the setup, the breakout/stop levels, and \
 the volume confirmation you used. Trade immediately (buy/sell) only when the \
@@ -165,10 +189,11 @@ alert wait is never blind to breaking news.
 """
 
 # Guidance for the advanced level tools (swing clusters, volume profile, floor
-# pivots -- steps 4-6 of the S/R plan). The tools are implemented and
-# dispatch-wired but not yet enabled: to turn them on, uncomment the
-# MOMENTUM_SYSTEM_PROMPT reassignment below AND the three _TOOL_ANALYZE_SWING_LEVELS /
-# _TOOL_ANALYZE_VOLUME_PROFILE / _TOOL_GET_FLOOR_PIVOTS entries in MOMENTUM_TOOLS.
+# pivots -- steps 4-6 of the S/R plan), appended to MOMENTUM_SYSTEM_PROMPT
+# below. Kept separate from the base prompt so the momentum agent can be run
+# without the extra level sources by dropping the reassignment and the three
+# _TOOL_ANALYZE_SWING_LEVELS / _TOOL_ANALYZE_VOLUME_PROFILE /
+# _TOOL_GET_FLOOR_PIVOTS entries in MOMENTUM_TOOLS.
 MOMENTUM_ADVANCED_LEVELS_ADDENDUM = """\
 
 ADVANCED LEVELS (confluence). Beyond get_key_levels' session structure, three \
@@ -186,10 +211,11 @@ next high-volume node, improving the realistic first target.
 prior day's range -- formula levels, but widely watched; treat a pivot that \
 coincides with a structural level as reinforced, and one on its own as minor.
 Whichever of these caps your upside goes into breakout_trade_geometry's \
-`overhead_resistance`, exactly as with get_key_levels.
+`overhead_resistance`, exactly as with get_key_levels -- applying the same \
+step-3 rule: skip levels within 0.5 ATR of the entry as noise and take the \
+first one that leaves at least 1.5 ATR of room.
 """
-# Uncomment to enable the advanced level guidance (with the MOMENTUM_TOOLS entries):
-# MOMENTUM_SYSTEM_PROMPT = MOMENTUM_SYSTEM_PROMPT + MOMENTUM_ADVANCED_LEVELS_ADDENDUM
+MOMENTUM_SYSTEM_PROMPT = MOMENTUM_SYSTEM_PROMPT + MOMENTUM_ADVANCED_LEVELS_ADDENDUM
 
 BREAKOUT_SYSTEM_PROMPT = """\
 You are an autonomous breakout-trading agent for a basket of equity tickers, \
@@ -998,15 +1024,18 @@ _TOOL_ANALYZE_VOLUME = {
     "function": {
         "name": "analyze_volume",
         "description": (
-            "Analyze recent trade volume to gauge participation. `rvol_pace` is the primary "
-            "gauge: today's cumulative volume vs what an average day has accumulated by this "
-            "same minute of the session (1.0 = normal pace, 1.5+ = clearly elevated) -- the "
-            "honest intraday participation read. Also returns the local `relative_volume` "
-            "(last 10 bars vs the prior 10 -- a few-minute pulse, not a day-level gauge), "
-            "the on-balance-volume trend, and whether volume confirms or diverges from the "
-            "recent price move. Volume is sourced from the consolidated tape (yfinance, all "
-            "exchanges) for accuracy rather than Alpaca's single-venue feed. Labeled values "
-            "plus a one-line summary."
+            "Analyze recent trade volume to gauge participation. Two gauges that answer "
+            "different questions: `rvol_pace` is today's cumulative volume vs what an "
+            "average day has accumulated by this same minute (1.0 = normal pace, 2.0+ = "
+            "clearly elevated), while the local `relative_volume` (last 10 bars vs the "
+            "prior 10) is participation RIGHT NOW. Pace stays elevated all session once a "
+            "name is busy, so it alone cannot tell a live move from one buyers have already "
+            "left -- use `participation_ok`, which is true only when BOTH clear (pace >= 2.0 "
+            "and local >= 1.2), and `volume_burst` (last 3 bars vs the 10-bar average) for "
+            "the shortest-horizon read. Also returns the on-balance-volume trend and whether "
+            "volume confirms or diverges from the recent price move. Volume is sourced from "
+            "the consolidated tape (yfinance, all exchanges) for accuracy rather than "
+            "Alpaca's single-venue feed. Labeled values plus a one-line summary."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
@@ -1862,13 +1891,14 @@ MOMENTUM_TOOLS: list[dict] = [
     _TOOL_ANALYZE_CONSOLIDATION,
     _TOOL_GET_KEY_LEVELS,
     _TOOL_BREAKOUT_TRADE_GEOMETRY,
-    # Advanced level sources (swing clusters, volume profile, floor pivots):
-    # implemented and dispatch-wired, disabled here. To enable, uncomment the
-    # three lines below AND the MOMENTUM_SYSTEM_PROMPT reassignment under
-    # MOMENTUM_ADVANCED_LEVELS_ADDENDUM near the top of this file.
-    # _TOOL_ANALYZE_SWING_LEVELS,
-    # _TOOL_ANALYZE_VOLUME_PROFILE,
-    # _TOOL_GET_FLOOR_PIVOTS,
+    # Advanced level sources (swing clusters, volume profile, floor pivots).
+    # Enabled together with MOMENTUM_ADVANCED_LEVELS_ADDENDUM: step 3 asks for
+    # the first level leaving 1.5 ATR of room rather than the nearest tick of
+    # session structure, and touch-ranked swing clusters plus volume-profile
+    # nodes are what make that level findable.
+    _TOOL_ANALYZE_SWING_LEVELS,
+    _TOOL_ANALYZE_VOLUME_PROFILE,
+    _TOOL_GET_FLOOR_PIVOTS,
     _TOOL_GET_NEWS,
     _TOOL_GET_POSITION,
     _TOOL_SET_TACTICS,

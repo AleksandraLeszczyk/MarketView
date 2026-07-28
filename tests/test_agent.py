@@ -7,6 +7,7 @@ from agent_stonks import historical as agent_historical
 from agent_stonks import market_hours
 from agent_stonks.agent import (
     BREAKOUT_TOOLS,
+    MOMENTUM_SYSTEM_PROMPT,
     MOMENTUM_TOOLS,
     PERSONALITY_TOOLS,
     REVERSAL_TOOLS,
@@ -241,11 +242,12 @@ class TestToolHandlers:
         result = _tool_breakout_trade_geometry(entry=100.0, stop=98.0, atr=3.0, overhead_resistance=101.0)
         assert result["room_to_run"] is False
 
-    def test_advanced_level_tools_dispatch_but_are_not_exposed_yet(self):
-        # Steps 4-6 of the S/R plan: analyzers are dispatch-wired (so enabling
-        # them is only a MOMENTUM_TOOLS + prompt-addendum uncomment away) but
-        # not yet in any personality's toolset -- except analyze_volume_profile_2,
-        # which the Volume Signal Detective is built around.
+    def test_advanced_level_tools_dispatch_and_are_exposed_to_momentum_only(self):
+        # Steps 4-6 of the S/R plan. Momentum step 3 asks for the first level
+        # leaving 1.5 ATR of room rather than the nearest tick of session
+        # structure, which needs these level sources; the other personalities
+        # keep the narrower toolset -- except analyze_volume_profile_2, which
+        # the Volume Signal Detective is built around.
         app, state = _app()
         tracker = DecisionTracker()
         assert "note" in _dispatch_tool("analyze_swing_levels", {"symbol": "AAPL"}, app, tracker)
@@ -255,15 +257,21 @@ class TestToolHandlers:
         pivots = _dispatch_tool("get_floor_pivots", {"symbol": "AAPL"}, app, tracker)
         assert pivots["levels"]["pivot"] == 105.0
         assert pivots["nearest_resistance"]["name"] == "r1"
+        advanced = {"analyze_swing_levels", "analyze_volume_profile", "get_floor_pivots"}
         for personality, tools in PERSONALITY_TOOLS.items():
             names = {t["function"]["name"] for t in tools}
-            assert not {
-                "analyze_swing_levels",
-                "analyze_volume_profile",
-                "get_floor_pivots",
-            } & names
+            if personality == "momentum":
+                assert advanced <= names
+            else:
+                assert not advanced & names
             if personality != "volume_detective":
                 assert "analyze_volume_profile_2" not in names
+
+    def test_momentum_prompt_carries_the_advanced_levels_guidance(self):
+        # The tools and the guidance that explains them ship together --
+        # exposing one without the other is the failure mode worth catching.
+        assert "ADVANCED LEVELS (confluence)" in MOMENTUM_SYSTEM_PROMPT
+        assert "analyze_swing_levels" in MOMENTUM_SYSTEM_PROMPT
 
     def test_volume_detective_personality_uses_volume_detective_tools(self):
         assert PERSONALITY_TOOLS["volume_detective"] is VOLUME_DETECTIVE_TOOLS

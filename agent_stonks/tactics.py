@@ -10,11 +10,19 @@ same moment for the action to fire.
 `TacticsExecutor` is the matching engine: a background thread, nudged by every
 stream tick (bars/trades/quotes) and backed by a slow fallback poll, that
 evaluates the armed tactics against live state and executes the first action
-whose conditions are met -- through the same `DecisionTracker` path the agent's
-own buy/sell decisions take, so fills, fees, logging, and charting behave
-identically. After one action executes, the whole tactics set is disarmed and
-the agent is woken to reevaluate with the fill in hand; it re-arms whatever
-still applies on the next cycle.
+whose conditions are met AND that can actually transact right now -- through
+the same `DecisionTracker` path the agent's own buy/sell decisions take, so
+fills, fees, logging, and charting behave identically. After one action
+executes, the whole tactics set is disarmed and the agent is woken to
+reevaluate with the fill in hand; it re-arms whatever still applies on the next
+cycle.
+
+Executability is part of the match, not an afterthought: a sell is dormant
+while the position is flat and a buy is dormant with no cash. A protective stop
+armed next to an entry trigger is meant to cover the position that entry will
+open, so a dip through the stop level BEFORE the entry fires must leave both
+armed -- otherwise the agent loses its breakout buy to its own stop and sits
+out the move (see `_executable_now`).
 
 While a sell bracket is armed on an open long position -- a take-profit
 ("sell when last_price above target") together with a protective stop ("sell
@@ -342,11 +350,27 @@ class TacticsExecutor:
         if tactics is None or tactics.status != "armed":
             return None
         for action in tactics.actions:
-            if self._conditions_met(action):
+            if self._conditions_met(action) and self._executable_now(action):
                 self._execute(tactics, action)
                 return action
         self._ratchet_trailing_stop(tactics)
         return None
+
+    def _executable_now(self, action: TacticAction) -> bool:
+        """Whether this action could actually transact at this moment.
+
+        A protective stop armed alongside an entry trigger is DORMANT, not
+        live, for as long as the agent is flat: it exists to cover the position
+        the entry will open. Firing it while flat transacts nothing, and -- as
+        `_execute` disarms the whole set -- used to destroy the entry trigger
+        sitting next to it, so a breakout buy could be wiped out by its own
+        stop before the breakout ever happened. Skipping it here leaves both
+        armed: the stop stays available for the fill that is still to come.
+        """
+        snap = self.tracker.snapshot()
+        if action.action == "sell":
+            return snap["positions"].get(self.state.symbol, 0.0) > 0
+        return (snap["cash"] - self.tracker.trade_cost) > 0
 
     def _entry_price(self, snap: dict) -> "float | None":
         """Fill price of the most recent filled buy in this symbol, or None."""
@@ -445,32 +469,74 @@ class TacticsExecutor:
             return 0.0
         return max(0.0, (snap["cash"] - self.tracker.trade_cost)) * frac / price
 
+    def _drop_action(self, tactics: Tactics, action: TacticAction,
+                     summary: str, conds: str) -> None:
+        """Retire one action that fired but could not transact, leaving the
+        rest of the set armed.
+
+        Dropping (rather than disarming everything) keeps a sibling entry
+        trigger alive, and terminates: each pass removes one action, so a
+        condition that stays true cannot spin. The agent is only woken once
+        the set empties out and there is genuinely nothing left armed.
+        """
+        try:
+            tactics.actions.remove(action)
+        except ValueError:
+            pass
+        entry = {
+            "type": "tactics_execution",
+            "ts": clock.now().isoformat(),
+            "action": action.action,
+            "symbol": tactics.symbol,
+            "tactic": summary,
+            "triggered_by": conds,
+            "status": "skipped",
+            "error": "resolved quantity is 0 (no position to sell / no cash to buy)",
+        }
+        app = self.state.app
+        with app.lock:
+            app.agent_log.append(entry)
+        logger.info("%s tactic skipped (nothing to transact): %s", tactics.symbol, summary)
+        if not tactics.actions:
+            tactics.status = "executed"
+            self.state.tactics = None
+            app.agent_wake_reason = (
+                f"Tactics exhausted: {summary} could not transact and nothing remains armed."
+            )
+            app.agent_wake_event.set()
+
     def _execute(self, tactics: Tactics, action: TacticAction) -> None:
         state = self.state
+        conds = " and ".join(format_condition(c) for c in action.conditions)
+        summary = format_tactic_action(action, symbol=tactics.symbol)
+
+        # Size the trade BEFORE disarming: an action that resolves to nothing
+        # never executed, so it must not take the rest of the set down with it
+        # (`_executable_now` filters the common case; this covers dust
+        # positions and cash that rounds to no affordable share).
+        quantity = self._resolve_quantity(action)
+        if quantity <= 0:
+            self._drop_action(tactics, action, summary, conds)
+            return
+
         # Disarm first so a slow fill can't be double-triggered by the next tick.
         tactics.status = "executed"
         state.tactics = None
 
-        conds = " and ".join(format_condition(c) for c in action.conditions)
-        summary = format_tactic_action(action, symbol=tactics.symbol)
-        quantity = self._resolve_quantity(action)
         decision = None
         error = None
-        if quantity > 0:
-            try:
-                decision = self.tracker.record_trade(
-                    tactics.symbol,
-                    action.action,
-                    quantity,
-                    f"Tactics triggered ({conds}): {action.note or tactics.reasoning}",
-                    state.api_key,
-                    state.api_secret,
-                    state.feed,
-                )
-            except Exception as exc:
-                error = str(exc)
-        else:
-            error = "resolved quantity is 0 (no position to sell / no cash to buy)"
+        try:
+            decision = self.tracker.record_trade(
+                tactics.symbol,
+                action.action,
+                quantity,
+                f"Tactics triggered ({conds}): {action.note or tactics.reasoning}",
+                state.api_key,
+                state.api_secret,
+                state.feed,
+            )
+        except Exception as exc:
+            error = str(exc)
 
         entry: dict = {
             "type": "tactics_execution",
@@ -502,6 +568,7 @@ class TacticsExecutor:
 
         # Wake the agent to reevaluate with the fill (or failure) in hand. Any
         # remaining armed actions were disarmed above -- the agent re-sets what
-        # still applies once it has seen the new position.
+        # still applies once it has seen the new position. (An action that
+        # resolved to no quantity never reaches here; see `_drop_action`.)
         app.agent_wake_reason = f"Tactics executed: {summary} -> {outcome}."
         app.agent_wake_event.set()

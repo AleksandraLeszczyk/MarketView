@@ -276,6 +276,36 @@ class TestAnalyzeVolume:
         assert result["volume_trend"] == "decreasing"
         assert "diverging" in result["confirmation"]
 
+    def test_participation_gate_needs_both_pace_and_local_volume(self):
+        closes = [100.0 + i for i in range(20)]
+        # Flat volume: local relative_volume lands at ~1.0, under the 1.2 floor.
+        flat = _make_bars(closes, volumes=[1000] * 20)
+        # High session pace on its own must NOT pass -- this is the exact
+        # combination that waved through every losing tactic entry.
+        assert analyze_volume(flat, rvol_pace=3.0)["participation_ok"] is False
+
+        # Local participation doubling, but a quiet session overall.
+        rising = _make_bars(closes, volumes=[1000] * 10 + [2000] * 10)
+        assert analyze_volume(rising, rvol_pace=1.1)["participation_ok"] is False
+
+        # Both clear.
+        result = analyze_volume(rising, rvol_pace=2.5)
+        assert result["participation_ok"] is True
+        assert "PASS" in result["summary"]
+
+    def test_participation_gate_is_none_without_pace(self):
+        bars = _make_bars([100.0 + i for i in range(20)], volumes=[1000] * 20)
+        assert analyze_volume(bars)["participation_ok"] is None
+
+    def test_volume_burst_measures_the_newest_bars(self):
+        closes = [100.0 + i for i in range(20)]
+        # Last 3 bars run hot against the 10-bar average behind them.
+        volumes = [1000] * 17 + [4000] * 3
+        result = analyze_volume(_make_bars(closes, volumes=volumes))
+        assert result["volume_burst"] > 1.5
+        quiet = analyze_volume(_make_bars(closes, volumes=[1000] * 20))
+        assert quiet["volume_burst"] == 1.0
+
 
 class TestGetPutCallWallsAndGamma:
     def test_no_strikes_returns_note(self):

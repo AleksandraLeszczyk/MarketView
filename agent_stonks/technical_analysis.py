@@ -1812,6 +1812,16 @@ def get_put_call_walls_and_gamma(
     }
 
 
+# Participation gate: session pace AND local participation must both clear.
+# Pace alone passed at every losing tactic entry in the SimLab run store --
+# it stays elevated all session once a name is busy, so it cannot tell a move
+# buyers are still in from one they have already left.
+PARTICIPATION_MIN_PACE = 2.0
+PARTICIPATION_MIN_LOCAL = 1.2
+# Bars behind `volume_burst` -- short enough to catch volume arriving now.
+VOLUME_BURST_BARS = 3
+
+
 def analyze_volume(
     bars: list[dict],
     rvol_pace: "float | None" = None,
@@ -1825,6 +1835,13 @@ def analyze_volume(
     gauge, since the local 10-bar-vs-10-bar `relative_volume` only measures the
     last few minutes against the few minutes before them. `partial_volume_feed`
     marks single-venue (IEX) volume, a small sample of the consolidated tape.
+
+    The two gauges measure genuinely different things and pass at different
+    times: session pace stays elevated all day once a name is busy, so on its
+    own it waves through moves buyers have already left. `participation_ok`
+    resolves the pair into the single answer callers actually want -- pace
+    elevated AND local participation rising -- and `volume_burst` adds the
+    shortest-horizon read, the last few bars against the 10-bar baseline.
     """
     if not bars:
         return {"note": "no intraday bars available yet"}
@@ -1839,6 +1856,13 @@ def analyze_volume(
         relative_volume = recent_avg / prior_avg
     else:
         relative_volume = None
+
+    # Is volume arriving RIGHT NOW? The last few bars against the 10-bar
+    # baseline, on a window short enough to catch a burst that the 10-vs-10
+    # ratio still has mostly ahead of it.
+    burst_window = volumes[-VOLUME_BURST_BARS:]
+    burst_avg = sum(burst_window) / len(burst_window) if burst_window else 0.0
+    volume_burst = burst_avg / recent_avg if recent_avg > 0 else None
     volume_trend = (
         "increasing" if recent_avg > prior_avg else "decreasing" if recent_avg < prior_avg else "flat"
     )
@@ -1860,6 +1884,17 @@ def analyze_volume(
     else:
         confirmation = "inconclusive"
 
+    # The two gauges answer different questions and are routinely confused for
+    # each other, so settle it here rather than leaving the caller to combine
+    # them: session pace elevated AND local participation rising right now.
+    if rvol_pace is None or relative_volume is None:
+        participation_ok = None
+    else:
+        participation_ok = (
+            rvol_pace >= PARTICIPATION_MIN_PACE
+            and relative_volume >= PARTICIPATION_MIN_LOCAL
+        )
+
     summary_parts = []
     if rvol_pace is not None:
         summary_parts.append(
@@ -1871,6 +1906,17 @@ def analyze_volume(
         + (f", {relative_volume:.1f}x" if relative_volume is not None else "")
         + ")."
     )
+    if volume_burst is not None:
+        summary_parts.append(
+            f"Last {VOLUME_BURST_BARS} bars are running {volume_burst:.2f}x the 10-bar average "
+            f"({'volume arriving now' if volume_burst >= 1.2 else 'no fresh volume'})."
+        )
+    if participation_ok is not None:
+        summary_parts.append(
+            f"Participation gate ({PARTICIPATION_MIN_PACE:.1f}x pace AND "
+            f"{PARTICIPATION_MIN_LOCAL:.1f}x local): "
+            f"{'PASS' if participation_ok else 'FAIL'}."
+        )
     if flow_trend:
         summary_parts.append(f"On-balance volume is {flow_trend}.")
     summary_parts.append(f"Volume is {confirmation} relative to the {price_pct_change:+.2f}% price move.")
@@ -1887,6 +1933,8 @@ def analyze_volume(
         "recent_10bar_avg_volume": recent_avg,
         "prior_10bar_avg_volume": prior_avg,
         "relative_volume": round(relative_volume, 2) if relative_volume is not None else None,
+        "volume_burst": round(volume_burst, 2) if volume_burst is not None else None,
+        "participation_ok": participation_ok,
         "volume_trend": volume_trend,
         "obv_trend": flow_trend,
         "price_pct_change_10bar": round(price_pct_change, 2),
