@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import uuid
@@ -37,6 +38,10 @@ RUNNING = "running"
 FINISHED = "finished"
 FAILED = "failed"
 ACTIVE_STATUSES = (WAITING, RUNNING)
+
+# Error stamped on an experiment the user stopped, to tell it apart from a run
+# that failed on its own.
+STOPPED_ERROR = "stopped by user"
 
 
 def _now_iso() -> str:
@@ -201,6 +206,30 @@ def _launch(experiment_id: str):
 def spawn(experiment_id: str) -> None:
     proc = _launch(experiment_id)
     update(experiment_id, status=RUNNING, pid=proc.pid, started_at=_now_iso())
+
+
+def stop(experiment_id: str) -> Optional[dict]:
+    """Stop an active experiment: kill its worker and finalize it as failed.
+
+    The worker owns the whole run (its own process, its own pinned clock and
+    patches), so there is nothing to unwind -- killing the process group is the
+    complete rollback, and no run record is written for a stopped experiment.
+    A worker that finalized in the meantime is left alone, so a click landing
+    on a run that just completed can't rewrite a finished result.
+    """
+    record = get_experiment(experiment_id)
+    if record is None or record["status"] not in ACTIVE_STATUSES:
+        return record
+    pid = record.get("pid")
+    if _pid_alive(pid):
+        try:
+            os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+    current = get_experiment(experiment_id)
+    if current is not None and current["status"] not in ACTIVE_STATUSES:
+        return current
+    return finalize(experiment_id, FAILED, error=STOPPED_ERROR)
 
 
 def tick(max_parallel: int) -> None:

@@ -477,6 +477,15 @@ def _render_pipeline_body(auto_refresh: bool) -> None:
                 line = sim_experiments.last_log_line(exp["experiment_id"])
                 if line:
                     st.caption(line)
+                if st.button(
+                    "Stop", key=f"exp_stop_{exp['experiment_id']}",
+                    icon=":material/stop_circle:",
+                    help="Kill the worker now. The cycles run so far are lost — "
+                         "no run record is saved.",
+                ):
+                    sim_experiments.stop(exp["experiment_id"])
+                    st.toast("Experiment stopped", icon=":material/stop_circle:")
+                    st.rerun()
             elif st.button(
                 "Remove", key=f"exp_rm_{exp['experiment_id']}", icon=":material/close:"
             ):

@@ -353,6 +353,52 @@ class TestExperiments:
         self.experiments.tick(max_parallel=2)
         assert spawned == [waiting["experiment_id"]]
 
+    def test_stop_kills_the_worker_and_finalizes(self, monkeypatch):
+        exp = self._submit()
+        self.experiments.update(
+            exp["experiment_id"], status=self.experiments.RUNNING, pid=4242
+        )
+        killed = []
+        monkeypatch.setattr(self.experiments, "_pid_alive", lambda pid: True)
+        monkeypatch.setattr(self.experiments.os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(
+            self.experiments.os, "killpg", lambda pgid, sig: killed.append((pgid, sig))
+        )
+        stopped = self.experiments.stop(exp["experiment_id"])
+        assert killed == [(4242, self.experiments.signal.SIGTERM)]
+        assert stopped["status"] == self.experiments.FAILED
+        assert stopped["error"] == self.experiments.STOPPED_ERROR
+        assert stopped["config"]["api_key"] == ""
+
+    def test_stop_leaves_a_finished_experiment_alone(self, monkeypatch):
+        exp = self._submit()
+        self.experiments.finalize(
+            exp["experiment_id"], self.experiments.FINISHED, run_id="run-1"
+        )
+        monkeypatch.setattr(self.experiments, "_pid_alive", lambda pid: True)
+        untouched = self.experiments.stop(exp["experiment_id"])
+        assert untouched["status"] == self.experiments.FINISHED
+        assert untouched["run_id"] == "run-1"
+        assert untouched["error"] is None
+
+    def test_stop_finalizes_a_waiting_experiment_without_a_worker(self):
+        exp = self._submit()
+        stopped = self.experiments.stop(exp["experiment_id"])
+        assert stopped["status"] == self.experiments.FAILED
+        assert stopped["error"] == self.experiments.STOPPED_ERROR
+
+    def test_stopped_experiment_is_not_reaped_again(self, monkeypatch):
+        exp = self._submit()
+        self.experiments.update(
+            exp["experiment_id"], status=self.experiments.RUNNING, pid=4242
+        )
+        monkeypatch.setattr(self.experiments, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(self.experiments, "spawn", lambda _id: None)
+        self.experiments.stop(exp["experiment_id"])
+        self.experiments.tick(max_parallel=1)
+        after = self.experiments.get_experiment(exp["experiment_id"])
+        assert after["error"] == self.experiments.STOPPED_ERROR
+
     def test_tick_reaps_dead_workers(self, monkeypatch):
         exp = self._submit()
         self.experiments.update(
