@@ -67,29 +67,21 @@ SCORING_MIN_TOTAL_RUNTIME_SEC = 3600
 PREMARKET_LEAD_SEC = 120
 PREMARKET_WAIT_POLL_SEC = 30.0
 
-# Apple Trader: the rule-based (non-LLM) loop that scores every closed AAPL
-# minute bar with the momentum-change regressor (see agent_stonks.apple_trader).
+# Apple Trader: the rule-based (non-LLM) loop that watches every closed AAPL
+# minute bar for a momentum-regime change into positive and asks the saved
+# persistence classifier whether that change will hold (see
+# agent_stonks.apple_trader).
 #
-# THRESHOLD is the size a predicted momentum change must reach, in bps/min, to
-# count as a regime call at all -- the default is the 90th percentile of
-# |prediction| on the model's own training days, i.e. "act on the most extreme
-# 10% of minutes". CONFIRM_MIN is how many consecutive closed bars must repeat
-# the same call before it is traded (the live stand-in for the model's
-# 15-minute persistence rule). VALIDATION_MIN is how long a fresh long has to
-# see the regime actually turn positive before the call is written off as false
-# and the position is cut; None follows the model bundle's own `persist`.
+# PROB_THRESHOLD is the probability a change has to clear to be bought; None
+# uses the cut-off the bundle itself chose on its validation block (0.07 for
+# the shipped model -- deliberately permissive, since the model's skill is in
+# rejecting the impossible rather than ranking the plausible). TRAIL_PCT is the
+# whole exit rule: sell once price is that far below the highest price seen
+# since the entry.
 APPLE_TRADER_CYCLE_SEC = 60
-APPLE_TRADER_THRESHOLD = 0.75
-APPLE_TRADER_CONFIRM_MIN = 3
-APPLE_TRADER_VALIDATION_MIN: "int | None" = None
-APPLE_TRADER_STOP_LOSS_PCT = 1.0
+APPLE_TRADER_PROB_THRESHOLD: "float | None" = None
+APPLE_TRADER_TRAIL_PCT = 0.5
 APPLE_TRADER_POSITION_PCT = 95.0
-# Completed sessions pulled in behind today so the day-level features (theta,
-# previous close, 5-day return) have the history the model was trained with.
-APPLE_TRADER_HISTORY_DAYS = 6
-# Predictions inside the first hour run on half-filled trailing windows, so the
-# loop watches without trading until the session has this many closed bars.
-APPLE_TRADER_MIN_BARS_TODAY = 60
 # Flatten this many minutes before the close: momentum, regimes and the model's
 # whole feature set are intraday, and none of it survives the overnight gap.
 APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN = 5

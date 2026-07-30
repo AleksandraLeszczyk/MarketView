@@ -2,44 +2,67 @@
 
 Every other personality in `agent_stonks.agent` is a system prompt handed to a
 model that reasons its way to a decision. This one is a plain loop: once a
-minute it scores the AAPL bar that just closed with the momentum-change
-regressor from FinNotebooks/TimeToChange (see `agent_stonks.momentum_model`)
-and applies a fixed set of rules to the number that comes back. Same paper
-ledger, same fill path, same log -- only the decision-making is deterministic,
-so the same tape always produces the same trades.
+minute it looks at the AAPL bar that just closed, and when the momentum regime
+has just turned positive it asks the persistence classifier from
+FinNotebooks/TimeToChange2 (see `agent_stonks.persistence_model`) whether that
+change is the kind that holds. Same paper ledger, same fill path, same log --
+only the decision-making is deterministic, so the same tape always produces the
+same trades.
 
 The rules
 ---------
-The model predicts Δ momentum over the next 15 minutes in bps/min, so
-`momentum + prediction` is where the smoothed momentum is heading, and
-comparing that to the day's ±theta gives the regime it is heading INTO.
+* BUY when the last closed bar is a momentum-regime change **into positive**
+  and the model's persistence probability for it is at least `prob_threshold`.
+  That is the entire entry condition: one bar, one question, one answer. There
+  is no confirmation count, because the thing a confirmation window would wait
+  for -- the new regime surviving -- is exactly what the model is being asked.
+  The one thing that overrides a signal is the clock: no position is opened
+  inside the closing flatten window, because a long the next rule is about to
+  shut is not a trade, it is two commissions.
+* SELL when price has fallen `trail_pct` below the highest price seen since the
+  entry. The peak ratchets up and never down, so the rule is a trailing stop
+  that starts `trail_pct` under the entry and turns into a profit lock as the
+  move runs.
 
-* BUY when the model calls a change into the positive regime -- negative ->
-  positive or balanced -> positive -- with |prediction| at or above
-  `threshold`, repeated on `confirm_minutes` consecutive closed bars.
-* SELL when it calls the way back out -- positive -> balanced or positive ->
-  negative -- under the same size and repetition test.
+Nothing else closes the position except the closing bell: momentum, regimes and
+every feature the model uses are intraday and do not survive the overnight gap,
+so the book is flattened `flatten_before_close_min` before the close.
 
-`threshold` is the parameter that decides how large a change has to be to count
-at all: the model's output is a ranking, not a calibrated forecast, so the
-operating point is a percentile of |prediction| rather than a physical level
-(the default is the 90th percentile on the model's own training days). Raising
-it trades less often and only on the loudest calls.
+Against the notebook
+--------------------
+The entry above is the rule TimeToChange2's own simulator runs
+(`mshift.backtest.simulate_day`): the same to-positive-change trigger, the same
+`proba >= threshold` test on the same 20-bar window, and the same refusal to
+open a position it is about to be forced out of (there, "no decision on the
+last bar of the session"). `tests/test_persistence_model.py` pins the feature
+pipeline to `mshift` bar for bar, so a signal here is a signal there.
 
-Checking its own calls
-----------------------
-The model's timing is much weaker than its direction (its `persist` window is
-15 bars, and on the full minute grid the timing signal barely beats chance), so
-every position is re-examined on each bar rather than left to a static bracket:
+Two differences remain, deliberately:
 
-* the regime it predicted has `validation_minutes` bars to actually show up.
-  If momentum never turns positive in that window the call was false and the
-  position is cut at market, without waiting for a stop.
-* a realized flip into the negative regime, held for `confirm_minutes` bars,
-  closes the position even when the model hasn't called the change yet.
-* a hard `stop_loss_pct` below the entry closes it immediately.
-* everything is flattened before the close -- momentum, regimes and every
-  feature the model uses are intraday and do not survive the overnight gap.
+* the **exit** is a trailing stop, where the notebook sells when actual
+  momentum drops below a level. Different rule, different holding times -- and
+  because a held position blocks the next entry, that alone can change which
+  later signals become trades.
+* the **fill**. The notebook decides at the close of bar *t* and fills at the
+  open of bar *t+1*; live there is no such price to wait for, so this loop
+  sends a market order as soon as the bar closes.
+
+And one that is not in the code at all: the notebook's bars are the
+consolidated tape (yfinance), while the live/SimLab feed is IEX. A few cents of
+difference is enough to trip the regime trigger a minute earlier or later, or
+to insert a regime change the other tape never saw -- which moves `pre_dwell`,
+the model's strongest feature, and with it the probability. Identical rules on
+the two tapes do not have to produce identical trades.
+
+What the model actually does
+----------------------------
+TimeToChange2's own verdict is that the classifier is **a filter that separates
+the impossible from the possible, not the likely from the unlikely**: 0.82
+out-of-fold AUC over all regime changes, but 0.50 over the changes that already
+pass the observable "the old regime had held 15 bars" pre-condition. So the
+entry is best read as "a to-positive change the model did not veto", and the
+exit does not lean on the model at all -- once the position is on, only price
+decides when it comes off.
 """
 
 from __future__ import annotations
@@ -49,21 +72,17 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from . import market_hours, momentum_model, scoring
+from . import market_hours, persistence_model, scoring
 from . import observability as obs
 from .agent import _log, stop_agent
 from .clock import now as _now
 from .config import (
     APPLE_TRADER_BAR_LAG_SEC,
-    APPLE_TRADER_CONFIRM_MIN,
     APPLE_TRADER_CYCLE_SEC,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
-    APPLE_TRADER_HISTORY_DAYS,
-    APPLE_TRADER_MIN_BARS_TODAY,
     APPLE_TRADER_POSITION_PCT,
-    APPLE_TRADER_STOP_LOSS_PCT,
-    APPLE_TRADER_THRESHOLD,
-    APPLE_TRADER_VALIDATION_MIN,
+    APPLE_TRADER_PROB_THRESHOLD,
+    APPLE_TRADER_TRAIL_PCT,
 )
 from .decisions import DecisionTracker
 from .state import AppState
@@ -76,106 +95,68 @@ APPLE_TRADER_AVATAR = "Multiavatar-4bcbffe68af819e050.png"
 # result grouping): this one has no LLM behind it, its rules are the "model".
 RULE_PROVIDER = "rules"
 
-# The saved model is fitted per ticker, and only AAPL has one -- the personality
-# is named after the single symbol it can trade.
+# TimeToChange2 fitted a single AAPL model, and its own results do not claim to
+# transfer -- the personality is named after the one symbol it can trade.
 TICKER = "AAPL"
-
-# The two calls the rules act on.
-SIGNAL_TO_POSITIVE = "to_positive"
-SIGNAL_OUT_OF_POSITIVE = "out_of_positive"
 
 
 @dataclass
 class AppleTraderConfig:
-    """Tunables of the loop. `threshold` is the one the user normally moves."""
+    """Tunables of the loop. `prob_threshold` and `trail_pct` are the two that
+    change what it does; the rest are sizing and housekeeping."""
 
-    threshold: float = APPLE_TRADER_THRESHOLD
-    confirm_minutes: int = APPLE_TRADER_CONFIRM_MIN
-    # None -> the bundle's own `persist` (the horizon the model predicts over).
-    validation_minutes: Optional[int] = APPLE_TRADER_VALIDATION_MIN
-    stop_loss_pct: float = APPLE_TRADER_STOP_LOSS_PCT
+    # None -> the cut-off the bundle chose on its own validation block.
+    prob_threshold: Optional[float] = APPLE_TRADER_PROB_THRESHOLD
+    trail_pct: float = APPLE_TRADER_TRAIL_PCT
     position_pct: float = APPLE_TRADER_POSITION_PCT
-    history_days: int = APPLE_TRADER_HISTORY_DAYS
-    min_bars_today: int = APPLE_TRADER_MIN_BARS_TODAY
     flatten_before_close_min: int = APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN
 
 
-def config_signature(config: "AppleTraderConfig | None" = None) -> str:
+def config_signature(
+    config: "AppleTraderConfig | None" = None, model_threshold: "float | None" = None
+) -> str:
     """Compact identity of one rule set, standing in for a model name.
 
     Two runs of this agent differ only in these numbers, so SimLab groups and
     de-duplicates runs on this string exactly as it does on `provider/model`
-    for the LLM agents -- retuning the threshold is a new configuration to
+    for the LLM agents -- retuning the trailing stop is a new configuration to
     test, not a repeat of one already tested.
     """
     c = config or AppleTraderConfig()
+    threshold = c.prob_threshold if c.prob_threshold is not None else model_threshold
+    shown = f"{threshold:g}" if threshold is not None else "model"
     return (
-        f"momentum_change_{TICKER}(thr={c.threshold:g},confirm={c.confirm_minutes},"
-        f"validate={c.validation_minutes or 'persist'},stop={c.stop_loss_pct:g}%,"
+        f"persistence_{TICKER}(p>={shown},trail={c.trail_pct:g}%,"
         f"size={c.position_pct:g}%)"
     )
 
 
-def classify(read: dict, threshold: float) -> "str | None":
-    """The call this minute's prediction makes, or None for "nothing to do".
-
-    A call needs three things at once: a prediction at least `threshold` big,
-    a current regime it can leave, and a projected momentum that lands in a
-    different regime. Predicting a bigger positive momentum while already in
-    the positive regime is not a change, and is deliberately not a signal.
-    """
-    pred = read.get("pred")
-    regime, projected = read.get("regime"), read.get("projected_regime")
-    if pred is None or regime is None or projected is None:
-        return None
-    if pred >= threshold and regime in (-1, 0) and projected == 1:
-        return SIGNAL_TO_POSITIVE
-    if pred <= -threshold and regime == 1 and projected in (0, -1):
-        return SIGNAL_OUT_OF_POSITIVE
-    return None
-
-
 class AppleTrader:
-    """The state machine driving one run: signal confirmation and the checks on
-    a position already taken. One instance per launched agent."""
+    """The state machine driving one run: the entry question and the trailing
+    stop on a position already taken. One instance per launched agent."""
 
-    def __init__(self, config: "AppleTraderConfig | None" = None, persist: int = 15) -> None:
+    def __init__(
+        self, config: "AppleTraderConfig | None" = None, model_threshold: float = 0.5
+    ) -> None:
         self.config = config or AppleTraderConfig()
-        self.persist = persist
-        # Confirmation counter: which call is building, and over how many
-        # DISTINCT closed bars it has now repeated.
-        self.pending: "str | None" = None
-        self.pending_bars = 0
-        # The open long: entry price, bars held, whether the predicted positive
-        # regime has actually shown up, and the run of realized negative bars.
+        # The bundle's own cut-off, used when the config doesn't override it.
+        self.model_threshold = model_threshold
+        # The open long: entry price, the running peak the stop trails, and how
+        # many bars it has been held.
         self.entry: "dict | None" = None
-        self.negative_bars = 0
         # Timestamp of the last bar acted on, so a cycle that re-reads the same
-        # bar (slow fetch, market data lag) can't count as fresh confirmation.
+        # bar (slow fetch, market data lag) can't buy the same change twice.
         self.last_bar_ts = None
 
-    # --- confirmation -----------------------------------------------------
-
-    def _confirm(self, signal: "str | None") -> bool:
-        """Feed one bar's call into the counter; True once it has repeated
-        `confirm_minutes` times in a row."""
-        if signal is None:
-            self.pending, self.pending_bars = None, 0
-            return False
-        if signal != self.pending:
-            self.pending, self.pending_bars = signal, 1
-        else:
-            self.pending_bars += 1
-        return self.pending_bars >= max(1, self.config.confirm_minutes)
-
     @property
-    def validation_bars(self) -> int:
-        return self.config.validation_minutes or self.persist
+    def prob_threshold(self) -> float:
+        threshold = self.config.prob_threshold
+        return self.model_threshold if threshold is None else threshold
 
     # --- one cycle --------------------------------------------------------
 
     def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
-        """Score the newest closed bar and act on it. Returns a short outcome
+        """Read the newest closed bar and act on it. Returns a short outcome
         tag ("bought", "sold", "hold", "warming_up", "closed", "no_data")."""
         sym_state = state.sym(TICKER)
         if sym_state is None:
@@ -185,16 +166,16 @@ class AppleTrader:
         if not market_hours.is_market_open():
             _log(
                 state,
-                {"type": "status", "text": "Market closed -- Apple Trader is not scoring bars."},
+                {"type": "status", "text": "Market closed -- Apple Trader is not watching bars."},
             )
             return "closed"
 
-        frame = momentum_model.minute_frame(sym_state, self.config.history_days)
-        read = momentum_model.read_latest(bundle, frame) if len(frame) else None
+        frame = persistence_model.minute_frame(sym_state)
+        read = persistence_model.read_latest(bundle, frame) if len(frame) else None
         if read is None:
             # Either the frame is too short to run the pipeline at all, or the
             # newest bar has no momentum yet -- the trailing window needs the
-            # session's first `window` minutes before it produces a number.
+            # session's first `horizon` minutes before it produces a number.
             _log(
                 state,
                 {"type": "status", "text": f"No scoreable {TICKER} bar yet; momentum is still forming."},
@@ -208,87 +189,85 @@ class AppleTrader:
 
         if position > 0 and self.entry is None:
             # A position without a remembered entry (agent restarted onto an
-            # existing ledger): adopt it at the current price so the checks
-            # below still have something to measure against.
-            self.entry = {"price": read["price"], "bars": 0, "regime_confirmed": read["regime"] == 1}
+            # existing ledger): adopt it at the current price, so the trailing
+            # stop starts from here rather than from a peak it never saw.
+            self.entry = {"price": read["price"], "peak": read["price"], "bars": 0}
         if position <= 0:
-            self.entry, self.negative_bars = None, 0
+            self.entry = None
 
         if fresh_bar and self.entry is not None:
             self.entry["bars"] += 1
-            if read["regime"] == 1:
-                self.entry["regime_confirmed"] = True
-            self.negative_bars = self.negative_bars + 1 if read["regime"] == -1 else 0
+            # The stop trails the highest price the position has TRADED at, so
+            # the peak comes from the bar's high, not its close.
+            self.entry["peak"] = max(self.entry["peak"], read["high"])
 
-        # Inside the first hour the trailing windows are still filling, and the
-        # model's own notes say to ignore what it prints there. The bar is read
-        # and logged, but nothing it says counts as a call -- so no confirmation
-        # can be built on it either. The risk checks below still run: a position
-        # carried into the warm-up window must not go unwatched.
-        warming_up = bool(
-            self.config.min_bars_today and read["bars_today"] < self.config.min_bars_today
-        )
-        signal = None if warming_up else classify(read, self.config.threshold)
-        confirmed = self._confirm(signal) if fresh_bar else False
-        _log(state, {"type": "analysis", "text": self._read_summary(read, signal, position, warming_up)})
+        _log(state, {"type": "analysis", "text": self._read_summary(read, position)})
 
         if position > 0:
-            reason = self._exit_reason(read, confirmed)
+            reason = self._exit_reason(read)
             if reason is not None:
                 self._sell(state, tracker, position, read, reason)
                 return "sold"
-            return "warming_up" if warming_up else "hold"
+            return "hold"
 
-        if confirmed and self.pending == SIGNAL_TO_POSITIVE:
+        if fresh_bar and self._entry_signal(read):
+            if self._closing_soon():
+                _log(
+                    state,
+                    {
+                        "type": "status",
+                        "text": (
+                            f"Entry signal on the {read['ts']:%H:%M} bar, but the session is "
+                            f"inside its last {self.config.flatten_before_close_min} min and "
+                            "any position would be flattened straight back out. Standing down."
+                        ),
+                    },
+                )
+                return "hold"
             return "bought" if self._buy(state, tracker, read) else "hold"
-        return "warming_up" if warming_up else "hold"
+        return "warming_up" if read["warming_up"] else "hold"
 
-    # --- the checks on an open position ------------------------------------
+    def _entry_signal(self, read: dict) -> bool:
+        """A change into the positive regime the model expects to hold.
 
-    def _exit_reason(self, read: dict, confirmed: bool) -> "str | None":
-        """Why this long should be closed on this bar, or None to keep holding.
-
-        Ordered by urgency: the loss cap first, then the end of the session,
-        then the call being wrong, then the model calling the way out.
+        `proba` is None on every bar that is not such a change, and also on one
+        that is but whose 20-bar feature window is incomplete -- in which case
+        the model is not asked, and an unasked model is not a yes. Exactly the
+        bars `mshift.backtest._signal_sequences` builds a sequence for.
         """
+        return read["to_positive"] and read["proba"] is not None and (
+            read["proba"] >= self.prob_threshold
+        )
+
+    def _closing_soon(self) -> bool:
+        """Whether the flatten-before-close rule is already in force."""
+        to_close = market_hours.seconds_to_close()
+        return to_close is not None and to_close <= self.config.flatten_before_close_min * 60
+
+    # --- the check on an open position -------------------------------------
+
+    def _exit_reason(self, read: dict) -> "str | None":
+        """Why this long should be closed on this bar, or None to keep holding."""
         entry = self.entry or {}
         entry_price = entry.get("price") or 0.0
-        pnl_pct = (read["price"] / entry_price - 1) * 100 if entry_price else 0.0
+        peak = entry.get("peak") or entry_price
+        price = read["price"]
+        pnl_pct = (price / entry_price - 1) * 100 if entry_price else 0.0
+        drawdown_pct = (price / peak - 1) * 100 if peak else 0.0
 
-        if self.config.stop_loss_pct and pnl_pct <= -abs(self.config.stop_loss_pct):
+        if self.config.trail_pct and drawdown_pct <= -abs(self.config.trail_pct):
             return (
-                f"Stop: {pnl_pct:+.2f}% from the ${entry_price:,.2f} entry breaches the "
-                f"{self.config.stop_loss_pct:.2f}% loss cap. Cutting the position at market."
+                f"Trailing stop: ${price:,.2f} is {drawdown_pct:+.2f}% off the ${peak:,.2f} "
+                f"high since the ${entry_price:,.2f} entry, past the "
+                f"{self.config.trail_pct:.2f}% give-back. Selling at market ({pnl_pct:+.2f}%)."
             )
 
-        to_close = market_hours.seconds_to_close()
-        if to_close is not None and to_close <= self.config.flatten_before_close_min * 60:
+        if self._closing_soon():
+            to_close = market_hours.seconds_to_close() or 0.0
             return (
                 f"Session ends in {to_close / 60:.0f} min. Momentum, regimes and every model "
-                "feature are intraday, so the position is flattened rather than carried overnight."
-            )
-
-        if not entry.get("regime_confirmed") and entry.get("bars", 0) >= self.validation_bars:
-            return (
-                f"False call: {self.validation_bars} bars after entry momentum is still "
-                f"{momentum_model.regime_name(read['regime'])} ({read['mom']:+.2f} bps/min vs "
-                f"theta {read['theta']:.2f}), so the predicted turn into the positive regime "
-                f"never happened. Cutting losses at {pnl_pct:+.2f}%."
-            )
-
-        if self.negative_bars >= max(1, self.config.confirm_minutes):
-            return (
-                f"Momentum has been negative for {self.negative_bars} straight bars "
-                f"({read['mom']:+.2f} bps/min vs theta {read['theta']:.2f}) -- the positive "
-                f"regime is gone. Exiting at {pnl_pct:+.2f}%."
-            )
-
-        if confirmed and self.pending == SIGNAL_OUT_OF_POSITIVE:
-            return (
-                f"Model calls a persistent change out of the positive regime: Δmomentum "
-                f"{read['pred']:+.2f} bps/min (|Δ| >= {self.config.threshold:.2f}) on "
-                f"{self.pending_bars} consecutive bars, projecting "
-                f"{momentum_model.regime_name(read['projected_regime'])}. Exiting at {pnl_pct:+.2f}%."
+                "feature are intraday, so the position is flattened rather than carried "
+                f"overnight ({pnl_pct:+.2f}%)."
             )
         return None
 
@@ -307,25 +286,25 @@ class AppleTrader:
             )
             return False
 
+        dwell = read["pre_dwell"]
         reasoning = (
-            f"Model calls a persistent change into the positive regime: Δmomentum "
-            f"{read['pred']:+.2f} bps/min (>= {self.config.threshold:.2f}) on "
-            f"{self.pending_bars} consecutive bars, taking momentum "
-            f"{read['mom']:+.2f} -> {read['projected_mom']:+.2f} bps/min through theta "
-            f"{read['theta']:.2f} out of the {momentum_model.regime_name(read['regime'])} regime."
+            f"Momentum regime turned "
+            f"{persistence_model.regime_name(read['prev_regime'])} -> positive on this bar "
+            f"(momentum {read['mom']:+.2f}"
+            + (f", the old regime had held {dwell} bars" if dwell is not None else "")
+            + f"), and the persistence model puts it at {read['proba']:.0%} "
+            f"(>= {self.prob_threshold:.0%}) to hold. Buying; the exit is a "
+            f"{self.config.trail_pct:.2f}% trailing stop from here."
         )
         decision = tracker.record_trade(
             TICKER, "buy", quantity, reasoning, state.api_key, state.api_secret, state.feed
         )
         self._log_decision(state, decision, read)
         if decision.status == "filled":
-            self.entry = {
-                "price": decision.price,
-                "bars": 0,
-                "regime_confirmed": read["regime"] == 1,
-            }
-            self.negative_bars = 0
-        self.pending, self.pending_bars = None, 0
+            # The peak starts at the fill, not at this bar's high: the stop
+            # trails the highest price seen since the position existed, and
+            # this bar's high happened before it did.
+            self.entry = {"price": decision.price, "peak": decision.price, "bars": 0}
         return decision.status == "filled"
 
     def _sell(
@@ -336,36 +315,41 @@ class AppleTrader:
         )
         self._log_decision(state, decision, read)
         if decision.status == "filled":
-            self.entry, self.negative_bars = None, 0
-        self.pending, self.pending_bars = None, 0
+            self.entry = None
 
     # --- logging -----------------------------------------------------------
 
-    def _read_summary(
-        self, read: dict, signal: "str | None", position: float, warming_up: bool = False
-    ) -> str:
-        pred = read["pred"]
-        pred_str = f"{pred:+.2f}" if pred is not None else "n/a"
+    def _read_summary(self, read: dict, position: float) -> str:
         parts = [
             f"{TICKER} {read['ts']:%H:%M} ${read['price']:,.2f}",
-            f"momentum {read['mom']:+.2f} bps/min vs theta {read['theta']:.2f} "
-            f"({momentum_model.regime_name(read['regime'])})",
-            f"Δmomentum {pred_str} (threshold {self.config.threshold:.2f}) -> "
-            f"{momentum_model.regime_name(read['projected_regime'])}",
+            f"momentum {read['mom']:+.2f} "
+            f"({persistence_model.regime_name(read['regime'])})",
         ]
-        if warming_up:
+        if read["regime_change"]:
+            dwell = read["pre_dwell"]
             parts.append(
-                f"warming up ({read['bars_today']}/{self.config.min_bars_today} bars) -- not trading"
+                f"regime change {persistence_model.regime_name(read['prev_regime'])} -> "
+                f"{persistence_model.regime_name(read['regime'])}"
+                + (f" after {dwell} bars" if dwell is not None else "")
             )
-        if signal is not None:
-            parts.append(f"{signal} {self.pending_bars}/{self.config.confirm_minutes} confirmed")
-        if position > 0 and self.entry:
-            pnl = (read["price"] / self.entry["price"] - 1) * 100 if self.entry["price"] else 0.0
-            held = self.entry["bars"]
-            state_word = "confirmed" if self.entry["regime_confirmed"] else "unconfirmed"
+        if read["to_positive"]:
+            proba = read["proba"]
             parts.append(
-                f"long {position:g} sh @ ${self.entry['price']:,.2f} ({pnl:+.2f}%), "
-                f"{held} bars, regime {state_word}"
+                f"persistence {proba:.0%} vs {self.prob_threshold:.0%}"
+                if proba is not None
+                else "persistence not scoreable (feature window not warm)"
+            )
+        if read["warming_up"]:
+            parts.append(f"warming up ({read['bars_today']} bars) -- not trading")
+        if position > 0 and self.entry:
+            entry_price = self.entry["price"]
+            pnl = (read["price"] / entry_price - 1) * 100 if entry_price else 0.0
+            peak = self.entry["peak"]
+            give_back = (read["price"] / peak - 1) * 100 if peak else 0.0
+            parts.append(
+                f"long {position:g} sh @ ${entry_price:,.2f} ({pnl:+.2f}%), "
+                f"{self.entry['bars']} bars, peak ${peak:,.2f} ({give_back:+.2f}% off, "
+                f"stop at -{self.config.trail_pct:.2f}%)"
             )
         return " · ".join(parts)
 
@@ -380,7 +364,7 @@ class AppleTrader:
                 "price": decision.price,
                 "quantity": decision.filled_quantity,
                 "reasoning": decision.reasoning,
-                "regime": momentum_model.regime_name(read["regime"]),
+                "regime": persistence_model.regime_name(read["regime"]),
             },
         )
 
@@ -405,15 +389,15 @@ def _apple_trader_loop(
     cycle_sec: int,
     stop_event: threading.Event,
 ) -> None:
-    bundle = momentum_model.load_bundle(TICKER)
+    bundle = persistence_model.load_bundle()
     if bundle is None:
         _log(
             state,
             {
                 "type": "error",
                 "text": (
-                    f"No momentum-change model for {TICKER} at "
-                    f"{momentum_model.model_path(TICKER)} (or scikit-learn/joblib are not "
+                    f"No momentum-persistence model at "
+                    f"{persistence_model.model_path()} (or scikit-learn/joblib are not "
                     f"installed). Apple Trader cannot run without it."
                 ),
             },
@@ -422,21 +406,19 @@ def _apple_trader_loop(
         state.agent_running = False
         return
 
-    params = bundle["pipeline_params"]
-    trader = AppleTrader(config, persist=params["persist"])
-    train_days = bundle.get("train_days") or []
+    trader = AppleTrader(config, model_threshold=persistence_model.model_threshold(bundle))
+    metrics = bundle.get("metrics") or {}
     _log(
         state,
         {
             "type": "status",
             "text": (
-                f"Apple Trader armed on {bundle.get('model_name', 'the saved model')} "
-                f"({len(train_days)} training days"
-                + (f", {train_days[0]} → {train_days[-1]}" if train_days else "")
-                + f"): scoring every {TICKER} minute bar, |Δmomentum| >= {config.threshold:.2f} "
-                f"bps/min confirmed over {config.confirm_minutes} bars to trade, "
-                f"{trader.validation_bars} bars to prove the regime, "
-                f"{config.stop_loss_pct:.2f}% loss cap."
+                f"Apple Trader armed on the saved persistence classifier (fitted "
+                f"{bundle.get('trained_at', 'unknown')}, held-out AUC "
+                f"{metrics.get('roc_auc', float('nan')):.2f}): watching every {TICKER} minute "
+                f"bar for a regime change into positive momentum, buying one the model rates "
+                f"at least {trader.prob_threshold:.0%} likely to persist, and exiting on a "
+                f"{config.trail_pct:.2f}% trailing stop from the high since entry."
             ),
         },
     )

@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Optional
 
-from agent_stonks import clock, market_hours, momentum_model
+from agent_stonks import clock, market_hours, persistence_model
 from agent_stonks.agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
@@ -141,7 +141,7 @@ class SimulationEngine:
         self._cursors: dict[str, int] = {sym: 0 for sym in self.app.symbols}
         self._last_step: Optional[datetime] = None
         self._stop_requested = False
-        # The momentum-change bundle, loaded once per rule-based run.
+        # The momentum-persistence bundle, loaded once per rule-based run.
         self._bundle: Optional[dict] = None
 
     @property
@@ -340,26 +340,19 @@ class SimulationEngine:
                 f"Apple Trader only trades {APPLE_TRADER_TICKER}; this simulation's "
                 f"symbols are {', '.join(self.app.symbols) or 'none'}."
             )
-        self._bundle = momentum_model.load_bundle(APPLE_TRADER_TICKER)
+        self._bundle = persistence_model.load_bundle()
         if self._bundle is None:
             raise RuntimeError(
-                f"no momentum-change model for {APPLE_TRADER_TICKER} at "
-                f"{momentum_model.model_path(APPLE_TRADER_TICKER)} (or scikit-learn/joblib "
-                "are not installed)."
+                f"no momentum-persistence model at {persistence_model.model_path()} "
+                "(or scikit-learn/joblib are not installed)."
             )
         config = AppleTraderConfig(**(self.config.rule_config or {}))
-        if len(self.market.days) < 2:
-            # theta is c * sigma(previous day) / sqrt(window). With a single
-            # stored day there is no previous day, so the pipeline falls back
-            # to the day's own volatility -- a different threshold than the
-            # agent would use live, and worth saying out loud.
-            self._log(
-                "status",
-                "Only one day in this simulation: the regime threshold falls back to the "
-                "day's own volatility instead of the previous session's. Include the day "
-                "before for a like-live run.",
-            )
-        return AppleTrader(config, persist=self._bundle["pipeline_params"]["persist"])
+        # Every indicator the model consumes is session-local, so one stored
+        # day is a complete, like-live run -- there is nothing behind it to
+        # miss.
+        return AppleTrader(
+            config, model_threshold=persistence_model.model_threshold(self._bundle)
+        )
 
     def _run_rule_day(self, day: date, trader: AppleTrader) -> None:
         """Score every closed bar of the session, in order.

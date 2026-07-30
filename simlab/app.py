@@ -17,7 +17,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from agent_stonks import clock, momentum_model
+from agent_stonks import clock, persistence_model
 from agent_stonks import observability as obs
 from agent_stonks.agent import (
     AGENT_PERSONALITIES,
@@ -192,51 +192,50 @@ def _render_rule_agent(personality: str) -> None:
         "always produces the same trades."
     )
     st.markdown(
-        f"Once a minute it scores the **{APPLE_TRADER_TICKER}** bar that just closed with "
-        "the saved momentum-change regressor, which predicts Δ momentum over the next 15 "
-        "minutes in bps/min. `momentum + prediction` against the day's ±theta gives the "
-        "regime the model is pointing at:\n"
-        "- **Buy** a called change *into* the positive regime (negative → positive, "
-        "balanced → positive).\n"
-        "- **Sell** the way back out (positive → balanced, positive → negative).\n"
-        "- A call counts only if it is at least **the change threshold** big and repeats "
-        "on several consecutive closed bars.\n"
-        "- Every open position is re-checked each bar: the predicted regime has a "
-        "validation window to actually show up, and if it never does the call is written "
-        "off and the position is cut. A sustained flip to negative momentum, a hard loss "
-        "cap, and the approaching close each also close it.\n\n"
+        f"Once a minute it reads the **{APPLE_TRADER_TICKER}** bar that just closed and "
+        "tracks the momentum regime — a Schmitt trigger over a volatility-normalised "
+        "momentum score, so a value hovering near the line cannot emit a burst of fake "
+        "changes:\n"
+        "- **Buy** when that bar is a regime change *into positive* and the saved "
+        "persistence classifier — given the 20 bars leading into it — puts the change at "
+        "or above **the persistence probability** to hold.\n"
+        "- **Sell** when price falls **the trailing stop** below the highest price seen "
+        "since the entry. The peak only ratchets up, so the rule starts as a stop under "
+        "the entry and becomes a profit lock as the move runs.\n"
+        "- Nothing else closes the position but the closing bell: every feature the model "
+        "uses is intraday, so the book is flattened before the close rather than carried "
+        "overnight.\n\n"
         "Its rules are set per simulation in the **Simulate** tab, and it is never scored "
         "by the LLM judge — it states no reasoning of its own to judge, so profit, profit "
         "efficiency and the oracle ceiling are the whole verdict."
     )
 
-    bundle = momentum_model.load_bundle(APPLE_TRADER_TICKER)
+    bundle = persistence_model.load_bundle()
     if bundle is None:
         st.error(
-            f"No model at `{momentum_model.model_path(APPLE_TRADER_TICKER)}` (or "
-            "scikit-learn/joblib are not installed). Simulations of this agent will fail "
-            "until it is available."
+            f"No model at `{persistence_model.model_path()}` (or scikit-learn/joblib are "
+            "not installed). Simulations of this agent will fail until it is available."
         )
         return
-    train_days = bundle.get("train_days") or []
+    metrics = bundle.get("metrics") or {}
     st.markdown("##### Model")
     cols = st.columns(4)
-    cols[0].metric("Estimator", str(bundle.get("model_name", "?")))
-    cols[1].metric("Training days", len(train_days))
-    cols[2].metric("Features", len(bundle.get("feature_cols") or []))
-    cols[3].metric("Persistence (bars)", bundle["pipeline_params"]["persist"])
-    if train_days:
-        st.caption(
-            f"Fitted on {train_days[0]} → {train_days[-1]}; saved {bundle.get('saved_at', '?')}. "
-            f"{bundle.get('notes', '')}"
-        )
-    with st.expander("Pipeline parameters and held-out metrics"):
-        st.json({"pipeline_params": bundle["pipeline_params"], "metrics": bundle.get("metrics")})
+    cols[0].metric("Sequence", f"{bundle['seq_len']} bars")
+    cols[1].metric("Features", len(bundle.get("feature_columns") or []))
+    cols[2].metric("Held-out AUC", f"{metrics.get('roc_auc', float('nan')):.2f}")
+    cols[3].metric("Own threshold", f"{persistence_model.model_threshold(bundle):g}")
+    st.caption(
+        f"Fitted {bundle.get('trained_at', '?')}, excluding sessions from "
+        f"{bundle.get('excluded_sessions_from', '?')} onwards. {bundle.get('notes', '')}"
+    )
+    with st.expander("Pipeline settings and held-out metrics"):
+        st.json({"settings": bundle.get("settings"), "metrics": metrics})
     st.warning(
-        ":material/warning: The stored metrics were measured against sampled stable "
-        "minutes, not the full minute grid. On every bar the direction survives but the "
-        "timing is close to chance — which is exactly what the per-bar re-checks above "
-        "are there to contain."
+        ":material/warning: That AUC covers *all* regime changes. On the changes that "
+        "already pass the observable “the old regime had held 15 bars” pre-condition the "
+        "model scores ~0.50 — it separates the impossible from the possible, not the "
+        "likely from the unlikely. The entry is best read as a change the model did not "
+        "veto, which is why the exit does not consult it at all."
     )
 
 
@@ -788,41 +787,38 @@ def _render_rule_params() -> AppleTraderConfig:
     """Apple Trader's rules for this batch. One rule set per batch, the way one
     prompt per personality applies to every LLM combination."""
     defaults = AppleTraderConfig()
+    bundle_threshold = persistence_model.model_threshold(persistence_model.load_bundle())
     with st.expander("Apple Trader rules", expanded=True):
         st.caption(
-            "The change threshold is the headline knob: how large a predicted momentum "
-            "change must be to count as a regime call. Each distinct rule set is tracked "
-            "as its own configuration in Results, so retuning is a new test rather than a "
-            "repeat of one already run."
+            "Two knobs decide everything: how sure the model has to be that a change into "
+            "positive momentum will hold, and how much of the run it gives back before "
+            "selling. Each distinct rule set is tracked as its own configuration in "
+            "Results, so retuning is a new test rather than a repeat of one already run."
         )
         col_a, col_b = st.columns(2)
-        threshold = col_a.number_input(
-            "Change threshold (bps/min)", min_value=0.0, max_value=10.0,
-            value=defaults.threshold, step=0.05, key="sim_apple_threshold",
-            help="Default is the 90th percentile of the model's predictions on its own "
-                 "training days — act on the loudest ~10% of minutes.",
+        prob_threshold = col_a.number_input(
+            "Persistence probability to buy", min_value=0.0, max_value=1.0,
+            value=float(defaults.prob_threshold or bundle_threshold),
+            step=0.01, format="%.2f", key="sim_apple_prob",
+            help=f"Default {bundle_threshold:g} is the cut-off the model itself chose on "
+                 "its validation block. Its skill is in rejecting changes that cannot "
+                 "persist, so a permissive setting is the intended one — raising it "
+                 "discards plausible changes roughly at random.",
         )
-        confirm = col_b.number_input(
-            "Confirm over (bars)", min_value=1, max_value=30,
-            value=defaults.confirm_minutes, step=1, key="sim_apple_confirm",
-        )
-        validation = col_a.number_input(
-            "Prove the regime within (bars)", min_value=1, max_value=120,
-            value=defaults.validation_minutes or 15, step=1, key="sim_apple_validation",
-        )
-        stop_loss = col_b.number_input(
-            "Loss cap (%)", min_value=0.0, max_value=20.0,
-            value=defaults.stop_loss_pct, step=0.1, key="sim_apple_stop",
+        trail_pct = col_b.number_input(
+            "Trailing stop (%)", min_value=0.05, max_value=10.0,
+            value=defaults.trail_pct, step=0.05, key="sim_apple_trail",
+            help="Sell once price is this far below the highest price seen since the "
+                 "entry. The peak only ratchets up, so this starts as a stop under the "
+                 "entry and becomes a profit lock as the move runs.",
         )
         position_pct = col_a.number_input(
             "Position size (% of cash)", min_value=1.0, max_value=100.0,
             value=defaults.position_pct, step=5.0, key="sim_apple_size",
         )
     return AppleTraderConfig(
-        threshold=float(threshold),
-        confirm_minutes=int(confirm),
-        validation_minutes=int(validation),
-        stop_loss_pct=float(stop_loss),
+        prob_threshold=float(prob_threshold),
+        trail_pct=float(trail_pct),
         position_pct=float(position_pct),
     )
 
@@ -934,17 +930,8 @@ def render_simulate_tab() -> None:
         if missing_ticker:
             st.error(
                 f":material/error: {_agent_label(rule_personalities[0])} only trades "
-                f"{APPLE_TRADER_TICKER} (the model is fitted per ticker), which is not "
-                f"selected for: {', '.join(missing_ticker)}."
-            )
-        thin = [
-            name for name in selected_names if len(dataset_scope[name]["days"] or []) < 2
-        ]
-        if thin:
-            st.warning(
-                ":material/info: The regime threshold is derived from the *previous* "
-                "session's volatility. With a single day selected it falls back to that "
-                f"day's own — include the day before for a like-live run: {', '.join(thin)}."
+                f"{APPLE_TRADER_TICKER} (the one symbol its model was fitted on), which is "
+                f"not selected for: {', '.join(missing_ticker)}."
             )
     st.caption(
         ":material/monitoring: Langfuse export: "

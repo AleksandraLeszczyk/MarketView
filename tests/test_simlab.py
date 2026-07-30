@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_stonks import clock, momentum_model
+from agent_stonks import clock, persistence_model
 from agent_stonks.agent import MOMENTUM_SYSTEM_PROMPT
 from agent_stonks.apple_trader import APPLE_TRADER_KEY, RULE_PROVIDER, config_signature
 from simlab import data as sim_data
@@ -253,20 +253,26 @@ class TestRuleAgentEngine:
 
     @pytest.fixture()
     def apple_store(self, tmp_path, monkeypatch):
-        """A stored AAPL session that alternates 100.00 / 100.10 for 90 minutes.
+        """A stored AAPL session shaped like the setup the agent trades.
 
-        Alternating gives the day a real volatility (so theta is a finite,
-        positive threshold) while the trailing mean return stays near zero, so
-        the regime is *balanced* on every bar. That is the state the entry rule
-        needs -- a call into the positive regime can only be made from outside
-        it -- and it never turns positive on its own, so the validation check
-        has something to catch.
+        60 minutes alternating 100.00 / 100.01 -- enough volatility for the
+        momentum score to be defined, no net drift, so the regime stays
+        *balanced*; then a steady climb that pushes momentum through the +0.90
+        entry threshold (the one bar the model is ever asked about, and it lands
+        well clear of the 30-bar opening warm-up); then a give-back steep enough
+        to take out a trailing stop. Volume varies bar to bar because several
+        features z-score it, and a constant would leave them undefined.
         """
         monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
         monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
+        prices = (
+            [100.0 + 0.01 * (i % 2) for i in range(60)]
+            + [100.0 + 0.03 * (i + 1) for i in range(40)]
+            + [101.2 - 0.06 * (i + 1) for i in range(20)]
+        )
         bars = [
-            _bar(OPEN_UTC + timedelta(minutes=i), 100.0 + 0.1 * (i % 2))
-            for i in range(90)
+            _bar(OPEN_UTC + timedelta(minutes=i), price, volume=1000.0 + 37 * (i % 13))
+            for i, price in enumerate(prices)
         ]
         sim_data._write_gz(sim_data.bars_path("AAPL", DAY), bars)
         sim_data._write_gz(sim_data.daily_path("AAPL"), {
@@ -275,25 +281,27 @@ class TestRuleAgentEngine:
         return tmp_path
 
     @staticmethod
-    def _bundle(prediction: float = 5.0) -> dict:
-        class Estimator:
-            def predict(self, X):
-                return [prediction] * len(X)
+    def _bundle(proba: float = 0.9) -> dict:
+        class Pipeline:
+            def predict_proba(self, X):
+                import numpy as np
+
+                return np.column_stack(
+                    [np.full(len(X), 1 - proba), np.full(len(X), proba)]
+                )
 
         return {
-            "estimator": Estimator(),
-            "feature_cols": momentum_model.FEATURE_COLS,
-            "pipeline_params": {
-                "window": 15, "smooth_halflife": 8.0, "c": 0.4,
-                "persist": 15, "n_prev_changes": 3,
-            },
-            "train_days": ["2026-06-01"],
-            "model_name": "Stub",
+            "pipeline": Pipeline(),
+            "feature_columns": list(persistence_model.FEATURE_COLUMNS),
+            "seq_len": 20,
+            "threshold": 0.07,
+            "settings": {"momentum": dict(persistence_model.MOMENTUM_DEFAULTS)},
+            "metrics": {"roc_auc": 0.84},
         }
 
-    def _run(self, monkeypatch, rule_config: dict, prediction: float = 5.0):
+    def _run(self, monkeypatch, rule_config: dict, proba: float = 0.9):
         monkeypatch.setattr(
-            momentum_model, "load_bundle", lambda ticker: self._bundle(prediction)
+            persistence_model, "load_bundle", lambda: self._bundle(proba)
         )
         market = SimMarket(["AAPL"], [DAY])
         config = SimulationConfig(
@@ -304,63 +312,48 @@ class TestRuleAgentEngine:
         engine = SimulationEngine(market, config)
         return market, engine, engine.run()
 
-    def test_scores_every_session_bar_and_needs_no_llm(self, apple_store, monkeypatch):
+    def test_reads_every_session_bar_and_needs_no_llm(self, apple_store, monkeypatch):
         # No client is passed and none is built: a rule run that quietly tried
         # to reach an LLM would raise here instead.
-        _, engine, result = self._run(
-            monkeypatch,
-            {"threshold": 1.0, "confirm_minutes": 2, "validation_minutes": 5,
-             "min_bars_today": 20},
-        )
+        _, engine, result = self._run(monkeypatch, {"prob_threshold": 0.5})
         assert result.error is None
         assert engine.rule_based
-        # 90 stored bars complete at 09:31..11:00 ET -- every one inside the
-        # session, so every one is scored.
-        assert result.cycles_run == 90
+        # 120 stored bars complete at 09:31..11:30 ET -- every one inside the
+        # session, so every one is read.
+        assert result.cycles_run == 120
         assert not clock.is_simulated()
 
-    def test_buys_a_confirmed_call_then_cuts_it_when_the_regime_never_shows(
-        self, apple_store, monkeypatch
-    ):
-        _, _, result = self._run(
-            monkeypatch,
-            {"threshold": 1.0, "confirm_minutes": 2, "validation_minutes": 5,
-             "min_bars_today": 20, "stop_loss_pct": 0.0},
-        )
+    def test_buys_the_backed_change_then_trails_out_of_it(self, apple_store, monkeypatch):
+        _, _, result = self._run(monkeypatch, {"prob_threshold": 0.5, "trail_pct": 0.5})
         actions = [(d["action"], d["status"]) for d in result.decisions]
         assert actions[:2] == [("buy", "filled"), ("sell", "filled")]
         buy, sell = result.decisions[0], result.decisions[1]
-        assert "persistent change into the positive regime" in buy["reasoning"]
-        assert "False call" in sell["reasoning"]
-        # The cut lands exactly `validation_minutes` bars after the entry.
-        assert (parse_ts(sell["ts"]) - parse_ts(buy["ts"])) == timedelta(minutes=5)
+        assert "-> positive" in buy["reasoning"] and "90%" in buy["reasoning"]
+        assert "Trailing stop" in sell["reasoning"]
+        # Bought early in the climb, held it all the way up -- the stop only
+        # trails -- and sold into the give-back, below the $101.20 peak but
+        # well above the entry: the profit lock, not the initial stop.
+        assert parse_ts(sell["ts"]) > parse_ts(buy["ts"])
+        assert 100.0 < float(buy["price"]) < 100.5
+        assert float(buy["price"]) < float(sell["price"]) < 101.2
 
-    def test_a_quiet_model_never_trades(self, apple_store, monkeypatch):
+    def test_a_change_the_model_vetoes_is_never_bought(self, apple_store, monkeypatch):
         _, _, result = self._run(
-            monkeypatch,
-            {"threshold": 1.0, "confirm_minutes": 2, "min_bars_today": 20},
-            prediction=0.1,  # below the threshold on every bar
+            monkeypatch, {"prob_threshold": 0.5}, proba=0.01  # below the cut-off
         )
         assert result.error is None
         assert [d for d in result.decisions if d["action"] in ("buy", "sell")] == []
 
     def test_records_its_rules_instead_of_a_prompt(self, apple_store, monkeypatch):
-        rules = {"threshold": 1.0, "confirm_minutes": 2, "min_bars_today": 20}
+        rules = {"prob_threshold": 0.5, "trail_pct": 0.5}
         _, _, result = self._run(monkeypatch, rules)
         assert result.prompt_used is None
         assert result.tool_names == []
         assert result.config_summary["rule_based"] is True
         assert result.config_summary["rule_config"] == rules
 
-    def test_one_day_theta_fallback_is_called_out(self, apple_store, monkeypatch):
-        _, _, result = self._run(monkeypatch, {"min_bars_today": 20})
-        assert any(
-            "falls back to the day's own volatility" in (e.get("text") or "")
-            for e in result.agent_log
-        )
-
     def test_a_dataset_without_the_ticker_fails_loudly(self, store, monkeypatch):
-        monkeypatch.setattr(momentum_model, "load_bundle", lambda ticker: self._bundle())
+        monkeypatch.setattr(persistence_model, "load_bundle", lambda: self._bundle())
         market = SimMarket(["TEST"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
@@ -370,14 +363,15 @@ class TestRuleAgentEngine:
         assert "only trades AAPL" in (result.error or "")
 
     def test_a_missing_model_fails_loudly(self, apple_store, monkeypatch):
-        monkeypatch.setattr(momentum_model, "load_bundle", lambda ticker: None)
+        monkeypatch.setattr(persistence_model, "load_bundle", lambda: None)
         market = SimMarket(["AAPL"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
             api_key="", symbols=["AAPL"], days=[DAY],
         )
         result = SimulationEngine(market, config).run()
-        assert "no momentum-change model" in (result.error or "")
+        assert "no momentum-persistence model" in (result.error or "")
+
 
 
 class TestOracle:

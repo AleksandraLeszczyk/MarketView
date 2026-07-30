@@ -11,7 +11,7 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from . import market_hours
+from . import market_hours, persistence_model
 from .agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
@@ -1580,57 +1580,40 @@ def _agent_report_section(symbols: list[str]) -> None:
 
 
 def _apple_trader_params() -> AppleTraderConfig:
-    """Apple Trader's tunables. `threshold` is the headline one: how large a
-    predicted momentum change has to be before it counts as a regime call."""
+    """Apple Trader's tunables: how sure the model has to be that a change into
+    positive momentum will hold, and how much of the run to give back."""
     defaults = AppleTraderConfig()
+    bundle_threshold = persistence_model.model_threshold(persistence_model.load_bundle())
     with st.expander("Apple Trader rules", expanded=True):
         c1, c2 = st.columns(2)
-        threshold = c1.number_input(
-            "Change threshold (bps/min)",
+        prob_threshold = c1.number_input(
+            "Persistence probability to buy",
             min_value=0.0,
+            max_value=1.0,
+            value=float(defaults.prob_threshold or bundle_threshold),
+            step=0.01,
+            format="%.2f",
+            key="apple_trader_prob",
+            help=(
+                f"How likely the model must rate a change into positive momentum to hold "
+                f"before it is bought. The default {bundle_threshold:g} is the cut-off the "
+                "model itself chose on its validation block — its skill is in rejecting "
+                "changes that cannot persist rather than ranking the plausible ones, so a "
+                "permissive setting is the intended one."
+            ),
+        )
+        trail_pct = c2.number_input(
+            "Trailing stop (%)",
+            min_value=0.05,
             max_value=10.0,
-            value=defaults.threshold,
+            value=defaults.trail_pct,
             step=0.05,
-            key="apple_trader_threshold",
+            key="apple_trader_trail",
             help=(
-                "Minimum |predicted Δ momentum| for a bar to count as a regime call. "
-                "The default is the 90th percentile of the model's predictions on its own "
-                "training days, i.e. act on the loudest ~10% of minutes; raise it to trade "
-                "less often and only on the strongest calls."
+                "Sell once price is this far below the highest price seen since the entry. "
+                "The peak only ratchets up, so this starts as a stop under the entry and "
+                "becomes a profit lock as the move runs."
             ),
-        )
-        confirm = c2.number_input(
-            "Confirm over (bars)",
-            min_value=1,
-            max_value=30,
-            value=defaults.confirm_minutes,
-            step=1,
-            key="apple_trader_confirm",
-            help=(
-                "How many consecutive closed minutes must repeat the same call before it is "
-                "traded — the live stand-in for the model's persistence rule."
-            ),
-        )
-        validation = c1.number_input(
-            "Prove the regime within (bars)",
-            min_value=1,
-            max_value=120,
-            value=defaults.validation_minutes or 15,
-            step=1,
-            key="apple_trader_validation",
-            help=(
-                "After buying, how long momentum has to actually turn positive. If it "
-                "hasn't by then the call was false and the position is cut at market."
-            ),
-        )
-        stop_loss = c2.number_input(
-            "Loss cap (%)",
-            min_value=0.0,
-            max_value=20.0,
-            value=defaults.stop_loss_pct,
-            step=0.1,
-            key="apple_trader_stop_loss",
-            help="Hard stop below the entry, checked every bar. 0 disables it.",
         )
         position_pct = c1.number_input(
             "Position size (% of cash)",
@@ -1641,10 +1624,8 @@ def _apple_trader_params() -> AppleTraderConfig:
             key="apple_trader_position_pct",
         )
     return AppleTraderConfig(
-        threshold=float(threshold),
-        confirm_minutes=int(confirm),
-        validation_minutes=int(validation),
-        stop_loss_pct=float(stop_loss),
+        prob_threshold=float(prob_threshold),
+        trail_pct=float(trail_pct),
         position_pct=float(position_pct),
     )
 
@@ -1667,7 +1648,7 @@ def _agent_panel(
         "orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}. "
         "The one exception is Apple Trader, which has no LLM at all: it is a fixed loop "
-        "over a saved momentum-change model."
+        "over a saved momentum-persistence model."
     )
     with st.expander("LLM", expanded=True):
         # Automatic first: it's the regime-adaptive orchestrator that picks and
@@ -1702,14 +1683,14 @@ def _agent_panel(
             )
         if personality == APPLE_TRADER_KEY:
             st.caption(
-                f"🍎 Apple Trader runs no LLM. Once a minute it scores the "
-                f"{APPLE_TRADER_TICKER} bar that just closed with the saved momentum-change "
-                "regressor, buys when the model calls a persistent change into the positive "
-                "momentum regime (from negative or balanced) and sells when it calls the way "
-                "back out. Every open position is re-checked each bar: if the predicted "
-                "regime never actually shows up the call is written off and the position is "
-                f"cut. It trades {APPLE_TRADER_TICKER} only — the model is fitted per ticker. "
-                "The provider/model settings below do not apply to it."
+                f"🍎 Apple Trader runs no LLM. Once a minute it reads the "
+                f"{APPLE_TRADER_TICKER} bar that just closed; when the momentum regime turns "
+                "positive on that bar it asks the saved persistence classifier whether the "
+                "change will hold, and buys if it says yes. The position is then sold purely "
+                "on price: a trailing stop the configured percentage below the highest price "
+                f"seen since the entry. It trades {APPLE_TRADER_TICKER} only — that is the "
+                "one symbol the model was fitted on. The provider/model settings below do "
+                "not apply to it."
             )
         provider = st.selectbox(
             "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
@@ -1756,8 +1737,8 @@ def _agent_panel(
             st.error("Enter at least one symbol in the sidebar first.")
         elif is_apple_trader and APPLE_TRADER_TICKER not in syms:
             st.error(
-                f"Apple Trader only trades {APPLE_TRADER_TICKER} (the momentum-change model is "
-                f"fitted per ticker); add {APPLE_TRADER_TICKER} to the symbols in the sidebar."
+                f"Apple Trader only trades {APPLE_TRADER_TICKER} (the one symbol its model was "
+                f"fitted on); add {APPLE_TRADER_TICKER} to the symbols in the sidebar."
             )
         elif not llm_key and not is_apple_trader:
             st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")

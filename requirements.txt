@@ -20,8 +20,8 @@ requests-mock>=1.11.0
 # silently stays off without this dependency or the pack file.
 lightgbm>=4.0.0
 
-# Optional — momentum-change model behind the Apple Trader personality
-# (agent_stonks/momentum_model.py, apple_trader.py). The saved bundle is a
+# Optional — momentum-persistence model behind the Apple Trader personality
+# (agent_stonks/persistence_model.py, apple_trader.py). The saved bundle is a
 # pickled sklearn pipeline, so unpickling it needs the same major version it
 # was fitted with; without these the personality reports the missing model and
 # stops instead of trading.
