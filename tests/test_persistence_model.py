@@ -286,6 +286,92 @@ class TestReadLatest:
         assert read["bars_today"] == len(frame)
         assert read["regime"] == 1 and not read["warming_up"]
 
+    def test_a_classifier_is_never_asked_the_anticipation_question(self):
+        """It was fitted on change bars, so a bar that is not one is not a
+        harder question for it -- it is a different one. `turn_proba` stays
+        None on every bar rather than carrying an off-distribution number."""
+        bundle = StubBundle()
+        assert not pm.anticipates(bundle)
+        frame = _session()
+        scored = pm.add_momentum_regimes(frame, PARAMS)
+        balanced = scored[scored["regime"] != 1].index[-1]
+
+        read = pm.read_latest(bundle, frame.loc[:balanced])
+        assert read["regime"] != 1
+        assert read["turn_proba"] is None
+
+
+class TurnStubBundle(StubBundle):
+    """A bundle that can also forecast, i.e. one shaped like N-BEATS'."""
+
+    def __init__(self, proba: float = 0.8, turn: float = 0.3):
+        super().__init__(proba)
+        self.turn_calls: list = []
+
+        def score_turn(X):
+            self.turn_calls.append(np.asarray(X))
+            return np.full(len(X), turn)
+
+        self["score_turn"] = score_turn
+
+
+class TestAnticipationRead:
+    """Which of the two questions a bar poses, and that it never poses both."""
+
+    def test_a_bar_the_regime_has_not_turned_on_gets_the_turn_question(self):
+        bundle = TurnStubBundle()
+        frame = _session()
+        scored = pm.add_momentum_regimes(frame, PARAMS)
+        balanced = scored[scored["regime"] != 1].index[-1]
+
+        read = pm.read_latest(bundle, frame.loc[:balanced])
+        assert read["regime"] != 1
+        assert read["turn_proba"] == pytest.approx(0.3)
+        assert read["proba"] is None
+        assert bundle.turn_calls[-1].shape == (1, 20, 25)
+        assert bundle.calls == []
+
+    def test_the_change_bar_still_gets_the_persistence_question(self):
+        bundle = TurnStubBundle()
+        frame = _session()
+        scored = pm.add_momentum_regimes(frame, PARAMS)
+        change_ts = scored[scored["regime_change"] & (scored["regime"] == 1)].index[0]
+
+        read = pm.read_latest(bundle, frame.loc[:change_ts])
+        assert read["to_positive"]
+        assert read["proba"] == pytest.approx(0.8)
+        assert read["turn_proba"] is None
+        assert bundle.turn_calls == []
+
+    def test_sitting_inside_the_positive_regime_poses_neither(self):
+        bundle = TurnStubBundle()
+        frame = _session()
+        scored = pm.add_momentum_regimes(frame, PARAMS)
+        change_ts = scored[scored["regime_change"] & (scored["regime"] == 1)].index[0]
+        after = frame.index[frame.index.get_loc(change_ts) + 1]
+
+        read = pm.read_latest(bundle, frame.loc[:after])
+        assert read["regime"] == 1 and not read["regime_change"]
+        assert read["proba"] is None and read["turn_proba"] is None
+
+    def test_the_dwell_the_gate_reads_is_the_current_regimes_own_length(self):
+        """On the bar before a change this is what `pre_dwell` will be on the
+        change bar itself -- the same observable gate, one bar early."""
+        frame = _session()
+        scored = pm.add_momentum_regimes(frame, PARAMS)
+        change_ts = scored[scored["regime_change"] & (scored["regime"] == 1)].index[0]
+        before = frame.index[frame.index.get_loc(change_ts) - 1]
+
+        read = pm.read_latest(TurnStubBundle(), frame.loc[:before])
+        assert read["bars_in_regime"] == int(scored["pre_dwell"].loc[change_ts])
+
+    def test_an_unwarmed_window_leaves_the_turn_unanswered(self):
+        bundle = TurnStubBundle()
+        frame = pm._frame_from_bars(_bars("2026-07-21", _flat_then_trend(16, 40, 1e-3)))
+        read = pm.read_latest(bundle, frame.iloc[:20])
+        assert read["turn_proba"] is None
+        assert bundle.turn_calls == []
+
 
 class TestBundle:
     def test_the_path_is_overridable_by_environment(self, monkeypatch):

@@ -553,6 +553,38 @@ def predict_proba(bundle: dict, X) -> np.ndarray:
     return bundle["pipeline"].predict_proba(X)[:, 1]
 
 
+def anticipates(bundle: "dict | None") -> bool:
+    """Whether this bundle can be asked about a change that has not happened.
+
+    Only a forecasting bundle can: it produces future momentum and replays the
+    regime trigger over it, so a bar that is not a regime change is still a
+    question it can answer. The incumbent classifier was fitted on change bars
+    and nothing else, so handing it a balanced bar is not a harder question --
+    it is a different one, off the distribution it was trained on. Apple
+    Trader's `anticipate` entry mode checks this before it will run.
+    """
+    return callable((bundle or {}).get("score_turn"))
+
+
+def predict_turn_proba(bundle: dict, X) -> np.ndarray:
+    """`P(the regime turns positive on the next bar and holds)` for a batch.
+
+    The forward-looking twin of `predict_proba`, with the same shape contract.
+    Raises on a bundle that cannot forecast rather than substituting the
+    persistence answer, which is about a different bar and would read as a
+    plausible number for a question nobody asked.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim == 2:
+        X = X[None, ...]
+    expected = (int(bundle["seq_len"]), len(bundle["feature_columns"]))
+    if X.shape[1:] != expected:
+        raise ValueError(f"expected sequences of shape {expected}, got {X.shape[1:]}")
+    if not anticipates(bundle):
+        raise ValueError("this model cannot forecast a regime change that has not happened yet")
+    return np.asarray(bundle["score_turn"](X), dtype=float)
+
+
 # --- the live minute grid ---------------------------------------------------
 
 def _frame_from_bars(bars: "list[dict]") -> pd.DataFrame:
@@ -611,18 +643,28 @@ def minute_frame(sym_state) -> pd.DataFrame:
 
 def read_latest(bundle: dict, df: pd.DataFrame) -> "dict | None":
     """Score the newest bar of `df`: the regime it is in, whether it just
-    changed, and -- only for a change INTO the positive regime -- the model's
-    probability that the change is persistent.
+    changed, and the model's probability for whichever of the two questions
+    that bar poses.
 
     Returns `{"ts", "price", "high", "mom", "regime", "prev_regime",
-    "regime_change", "to_positive", "pre_dwell", "proba", "bars_today",
-    "warming_up"}`, or None when the frame is too short to score at all.
+    "regime_change", "to_positive", "pre_dwell", "bars_in_regime", "proba",
+    "turn_proba", "bars_today", "warming_up"}`, or None when the frame is too
+    short to score at all.
 
-    The model is consulted on exactly the bars TimeToChange2's own simulator
-    consults it on (`mshift.backtest._signal_sequences`): a to-positive regime
-    change with a complete, all-finite 20-bar feature window behind it, inside
-    one session. On every other bar `proba` is None -- an absent number rather
-    than a fabricated one.
+    Two questions, and a bar is only ever one of them:
+
+    `proba`      the bar IS a change into positive -- will the change hold?
+                 Consulted on exactly the bars TimeToChange2's own simulator
+                 consults it on (`mshift.backtest._signal_sequences`): a
+                 to-positive regime change with a complete, all-finite 20-bar
+                 feature window behind it, inside one session.
+    `turn_proba` the bar is NOT positive yet -- is it about to be? Only a
+                 forecasting bundle can answer this (see `anticipates`), so it
+                 is None on the incumbent classifier no matter which bar it is.
+
+    Both are None wherever they do not apply -- an absent number rather than a
+    fabricated one -- which is what makes each entry mode's condition in
+    `apple_trader` a plain "is this number there and big enough".
 
     `warming_up` reports the opening window `mshift.momentum.build_events`
     drops when assembling the *training* set, but it is not a second gate here
@@ -644,13 +686,20 @@ def read_latest(bundle: dict, df: pd.DataFrame) -> "dict | None":
     to_positive = changed and regime == 1
     warming_up = int(last["bar_of_day"]) < p["warmup_bars"]
 
-    proba = None
-    if to_positive:
+    # A bar is either a completed to-positive change (the persistence
+    # question) or one that has not turned positive yet (the anticipation
+    # question) -- never both, and never neither.
+    ask_turn = regime != 1 and anticipates(bundle)
+    proba = turn_proba = None
+    if to_positive or ask_turn:
         sequence = build_sequence(
             compute_features(scored), bundle["feature_columns"], int(bundle["seq_len"])
         )
         if sequence is not None:
-            proba = float(predict_proba(bundle, sequence[None, ...])[0])
+            if to_positive:
+                proba = float(predict_proba(bundle, sequence[None, ...])[0])
+            else:
+                turn_proba = float(predict_turn_proba(bundle, sequence[None, ...])[0])
 
     prev = last["prev_regime"]
     return {
@@ -663,7 +712,12 @@ def read_latest(bundle: dict, df: pd.DataFrame) -> "dict | None":
         "regime_change": changed,
         "to_positive": to_positive,
         "pre_dwell": None if pd.isna(last["pre_dwell"]) else int(last["pre_dwell"]),
+        # How long the CURRENT regime has run as of this bar. On a bar the
+        # regime is about to leave, this is the `pre_dwell` the change bar
+        # would report -- the observable gate, one bar early.
+        "bars_in_regime": int(last["bars_in_regime"]),
         "proba": proba,
+        "turn_proba": turn_proba,
         "bars_today": int(last["bar_of_day"]) + 1,
         "warming_up": warming_up,
     }

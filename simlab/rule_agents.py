@@ -24,8 +24,10 @@ from agent_stonks.apple_trader import (
     APPLE_TRADER_AVATAR,
     APPLE_TRADER_KEY,
     APPLE_TRADER_LABEL,
+    ENTRY_CONFIRM,
     AppleTrader,
     AppleTraderConfig,
+    entry_mode_error,
 )
 from agent_stonks.apple_trader import TICKER as APPLE_TRADER_TICKER
 from agent_stonks.apple_trader import config_signature as apple_config_signature
@@ -104,6 +106,9 @@ def _build_apple(config: AppleTraderConfig) -> _BundleBound:
     bundle = apple_models.load(config.model_key)
     if bundle is None:
         raise RuntimeError(apple_models.unavailable_reason(config.model_key))
+    mismatch = entry_mode_error(config, bundle)
+    if mismatch is not None:
+        raise RuntimeError(mismatch)
     return _BundleBound(
         AppleTrader(config, model_threshold=persistence_model.model_threshold(bundle)),
         bundle,
@@ -116,6 +121,18 @@ def _apple_signature(config: AppleTraderConfig) -> str:
     return apple_config_signature(
         config, model_threshold=apple_models.threshold(config.model_key)
     )
+
+
+# What Apple Trader's rule set meant before a field existed to say otherwise.
+# A stored record is a description of a run that already happened, so a missing
+# key has to decode to the behaviour of the day it was written -- not to
+# today's default, which would silently replay a record under a different
+# strategy and file it in Results beside the original as though it matched.
+_APPLE_LEGACY = {"model_key": "persistence", "entry_mode": ENTRY_CONFIRM}
+
+
+def _apple_from_record(raw: "dict | None") -> AppleTraderConfig:
+    return AppleTraderConfig(**{**_APPLE_LEGACY, **(raw or {})})
 
 
 # ------------------------------------- TraderByChatGPT / TraderByClaude
@@ -160,7 +177,7 @@ RULE_AGENTS: dict[str, RuleAgent] = {
         build=_build_apple,
         signature=_apple_signature,
         to_record=asdict,
-        from_record=lambda raw: AppleTraderConfig(**(raw or {})),
+        from_record=_apple_from_record,
     ),
     TRADER_BY_CHATGPT_KEY: RuleAgent(
         key=TRADER_BY_CHATGPT_KEY,

@@ -2,33 +2,79 @@
 
 Every other personality in `agent_stonks.agent` is a system prompt handed to a
 model that reasons its way to a decision. This one is a plain loop: once a
-minute it looks at the AAPL bar that just closed, and when the momentum regime
-has just turned positive it asks a saved model from FinNotebooks/TimeToChange2
-whether that change is the kind that holds. Same paper ledger, same fill path,
-same log -- only the decision-making is deterministic, so the same tape always
-produces the same trades.
+minute it looks at the AAPL bar that just closed and asks a saved model from
+FinNotebooks/TimeToChange2 one question about the momentum regime. Same paper
+ledger, same fill path, same log -- only the decision-making is deterministic,
+so the same tape always produces the same trades.
 
-Which model answers is a setting (`AppleTraderConfig.model_key`, see
-`agent_stonks.apple_models`): the incumbent persistence classifier, or the
-N-BEATS ensemble that forecasts momentum and derives the same probability from
-500 sampled futures. The rules below do not change with it -- both are handed
-the same 20-bar window on the same bars and return one number -- so a run's
-model is part of its configuration identity rather than a different agent.
+Two settings decide what that question is. `AppleTraderConfig.entry_mode`
+chooses whether the loop buys the regime change it can *see* on the bar
+(`confirm`) or the one the model *predicts* for the next bar (`anticipate`,
+the default) -- the difference between entering after the momentum score has
+crossed its threshold and entering before. `AppleTraderConfig.model_key` (see
+`agent_stonks.apple_models`) chooses who answers: the incumbent persistence
+classifier, or the N-BEATS ensemble that forecasts momentum and derives its
+probability from 500 sampled futures. The two settings are not independent --
+only a forecaster can answer the anticipation question -- but both are part of
+a run's configuration identity rather than a different agent.
 
 The rules
 ---------
-* BUY when the last closed bar is a momentum-regime change **into positive**
-  and the model's persistence probability for it is at least `prob_threshold`.
-  That is the entire entry condition: one bar, one question, one answer. There
-  is no confirmation count, because the thing a confirmation window would wait
-  for -- the new regime surviving -- is exactly what the model is being asked.
-  The one thing that overrides a signal is the clock: no position is opened
-  inside the closing flatten window, because a long the next rule is about to
-  shut is not a trade, it is two commissions.
+* BUY on one bar, one question, one answer -- but *which* bar and which
+  question is `AppleTraderConfig.entry_mode`:
+
+  - `anticipate` (default): the last closed bar's regime is still **negative or
+    balanced**, and the model's forecast puts it at `prob_threshold` or better
+    to turn positive on the next bar and stay positive. The regime has not
+    turned yet; the trade is taken on the prediction that it is about to.
+  - `confirm`: the last closed bar **is** a momentum-regime change into
+    positive, and the model's persistence probability for it is at least
+    `prob_threshold`. There is no confirmation count on top, because the thing
+    a confirmation window would wait for -- the new regime surviving -- is
+    exactly what the model is being asked.
+
+  The one thing that overrides a signal either way is the clock: no position is
+  opened inside the closing flatten window, because a long the next rule is
+  about to shut is not a trade, it is two commissions.
 * SELL when price has fallen `trail_pct` below the highest price seen since the
   entry. The peak ratchets up and never down, so the rule is a trailing stop
   that starts `trail_pct` under the entry and turns into a profit lock as the
   move runs.
+
+Why `anticipate` is the default
+-------------------------------
+`confirm` is the rule TimeToChange2's simulator runs, and on a live tape it is
+structurally late. The regime turns positive when the smoothed momentum score
+crosses `enter_threshold` (0.90), and that score is a 15-bar return smoothed
+over 7 more -- so by the bar the trigger fires, the move that produced it is
+fifteen to twenty bars old. Measured over the four to-positive changes on the
+2026-07-27 SIP tape: price had already run 0.13-0.24% into the signal, while
+the *forward* 30-bar excursion from the signal was 0.13-0.23%. Against a 0.50%
+trailing stop that is a strategy buying the end of the move -- two of that
+session's three round-trips lost and it finished -0.41%.
+
+`anticipate` asks the same model the same question one bar earlier, which is
+the earliest a forecast can be checked at all: the horizon is 15 bars and the
+persistence label wants 15 bars of survival, so only a turn on the very next
+forecast bar leaves room to verify it holds. It fires while the regime is still
+balanced or negative -- which is the point -- and it is selective rather than
+chatty: on that tape the question is posed on 286 bars and only 7 clear 0.05,
+against a median of 0.000. The bars leading into the four real changes score
+0.43, 0.09, 0.00 and 0.20 -- the third being the change whose old regime had
+held 8 bars, which the dwell gate zeroes in both modes. Entering the same three
+episodes one to six bars early took the session to +0.08%; one day and three
+trades is a sanity check on the wiring, not evidence about the edge.
+
+Both modes carry the same observable gate (the regime being left must already
+have run `min_dwell` bars), so `prob_threshold` means the same kind of thing in
+each. It is not, however, *tuned* for `anticipate`: the cut-off a bundle ships
+was grid-searched on the confirmation question, so treat it as a starting point
+and re-tune it in SimLab rather than as a validated setting.
+
+`anticipate` needs a model that can forecast, so it runs on the N-BEATS
+ensemble and not on the incumbent classifier, which was fitted on change bars
+and has nothing to say about a bar that is not one. Pairing them fails at
+launch (`entry_mode_error`) rather than producing an empty ledger.
 
 Nothing else closes the position except the closing bell: momentum, regimes and
 every feature the model uses are intraday and do not survive the overnight gap,
@@ -36,12 +82,14 @@ so the book is flattened `flatten_before_close_min` before the close.
 
 Against the notebook
 --------------------
-The entry above is the rule TimeToChange2's own simulator runs
+The `confirm` entry is the rule TimeToChange2's own simulator runs
 (`mshift.backtest.simulate_day`): the same to-positive-change trigger, the same
 `proba >= threshold` test on the same 20-bar window, and the same refusal to
 open a position it is about to be forced out of (there, "no decision on the
 last bar of the session"). `tests/test_persistence_model.py` pins the feature
-pipeline to `mshift` bar for bar, so a signal here is a signal there.
+pipeline to `mshift` bar for bar, so a signal in that mode is a signal there.
+Everything in this section is about that mode; `anticipate` has no counterpart
+in the notebook, which only ever scores change bars.
 
 Two differences remain, deliberately:
 
@@ -101,6 +149,7 @@ from .clock import now as _now
 from .config import (
     APPLE_TRADER_BAR_LAG_SEC,
     APPLE_TRADER_CYCLE_SEC,
+    APPLE_TRADER_ENTRY_MODE,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
     APPLE_TRADER_MODEL,
     APPLE_TRADER_POSITION_PCT,
@@ -122,21 +171,64 @@ RULE_PROVIDER = "rules"
 # transfer -- the personality is named after the one symbol it can trade.
 TICKER = "AAPL"
 
+# The two entry triggers. See the module docstring for what separates them and
+# `agent_stonks.config` for why `anticipate` is the default.
+ENTRY_ANTICIPATE = "anticipate"
+ENTRY_CONFIRM = "confirm"
+ENTRY_MODES = (ENTRY_ANTICIPATE, ENTRY_CONFIRM)
+
+# How the two modes are named and explained wherever they are offered. Both the
+# live dashboard and SimLab present this choice, and it is the setting most
+# likely to be misread as cosmetic -- so the wording lives here once rather
+# than drifting between two panels.
+ENTRY_MODE_LABEL = {
+    ENTRY_ANTICIPATE: "Anticipate the turn",
+    ENTRY_CONFIRM: "Confirm the turn",
+}
+ENTRY_MODE_SUMMARY = {
+    ENTRY_ANTICIPATE: (
+        "Buys while the regime is still negative or balanced, on the model's forecast "
+        "that it turns positive on the next bar and stays there. Needs a forecasting "
+        "model."
+    ),
+    ENTRY_CONFIRM: (
+        "Buys the bar the change into positive prints on, if the model rates it likely "
+        "to hold. This is the notebook's rule — and by that bar the momentum score has "
+        "already crossed its threshold, so the entry lands after the move that produced "
+        "the signal."
+    ),
+}
+ENTRY_MODE_PROB_LABEL = {
+    ENTRY_ANTICIPATE: "Turn probability to buy",
+    ENTRY_CONFIRM: "Persistence probability to buy",
+}
+
 
 @dataclass
 class AppleTraderConfig:
-    """Tunables of the loop. `model_key`, `prob_threshold` and `trail_pct` are
-    the three that change what it does; the rest are sizing and housekeeping."""
+    """Tunables of the loop. `entry_mode`, `model_key`, `prob_threshold` and
+    `trail_pct` are the four that change what it does; the rest are sizing and
+    housekeeping."""
 
     # Which saved model answers the entry question -- a key of
     # `apple_models.MODELS`.
     model_key: str = APPLE_TRADER_MODEL
+    # Which question to ask it: buy the predicted turn, or the confirmed one.
+    # `anticipate` requires a model that can forecast, which is checked before
+    # the loop starts rather than discovered on the first candidate.
+    entry_mode: str = APPLE_TRADER_ENTRY_MODE
     # None -> the cut-off the chosen model picked on its own validation block,
     # which is the only setting that means the same thing across models.
     prob_threshold: Optional[float] = APPLE_TRADER_PROB_THRESHOLD
     trail_pct: float = APPLE_TRADER_TRAIL_PCT
     position_pct: float = APPLE_TRADER_POSITION_PCT
     flatten_before_close_min: int = APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN
+
+    def __post_init__(self) -> None:
+        if self.entry_mode not in ENTRY_MODES:
+            raise ValueError(
+                f"unknown entry_mode {self.entry_mode!r}; expected one of {ENTRY_MODES}"
+            )
 
 
 def config_signature(
@@ -147,17 +239,42 @@ def config_signature(
     Two runs of this agent differ only in these numbers and the model behind
     them, so SimLab groups and de-duplicates runs on this string exactly as it
     does on `provider/model` for the LLM agents -- retuning the trailing stop,
-    or swapping the classifier for the forecaster, is a new configuration to
-    test rather than a repeat of one already tested. The model leads the string
-    because a threshold read without it is meaningless: the two models' scales
-    are unrelated.
+    swapping the classifier for the forecaster, or moving the entry from the
+    confirmed change to the predicted one is a new configuration to test rather
+    than a repeat of one already tested. The model leads the string because a
+    threshold read without it is meaningless: the two models' scales are
+    unrelated. The entry mode follows it because the same model answers a
+    different question in each.
     """
     c = config or AppleTraderConfig()
     threshold = c.prob_threshold if c.prob_threshold is not None else model_threshold
     shown = f"{threshold:g}" if threshold is not None else "model"
     return (
-        f"{apple_models.get(c.model_key).key}_{TICKER}(p>={shown},"
+        f"{apple_models.get(c.model_key).key}_{TICKER}({c.entry_mode},p>={shown},"
         f"trail={c.trail_pct:g}%,size={c.position_pct:g}%)"
+    )
+
+
+def entry_mode_error(config: AppleTraderConfig, bundle: "dict | None") -> "str | None":
+    """Why this rule set cannot run on this bundle, or None if it can.
+
+    The one pairing that does not work is `anticipate` on a model that cannot
+    forecast. Checked once before the loop starts rather than per bar, because
+    the failure mode it prevents is the quiet one: `read_latest` leaves
+    `turn_proba` as None on a classifier, `_entry_signal` reads None as "not a
+    buy", and the run finishes clean with an empty ledger that looks like a
+    strategy result instead of a misconfiguration.
+    """
+    if config.entry_mode != ENTRY_ANTICIPATE:
+        return None
+    if persistence_model.anticipates(bundle):
+        return None
+    model = apple_models.get(config.model_key)
+    forecasters = ", ".join(m.label for m in apple_models.MODELS.values() if m.anticipates)
+    return (
+        f"{model.label} cannot forecast a regime change that has not happened yet, "
+        f"so it cannot run the '{ENTRY_ANTICIPATE}' entry. Either switch the model "
+        f"({forecasters}) or switch the entry to '{ENTRY_CONFIRM}'."
     )
 
 
@@ -257,17 +374,28 @@ class AppleTrader:
             return "bought" if self._buy(state, tracker, read) else "hold"
         return "warming_up" if read["warming_up"] else "hold"
 
-    def _entry_signal(self, read: dict) -> bool:
-        """A change into the positive regime the model expects to hold.
+    def _entry_probability(self, read: dict) -> "float | None":
+        """The number this entry mode is asking about, or None if this bar does
+        not pose its question.
 
-        `proba` is None on every bar that is not such a change, and also on one
-        that is but whose 20-bar feature window is incomplete -- in which case
-        the model is not asked, and an unasked model is not a yes. Exactly the
-        bars `mshift.backtest._signal_sequences` builds a sequence for.
+        `read_latest` fills exactly one of the two in, and only on a bar where
+        the question applies and the 20-bar feature window behind it is
+        complete. So neither branch has to re-check which bar it is looking at:
+        an absent number is a bar with nothing to decide, and an unasked model
+        is not a yes.
         """
-        return read["to_positive"] and read["proba"] is not None and (
-            read["proba"] >= self.prob_threshold
-        )
+        if self.config.entry_mode == ENTRY_ANTICIPATE:
+            # Non-None only where the regime is still negative or balanced --
+            # which is the entire point of this mode.
+            return read["turn_proba"]
+        # Non-None only on a bar that IS a change into positive, exactly the
+        # bars `mshift.backtest._signal_sequences` builds a sequence for.
+        return read["proba"] if read["to_positive"] else None
+
+    def _entry_signal(self, read: dict) -> bool:
+        """Whether this bar is a buy under the configured entry mode."""
+        proba = self._entry_probability(read)
+        return proba is not None and proba >= self.prob_threshold
 
     def _closing_soon(self) -> bool:
         """Whether the flatten-before-close rule is already in force."""
@@ -316,16 +444,7 @@ class AppleTrader:
             )
             return False
 
-        dwell = read["pre_dwell"]
-        reasoning = (
-            f"Momentum regime turned "
-            f"{persistence_model.regime_name(read['prev_regime'])} -> positive on this bar "
-            f"(momentum {read['mom']:+.2f}"
-            + (f", the old regime had held {dwell} bars" if dwell is not None else "")
-            + f"), and the persistence model puts it at {read['proba']:.0%} "
-            f"(>= {self.prob_threshold:.0%}) to hold. Buying; the exit is a "
-            f"{self.config.trail_pct:.2f}% trailing stop from here."
-        )
+        reasoning = self._entry_reasoning(read)
         decision = tracker.record_trade(
             TICKER, "buy", quantity, reasoning, state.api_key, state.api_secret, state.feed
         )
@@ -336,6 +455,35 @@ class AppleTrader:
             # this bar's high happened before it did.
             self.entry = {"price": decision.price, "peak": decision.price, "bars": 0}
         return decision.status == "filled"
+
+    def _entry_reasoning(self, read: dict) -> str:
+        """Why this bar was bought, in the terms of the mode that bought it.
+
+        The two modes buy on opposite sides of the same event, so a single
+        sentence covering both would have to be vague about the one thing a
+        reader of the ledger most needs to know: whether the regime had already
+        turned when the order went in.
+        """
+        trail = f"the exit is a {self.config.trail_pct:.2f}% trailing stop from here."
+        if self.config.entry_mode == ENTRY_ANTICIPATE:
+            dwell = read["bars_in_regime"]
+            return (
+                f"Momentum regime is still "
+                f"{persistence_model.regime_name(read['regime'])} on this bar "
+                f"(momentum {read['mom']:+.2f}, and it has held {dwell} bars), but the "
+                f"forecast puts it at {read['turn_proba']:.0%} "
+                f"(>= {self.prob_threshold:.0%}) to turn positive on the next bar and "
+                f"stay there. Buying the turn before it prints; {trail}"
+            )
+        dwell = read["pre_dwell"]
+        return (
+            f"Momentum regime turned "
+            f"{persistence_model.regime_name(read['prev_regime'])} -> positive on this bar "
+            f"(momentum {read['mom']:+.2f}"
+            + (f", the old regime had held {dwell} bars" if dwell is not None else "")
+            + f"), and the persistence model puts it at {read['proba']:.0%} "
+            f"(>= {self.prob_threshold:.0%}) to hold. Buying; {trail}"
+        )
 
     def _sell(
         self, state: AppState, tracker: DecisionTracker, quantity: float, read: dict, reasoning: str
@@ -362,7 +510,11 @@ class AppleTrader:
                 f"{persistence_model.regime_name(read['regime'])}"
                 + (f" after {dwell} bars" if dwell is not None else "")
             )
-        if read["to_positive"]:
+        if self.config.entry_mode == ENTRY_ANTICIPATE:
+            turn = read["turn_proba"]
+            if turn is not None:
+                parts.append(f"turns positive {turn:.0%} vs {self.prob_threshold:.0%}")
+        elif read["to_positive"]:
             proba = read["proba"]
             parts.append(
                 f"persistence {proba:.0%} vs {self.prob_threshold:.0%}"
@@ -432,6 +584,13 @@ def _apple_trader_loop(
                 ),
             },
         )
+        scoring.end_session(state, tracker)
+        state.agent_running = False
+        return
+
+    mismatch = entry_mode_error(config, bundle)
+    if mismatch is not None:
+        _log(state, {"type": "error", "text": mismatch})
         scoring.end_session(state, tracker)
         state.agent_running = False
         return

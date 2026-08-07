@@ -421,6 +421,57 @@ def persistence_probability(
     }
 
 
+def turn_probability(
+    samples: np.ndarray, start_regime, current_dwell, momentum: dict, min_dwell: int
+) -> dict:
+    """`P(the regime turns positive on the next bar and stays there)`.
+
+    The forward-shifted twin of `persistence_probability`. That one is anchored
+    on a bar where the change has already happened and asks whether the new
+    regime survives; this one is anchored on the bar *before* -- the regime is
+    still negative or balanced -- and asks whether the change is about to
+    happen at all. It is the question Apple Trader's `anticipate` entry mode is
+    built on, and the reason that mode needs a forecaster: a classifier trained
+    on change bars has nothing to say about a bar that is not one.
+
+    "Stays there" is the whole horizon rather than `min_dwell` bars, and the two
+    coincide by construction: the forecast is `horizon` bars long and
+    `min_dwell` is 15 of them, so a path that is positive from the first
+    forecast bar to the last has exactly cleared the dwell the persistence
+    label demands. A turn any *later* in the horizon cannot be checked for
+    survival inside it, which is why this asks only about the next bar -- see
+    the `anticipate` note in `agent_stonks.apple_trader`.
+
+    The gate is the same observable half of the persistence label, evaluated
+    one bar earlier: `current_dwell` is how long the regime being left has run
+    as of the anchor bar, which is precisely the `pre_dwell` the change bar
+    would report. So both probabilities carry the same gate and mean the same
+    kind of thing, which is what lets one threshold serve both modes.
+    """
+    samples = np.asarray(samples, dtype=np.float64)
+    n, n_paths, horizon = samples.shape
+    if horizon < min_dwell:
+        raise ValueError(
+            f"horizon {horizon} is too short to see a turn hold for {min_dwell} bars"
+        )
+
+    states = forward_regime_path(
+        samples.reshape(n * n_paths, horizon),
+        np.repeat(np.asarray(start_regime), n_paths),
+        float(momentum["enter_threshold"]),
+        float(momentum["exit_threshold"]),
+    )
+    holds = (states == 1).all(axis=1).reshape(n, n_paths)
+
+    p_turn = holds.mean(axis=1)
+    gate = (np.asarray(current_dwell, dtype=np.float64) >= min_dwell).astype(float)
+    return {
+        "p_turn": p_turn,
+        "p_full": p_turn * gate,
+        "pre_dwell_gate": gate,
+    }
+
+
 # --- loading -----------------------------------------------------------------
 
 def model_path() -> Path:
@@ -531,6 +582,12 @@ def load_bundle() -> "dict | None":
         )
         i_regime = feature_columns.index("f_regime")
         i_dwell = feature_columns.index("f_prev_dwell")
+        i_in_regime = feature_columns.index("f_bars_in_regime")
+
+        def _sampled_paths(X: np.ndarray) -> np.ndarray:
+            return bootstrap_paths(
+                ensemble_forecast(seeds, X, target_index), residuals, N_PATHS, BOOTSTRAP_SEED
+            )
 
         def score(X) -> np.ndarray:
             """`(n, seq_len, n_features)` sequences -> persistence probability.
@@ -544,11 +601,8 @@ def load_bundle() -> "dict | None":
             X = np.asarray(X, dtype=np.float32)
             if len(X) == 0:
                 return np.array([])
-            paths = bootstrap_paths(
-                ensemble_forecast(seeds, X, target_index), residuals, N_PATHS, BOOTSTRAP_SEED
-            )
             result = persistence_probability(
-                paths,
+                _sampled_paths(X),
                 np.rint(X[:, -1, i_regime]).astype(int),
                 np.expm1(X[:, -1, i_dwell]),
                 momentum,
@@ -556,8 +610,45 @@ def load_bundle() -> "dict | None":
             )
             return np.clip(result["p_full"], 0.0, 1.0)
 
+        def score_turn(X) -> np.ndarray:
+            """`(n, seq_len, n_features)` sequences -> P(turns positive next bar).
+
+            The `anticipate` half of the interface, and the reason the bundle
+            carries two callables: the anchor here is a bar whose regime is
+            still negative or balanced, so `score` above -- which asks whether
+            the regime the anchor is *in* survives -- would be answering the
+            wrong question entirely.
+
+            Like `score`, everything comes out of the array itself:
+            `f_bars_in_regime` is `log1p` of how long the current regime has
+            run as of the anchor bar, which is the `pre_dwell` the change bar
+            would report. Rows the gate closes are returned as a hard zero
+            without forecasting them -- the same answer the full computation
+            gives, for none of the five networks and 500 paths, which is what
+            keeps a per-bar cycle affordable when most bars cannot qualify.
+            """
+            X = np.asarray(X, dtype=np.float32)
+            if len(X) == 0:
+                return np.array([])
+            dwell = np.expm1(X[:, -1, i_in_regime])
+            open_gate = dwell >= min_dwell
+            out = np.zeros(len(X), dtype=float)
+            if not open_gate.any():
+                return out
+            candidates = X[open_gate]
+            result = turn_probability(
+                _sampled_paths(candidates),
+                np.rint(candidates[:, -1, i_regime]).astype(int),
+                dwell[open_gate],
+                momentum,
+                min_dwell,
+            )
+            out[open_gate] = np.clip(result["p_full"], 0.0, 1.0)
+            return out
+
         bundle = {
             "score": score,
+            "score_turn": score_turn,
             "feature_columns": feature_columns,
             "seq_len": seq_len,
             "horizon": horizon,

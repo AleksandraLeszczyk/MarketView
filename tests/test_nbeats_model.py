@@ -185,11 +185,84 @@ class TestBundle:
         with pytest.raises(ValueError, match="expected sequences"):
             pm.predict_proba(BUNDLE, np.zeros((1, 19, len(pm.FEATURE_COLUMNS))))
 
+    def _anticipation_window(self, regime: float, dwell: float) -> np.ndarray:
+        X = np.zeros((1, 20, len(pm.FEATURE_COLUMNS)), dtype=np.float32)
+        X[0, :, pm.FEATURE_COLUMNS.index("f_regime")] = regime
+        X[0, :, pm.FEATURE_COLUMNS.index("f_bars_in_regime")] = np.log1p(dwell)
+        return X
+
+    def test_the_forecaster_answers_the_anticipation_question_too(self):
+        proba = pm.predict_turn_proba(BUNDLE, self._anticipation_window(0.0, 40.0))
+        assert proba.shape == (1,)
+        assert 0.0 <= proba[0] <= 1.0
+        # Seeded bootstrap: the same tape has to give the same trades.
+        assert proba[0] == pytest.approx(
+            pm.predict_turn_proba(BUNDLE, self._anticipation_window(0.0, 40.0))[0]
+        )
+
+    def test_the_dwell_gate_closes_on_the_bar_before_the_change_too(self):
+        """`anticipate` carries the same observable half of the persistence
+        label as `confirm`, read one bar earlier: there it is `pre_dwell` on
+        the change bar, here it is the current regime's own length."""
+        assert pm.predict_turn_proba(BUNDLE, self._anticipation_window(0.0, 8.0))[0] == 0.0
+
+    def test_the_wrong_shaped_sequence_is_refused_here_as_well(self):
+        with pytest.raises(ValueError, match="expected sequences"):
+            pm.predict_turn_proba(BUNDLE, np.zeros((1, 19, len(pm.FEATURE_COLUMNS))))
+
+
+class TestTurnProbability:
+    """The forward-shifted twin of `persistence_probability`: the anchor bar is
+    one the regime has NOT turned on yet."""
+
+    def _paths(self, *rows) -> np.ndarray:
+        return np.asarray([list(rows)], dtype=float)
+
+    def test_a_path_positive_for_the_whole_horizon_counts(self):
+        paths = self._paths([1.2] * 15)
+        out = nb.turn_probability(paths, 0, 40, MOMENTUM, 15)
+        assert out["p_turn"][0] == pytest.approx(1.0)
+        assert out["p_full"][0] == pytest.approx(1.0)
+
+    def test_a_turn_that_dies_inside_the_horizon_does_not(self):
+        paths = self._paths([1.2] * 10 + [0.0] * 5)
+        assert nb.turn_probability(paths, 0, 40, MOMENTUM, 15)["p_turn"][0] == 0.0
+
+    def test_a_turn_that_arrives_late_does_not_count_either(self):
+        """The horizon is exactly `min_dwell` long, so only a turn on the very
+        first forecast bar leaves room to see it survive. A later one is not
+        rejected as unlikely -- it simply cannot be checked."""
+        paths = self._paths([0.5] + [1.2] * 14)
+        assert nb.turn_probability(paths, 0, 40, MOMENTUM, 15)["p_turn"][0] == 0.0
+
+    def test_a_short_dwell_closes_the_gate_whatever_the_paths_say(self):
+        out = nb.turn_probability(self._paths([1.2] * 15), 0, 8, MOMENTUM, 15)
+        assert out["p_turn"][0] == pytest.approx(1.0)
+        assert out["p_full"][0] == 0.0
+
+    def test_it_starts_from_the_negative_regime_as_readily_as_the_balanced_one(self):
+        # From -1 the trigger needs `mom > enter` to reach +1 directly.
+        out = nb.turn_probability(self._paths([1.2] * 15), -1, 40, MOMENTUM, 15)
+        assert out["p_turn"][0] == pytest.approx(1.0)
+
+    def test_a_horizon_too_short_to_decide_raises(self):
+        with pytest.raises(ValueError, match="too short"):
+            nb.turn_probability(self._paths([1.2] * 10), 0, 40, MOMENTUM, 15)
+
 
 class TestAppleModelsRegistry:
-    def test_both_models_are_offered_with_the_classifier_first(self):
+    def test_both_models_are_offered_with_the_forecaster_as_default(self):
         assert apple_models.keys() == ["persistence", "nbeats"]
-        assert apple_models.DEFAULT_MODEL == "persistence"
+        # Apple Trader's default entry (`anticipate`) is a question only a
+        # forecaster can answer, so the default model has to be one.
+        assert apple_models.DEFAULT_MODEL == "nbeats"
+
+    def test_only_the_forecaster_claims_it_can_anticipate(self):
+        """The flag a picker reads, without importing 200 MB of PyTorch to
+        find out. `persistence_model.anticipates` is the authority at run
+        time; these two must not disagree."""
+        assert apple_models.get("nbeats").anticipates is True
+        assert apple_models.get("persistence").anticipates is False
 
     def test_an_unknown_key_falls_back_rather_than_raising(self):
         # Stored experiment records outlive model names; a Results page should

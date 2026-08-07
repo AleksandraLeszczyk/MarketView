@@ -76,7 +76,9 @@ class Reads:
         prev_regime: "int | None" = 0,
         change: bool = False,
         proba: "float | None" = None,
+        turn_proba: "float | None" = None,
         pre_dwell: "int | None" = 20,
+        bars_in_regime: int = 20,
         bars_today: int = 200,
         warming_up: bool = False,
         advance: bool = True,
@@ -98,20 +100,45 @@ class Reads:
             "regime_change": change,
             "to_positive": change and regime == 1,
             "pre_dwell": pre_dwell if change else None,
+            "bars_in_regime": bars_in_regime,
             "proba": proba,
+            "turn_proba": turn_proba,
             "bars_today": bars_today,
             "warming_up": warming_up,
         }
         return self.next_read
 
     def to_positive(self, *, proba: float, **kwargs) -> dict:
-        """The one bar the model is ever asked about: a change into positive."""
+        """The bar `confirm` acts on: a change into positive, already printed."""
         return self.set(regime=1, prev_regime=0, change=True, proba=proba, **kwargs)
+
+    def pre_turn(self, *, turn_proba: "float | None", regime: int = 0, **kwargs) -> dict:
+        """The bar `anticipate` acts on: the regime has NOT turned positive, and
+        the forecaster has been asked whether it is about to.
+
+        `read_latest` only fills `turn_proba` in on such a bar, so a stub that
+        set it beside `regime=1` would be testing a state the pipeline cannot
+        produce.
+        """
+        return self.set(regime=regime, prev_regime=regime, turn_proba=turn_proba, **kwargs)
+
+
+def confirm_config(**kwargs) -> AppleTraderConfig:
+    """A rule set on the `confirm` entry, which is no longer the default.
+
+    The trailing stop, the flatten rule and the guards are shared by both entry
+    modes, so the suites below pin them through the mode whose trigger is the
+    notebook's and whose stub is a single scripted bar.
+    """
+    return AppleTraderConfig(entry_mode=at.ENTRY_CONFIRM, **kwargs)
 
 
 class TestEntry:
+    """The `confirm` trigger: buy a change into positive that has already
+    printed, if the model rates it likely to hold."""
+
     def _trader(self, **kwargs) -> AppleTrader:
-        return AppleTrader(AppleTraderConfig(**kwargs), model_threshold=0.07)
+        return AppleTrader(confirm_config(**kwargs), model_threshold=0.07)
 
     def test_buys_a_to_positive_change_the_model_backs(self, state, market_open, monkeypatch):
         broker = FakeBroker(100.0)
@@ -138,7 +165,7 @@ class TestEntry:
     ):
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
         reads = Reads(monkeypatch)
-        trader = AppleTrader(AppleTraderConfig(prob_threshold=None), model_threshold=0.07)
+        trader = AppleTrader(confirm_config(prob_threshold=None), model_threshold=0.07)
         assert trader.prob_threshold == pytest.approx(0.07)
 
         reads.to_positive(proba=0.10)  # under any sane default, over this model's
@@ -256,6 +283,146 @@ class TestEntry:
         assert tracker.position_for(TICKER) == size
 
 
+class TestAnticipateEntry:
+    """The default trigger: buy while the regime is still negative or balanced,
+    on the forecast that it turns positive next bar.
+
+    The whole point of this mode is *where in the transition* the order goes
+    in, so these pin which bars can and cannot produce one -- not just the
+    threshold arithmetic.
+    """
+
+    def _trader(self, **kwargs) -> AppleTrader:
+        return AppleTrader(
+            AppleTraderConfig(entry_mode=at.ENTRY_ANTICIPATE, **kwargs),
+            model_threshold=0.05,
+        )
+
+    def test_buys_a_balanced_bar_the_forecast_expects_to_turn(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = self._trader(prob_threshold=0.2)
+
+        reads.pre_turn(turn_proba=0.45, regime=0, mom=0.8)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
+        assert tracker.position_for(TICKER) > 0
+
+    def test_buys_out_of_the_negative_regime_too(self, state, market_open, monkeypatch):
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = self._trader(prob_threshold=0.2)
+
+        reads.pre_turn(turn_proba=0.31, regime=-1, mom=-0.5)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
+        assert tracker.position_for(TICKER) > 0
+
+    def test_the_regime_is_not_yet_positive_when_the_order_goes_in(
+        self, state, market_open, monkeypatch
+    ):
+        """The regression this mode exists for. `confirm` can only ever buy a
+        bar whose regime has already turned positive, which puts the entry
+        after the momentum score has crossed its threshold and after the move
+        that pushed it there. Here the ledger records a bar that has not."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = self._trader(prob_threshold=0.2)
+
+        read = reads.pre_turn(turn_proba=0.45, regime=0, mom=0.8, bars_in_regime=44)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
+        assert read["regime"] != 1
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "still balanced" in reasoning
+        assert "held 44 bars" in reasoning
+        assert "45%" in reasoning
+
+    def test_a_forecast_below_the_threshold_is_not_a_buy(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        reads = Reads(monkeypatch)
+        trader = self._trader(prob_threshold=0.2)
+
+        reads.pre_turn(turn_proba=0.19)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_an_unscoreable_bar_is_not_a_buy(self, state, market_open, monkeypatch):
+        """A bar whose 20-bar window hasn't warmed up, or a bundle that cannot
+        forecast at all, leaves `turn_proba` None. An unasked model is not a
+        yes -- and it must not fall through to the persistence answer."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        reads = Reads(monkeypatch)
+        trader = self._trader(prob_threshold=0.2)
+
+        reads.pre_turn(turn_proba=None, proba=0.99)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_the_confirmed_change_is_no_longer_an_entry(
+        self, state, market_open, monkeypatch
+    ):
+        """Once the change has printed, this mode has missed it and says so by
+        standing aside -- it does not chase the bar `confirm` would have
+        bought."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        reads = Reads(monkeypatch)
+        trader = self._trader(prob_threshold=0.2)
+
+        reads.to_positive(proba=0.99)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_no_entry_inside_the_closing_flatten_window(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = self._trader(prob_threshold=0.2, flatten_before_close_min=5)
+
+        clock.set_simulated(datetime(2026, 7, 21, 19, 57, tzinfo=timezone.utc))  # 15:57 ET
+        reads.pre_turn(turn_proba=0.99)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_re_reading_the_same_bar_does_not_re_enter(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = self._trader(prob_threshold=0.2, trail_pct=0.5)
+
+        reads.pre_turn(turn_proba=0.9)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
+        reads.pre_turn(turn_proba=0.9, price=99.0, advance=False)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
+        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_the_trailing_stop_is_the_exit_here_too(
+        self, state, market_open, monkeypatch
+    ):
+        """Nothing about the exit changes with the entry mode: once the
+        position is on, only price decides when it comes off."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = self._trader(prob_threshold=0.2, trail_pct=0.5)
+
+        reads.pre_turn(turn_proba=0.9, price=100.0)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
+        reads.set(price=102.0, regime=1)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
+        reads.set(price=101.4, regime=1)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
+
+
 def _enter(state, tracker, reads, config) -> AppleTrader:
     """Take a long at $100 so the exit rule has something to act on."""
     trader = AppleTrader(config, model_threshold=0.07)
@@ -271,7 +438,7 @@ class TestTrailingStop:
         broker = FakeBroker(100.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, AppleTraderConfig(trail_pct=0.5))
+        trader = _enter(state, tracker, reads, confirm_config(trail_pct=0.5))
 
         reads.set(price=99.6)  # -0.4% from the peak: still inside the give-back
         assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
@@ -288,7 +455,7 @@ class TestTrailingStop:
         broker = FakeBroker(100.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, AppleTraderConfig(trail_pct=0.5))
+        trader = _enter(state, tracker, reads, confirm_config(trail_pct=0.5))
 
         reads.set(price=102.0)
         assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
@@ -302,7 +469,7 @@ class TestTrailingStop:
         broker = FakeBroker(100.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, AppleTraderConfig(trail_pct=1.0))
+        trader = _enter(state, tracker, reads, confirm_config(trail_pct=1.0))
 
         for price in (101.0, 100.4, 103.0, 102.5):
             reads.set(price=price)
@@ -317,7 +484,7 @@ class TestTrailingStop:
         broker = FakeBroker(100.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, AppleTraderConfig(trail_pct=0.5))
+        trader = _enter(state, tracker, reads, confirm_config(trail_pct=0.5))
 
         reads.set(price=100.5, high=100.6)
         assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
@@ -336,7 +503,7 @@ class TestTrailingStop:
         broker = FakeBroker(100.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         reads = Reads(monkeypatch, broker)
-        trader = AppleTrader(AppleTraderConfig(trail_pct=0.5), model_threshold=0.07)
+        trader = AppleTrader(confirm_config(trail_pct=0.5), model_threshold=0.07)
 
         reads.to_positive(proba=0.9, price=100.0, high=102.0)
         assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
@@ -350,7 +517,7 @@ class TestTrailingStop:
         broker = FakeBroker(100.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, AppleTraderConfig(trail_pct=0.5))
+        trader = _enter(state, tracker, reads, confirm_config(trail_pct=0.5))
 
         reads.set(price=99.51)
         assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
@@ -365,7 +532,7 @@ class TestTrailingStop:
         broker = FakeBroker(100.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, AppleTraderConfig(trail_pct=2.0))
+        trader = _enter(state, tracker, reads, confirm_config(trail_pct=2.0))
 
         for _ in range(5):
             reads.set(price=99.5, mom=-1.5, regime=-1, prev_regime=0, change=True)
@@ -376,7 +543,7 @@ class TestTrailingStop:
         broker = FakeBroker(100.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, AppleTraderConfig(trail_pct=5.0))
+        trader = _enter(state, tracker, reads, confirm_config(trail_pct=5.0))
 
         clock.set_simulated(datetime(2026, 7, 21, 19, 57, tzinfo=timezone.utc))  # 15:57 ET
         reads.set(price=100.2)
@@ -390,7 +557,7 @@ class TestTrailingStop:
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         tracker.record_trade(TICKER, "buy", 10, "seeded", "k", "s")
         reads = Reads(monkeypatch, broker)
-        trader = AppleTrader(AppleTraderConfig(trail_pct=0.5), model_threshold=0.07)
+        trader = AppleTrader(confirm_config(trail_pct=0.5), model_threshold=0.07)
 
         reads.set(price=100.0)
         assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
@@ -431,9 +598,29 @@ class TestGuards:
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
         monkeypatch.setattr(at.persistence_model, "load_bundle", lambda: None)
         stop_event = threading.Event()
-        at._apple_trader_loop(state, tracker, AppleTraderConfig(), 60, stop_event)
+        at._apple_trader_loop(
+            state, tracker, confirm_config(model_key="persistence"), 60, stop_event
+        )
         assert state.agent_running is False
         assert any("cannot run without it" in e.get("text", "") for e in state.agent_log)
+
+    def test_anticipating_on_a_model_that_cannot_forecast_stops_the_loop(
+        self, state, monkeypatch
+    ):
+        """The failure this prevents is the quiet one: `read_latest` leaves
+        `turn_proba` None on a classifier, every bar reads as "not a buy", and
+        the run finishes clean with an empty ledger that looks like a result."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        monkeypatch.setattr(at.apple_models, "load", lambda key: BUNDLE)
+        config = AppleTraderConfig(
+            model_key="persistence", entry_mode=at.ENTRY_ANTICIPATE
+        )
+        at._apple_trader_loop(state, tracker, config, 60, threading.Event())
+        assert state.agent_running is False
+        assert any(
+            "cannot forecast" in e.get("text", "") and e["type"] == "error"
+            for e in state.agent_log
+        )
 
     def test_the_loop_loads_the_model_the_config_names(self, state, monkeypatch):
         """A config naming an unavailable model stops on *that* model rather
@@ -457,7 +644,11 @@ class TestConfigSignature:
         assert base != config_signature(AppleTraderConfig(prob_threshold=0.3, trail_pct=0.5))
         assert base != config_signature(AppleTraderConfig(prob_threshold=0.2, trail_pct=0.8))
         assert base != config_signature(
-            AppleTraderConfig(prob_threshold=0.2, trail_pct=0.5, model_key="nbeats")
+            AppleTraderConfig(prob_threshold=0.2, trail_pct=0.5, model_key="persistence")
+        )
+        # The same model answering the other question is a different experiment.
+        assert base != config_signature(
+            confirm_config(prob_threshold=0.2, trail_pct=0.5)
         )
         assert base == config_signature(AppleTraderConfig(prob_threshold=0.2, trail_pct=0.5))
 

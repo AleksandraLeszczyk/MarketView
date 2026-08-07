@@ -604,15 +604,21 @@ class TestRuleAgentEngine:
             "metrics": {"roc_auc": 0.84},
         }
 
+    # The stub bundle above is a classifier, so these runs pin the `confirm`
+    # entry -- the one it can answer. `anticipate`, the default, needs a
+    # forecasting bundle and is covered by its own case below.
+    CONFIRM = {"model_key": "persistence", "entry_mode": "confirm"}
+
     def _run(self, monkeypatch, rule_config: dict, proba: float = 0.9):
         monkeypatch.setattr(
             persistence_model, "load_bundle", lambda: self._bundle(proba)
         )
+        rules = {**self.CONFIRM, **rule_config}
         market = SimMarket(["AAPL"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER,
             model=config_signature(), api_key="", symbols=["AAPL"], days=[DAY],
-            starting_cash=10_000.0, rule_config=rule_config,
+            starting_cash=10_000.0, rule_config=rules,
         )
         engine = SimulationEngine(market, config)
         return market, engine, engine.run()
@@ -655,14 +661,14 @@ class TestRuleAgentEngine:
         assert result.prompt_used is None
         assert result.tool_names == []
         assert result.config_summary["rule_based"] is True
-        assert result.config_summary["rule_config"] == rules
+        assert result.config_summary["rule_config"] == {**self.CONFIRM, **rules}
 
     def test_a_dataset_without_the_ticker_fails_loudly(self, store, monkeypatch):
         monkeypatch.setattr(persistence_model, "load_bundle", lambda: self._bundle())
         market = SimMarket(["TEST"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=["TEST"], days=[DAY],
+            api_key="", symbols=["TEST"], days=[DAY], rule_config=dict(self.CONFIRM),
         )
         result = SimulationEngine(market, config).run()
         assert "only trades AAPL" in (result.error or "")
@@ -672,7 +678,7 @@ class TestRuleAgentEngine:
         market = SimMarket(["AAPL"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=["AAPL"], days=[DAY],
+            api_key="", symbols=["AAPL"], days=[DAY], rule_config=dict(self.CONFIRM),
         )
         result = SimulationEngine(market, config).run()
         # Names the file and the dependency: a run that simply never traded
@@ -680,6 +686,26 @@ class TestRuleAgentEngine:
         error = result.error or ""
         assert "apple_momentum_2.joblib" in error
         assert "scikit-learn" in error
+
+    def test_anticipating_on_a_model_that_cannot_forecast_fails_loudly(
+        self, apple_store, monkeypatch
+    ):
+        """The default entry needs a forecaster. Paired with the classifier the
+        run would otherwise finish clean and empty -- `read_latest` leaves
+        `turn_proba` None on every bar -- which reads like a strategy that
+        found nothing rather than a rule set that could never fire.
+        """
+        monkeypatch.setattr(persistence_model, "load_bundle", lambda: self._bundle())
+        market = SimMarket(["AAPL"], [DAY])
+        config = SimulationConfig(
+            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
+            api_key="", symbols=["AAPL"], days=[DAY],
+            rule_config={"model_key": "persistence", "entry_mode": "anticipate"},
+        )
+        result = SimulationEngine(market, config).run()
+        error = result.error or ""
+        assert "cannot forecast" in error
+        assert "'confirm'" in error
 
     def test_the_named_model_is_the_one_loaded(self, apple_store, monkeypatch):
         """`model_key` selects which saved model answers the entry question.
@@ -709,11 +735,27 @@ class TestRuleAgentEngine:
         assert classifier.startswith("persistence_AAPL(")
         assert forecaster.startswith("nbeats_AAPL(")
 
-    def test_rules_recorded_before_the_model_switch_still_decode(self):
-        """Experiment records written when there was only one model carry no
-        `model_key`; they replay on the default rather than failing to load."""
-        config = rule_agent(APPLE_TRADER_KEY).from_record({"prob_threshold": 0.5})
-        assert config.model_key == apple_models.DEFAULT_MODEL
+    def test_rules_recorded_before_a_field_existed_decode_to_what_they_ran(self):
+        """Records written when there was one model and one entry carry neither
+        `model_key` nor `entry_mode`.
+
+        They decode to the behaviour of the day they were written, NOT to
+        today's defaults: a stored record describes a run that already
+        happened, and replaying it as anticipate-on-N-BEATS would file a
+        different strategy's numbers in Results beside the original as though
+        they matched. (It would also refuse to build at all, since the model
+        those records name cannot anticipate.)
+        """
+        agent = rule_agent(APPLE_TRADER_KEY)
+        config = agent.from_record({"prob_threshold": 0.5})
+        assert (config.model_key, config.entry_mode) == ("persistence", "confirm")
+        assert config.prob_threshold == pytest.approx(0.5)
+
+        # A record that does name them is taken at its word.
+        newer = agent.from_record(
+            {"prob_threshold": 0.5, "entry_mode": "anticipate", "model_key": "nbeats"}
+        )
+        assert (newer.model_key, newer.entry_mode) == ("nbeats", "anticipate")
 
 
 class TestTraderByChatGPTEngine:
@@ -1259,6 +1301,50 @@ class TestBreakdown:
     def test_unknown_dimension_rejected(self):
         with pytest.raises(ValueError):
             sim_results.breakdown([], by="provider-only")
+
+
+class TestTopRuns:
+    def _run(self, run_id="r1", return_pct=1.0, efficiency=0.5, **config):
+        return {
+            "run_id": run_id,
+            "dataset": config.pop("dataset", "ds1"),
+            "config_summary": {
+                "provider": "openai", "model": "gpt-a", "personality": "momentum",
+                **config,
+            },
+            "summary": {"return_pct": return_pct, "profit_efficiency": efficiency},
+        }
+
+    def test_ranks_by_the_chosen_metric(self):
+        runs = [
+            self._run(run_id="r1", return_pct=1.0, efficiency=0.9),
+            self._run(run_id="r2", return_pct=5.0, efficiency=0.1),
+            self._run(run_id="r3", return_pct=3.0, efficiency=0.5),
+        ]
+        by_return = sim_results.top_runs(runs, by="return_pct")
+        assert [r["run_id"] for r in by_return] == ["r2", "r3", "r1"]
+        by_efficiency = sim_results.top_runs(runs, by="profit_efficiency")
+        assert [r["run_id"] for r in by_efficiency] == ["r1", "r3", "r2"]
+
+    def test_limit_and_identity(self):
+        runs = [self._run(run_id=f"r{i}", return_pct=float(i)) for i in range(5)]
+        top = sim_results.top_runs(runs, by="return_pct", limit=3)
+        assert [r["run_id"] for r in top] == ["r4", "r3", "r2"]
+        assert top[0]["model"] == "openai/gpt-a"
+        assert top[0]["personality"] == "momentum"
+        assert top[0]["dataset"] == "ds1"
+        # Both metrics travel with the row, whichever one it was ranked on.
+        assert top[0]["profit_efficiency"] == 0.5
+
+    def test_runs_without_the_metric_drop_out(self):
+        runs = [self._run(run_id="r1", efficiency=None), self._run(run_id="r2")]
+        assert [r["run_id"] for r in sim_results.top_runs(runs, by="profit_efficiency")] == ["r2"]
+        # ...but still rank on a metric they do have.
+        assert len(sim_results.top_runs(runs, by="return_pct")) == 2
+
+    def test_unknown_metric_rejected(self):
+        with pytest.raises(ValueError):
+            sim_results.top_runs([], by="judge_score")
 
 
 class TestRunFilters:

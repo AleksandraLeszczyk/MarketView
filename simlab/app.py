@@ -1,4 +1,4 @@
-"""SimLab Streamlit UI: agents / datasets / simulate / results.
+"""SimLab Streamlit UI: agents / datasets / simulate / summary / results.
 
 Run with ``streamlit run sim_main.py``. Kept separate from the live dashboard
 (``main.py``) -- this app never opens a stream or touches the live tape; it
@@ -24,7 +24,16 @@ from agent_stonks.agent import (
     _dispatch_tool,
     selectable_personalities,
 )
-from agent_stonks.apple_trader import RULE_PROVIDER, APPLE_TRADER_KEY, AppleTraderConfig
+from agent_stonks.apple_trader import (
+    APPLE_TRADER_KEY,
+    ENTRY_ANTICIPATE,
+    ENTRY_MODE_LABEL,
+    ENTRY_MODE_PROB_LABEL,
+    ENTRY_MODE_SUMMARY,
+    ENTRY_MODES,
+    RULE_PROVIDER,
+    AppleTraderConfig,
+)
 from agent_stonks.claude_rule_trader import (
     TRADER_BY_CLAUDE_KEY,
     TraderByClaudeConfig,
@@ -274,9 +283,13 @@ def _render_apple_rules() -> None:
         "tracks the momentum regime — a Schmitt trigger over a volatility-normalised "
         "momentum score, so a value hovering near the line cannot emit a burst of fake "
         "changes:\n"
-        "- **Buy** when that bar is a regime change *into positive* and **the model** — "
-        "given the 20 bars leading into it — puts the change at or above **the persistence "
-        "probability** to hold.\n"
+        "- **Buy** on **the entry mode**'s question, given the 20 bars leading into that "
+        "bar. On *Anticipate* (the default) the regime is still negative or balanced and "
+        "the model forecasts that it turns positive on the next bar; on *Confirm* the "
+        "change has already printed and the model rates it likely to hold. The second is "
+        "the notebook's rule, and it is structurally late — the momentum score has "
+        "already crossed its threshold by then, so the fill lands after the move that "
+        "produced the signal.\n"
         "- **Sell** when price falls **the trailing stop** below the highest price seen "
         "since the entry. The peak only ratchets up, so the rule starts as a stop under "
         "the entry and becomes a profit lock as the move runs.\n"
@@ -293,11 +306,18 @@ def _render_apple_rules() -> None:
         "The entry question can be put to either of two saved TimeToChange2 models, "
         "chosen per simulation. Everything before the question — bars, momentum, regimes, "
         "all 25 features, the 20-bar window — is identical for both, so a dataset run "
-        "through each is a comparison of the models and nothing else."
+        "through each on the *Confirm* entry is a comparison of the models and nothing "
+        "else. *Anticipate* asks about a bar that is not a regime change, which only a "
+        "forecaster can answer."
     )
     for model in (apple_models.get(key) for key in apple_models.keys()):
         with st.expander(model.label, expanded=model.key == AppleTraderConfig().model_key):
             st.markdown(model.summary)
+            if not model.anticipates:
+                st.caption(
+                    ":material/block: Fitted on regime-change bars only, so it runs the "
+                    "*Confirm* entry and not *Anticipate*."
+                )
             bundle = apple_models.load(model.key)
             if bundle is None:
                 st.error(
@@ -1070,41 +1090,64 @@ def _render_apple_params() -> AppleTraderConfig:
     defaults = AppleTraderConfig()
     with st.expander("Apple Trader rules", expanded=True):
         st.caption(
-            "Three knobs decide everything: which saved model is asked whether a change "
-            "into positive momentum will hold, how sure it has to be, and how much of the "
-            "run the trade gives back before selling. Each distinct rule set is tracked as "
-            "its own configuration in Results, so swapping the model or retuning the stop "
-            "is a new test rather than a repeat of one already run."
+            "Four knobs decide everything: **when** the saved model is asked about a "
+            "regime change, which model is asked, how sure it has to be, and how much of "
+            "the run the trade gives back before selling. Each distinct rule set is "
+            "tracked as its own configuration in Results, so moving the entry, swapping "
+            "the model or retuning the stop is a new test rather than a repeat of one "
+            "already run."
         )
+        entry_mode = st.segmented_control(
+            "Entry", ENTRY_MODES, default=defaults.entry_mode,
+            format_func=lambda mode: ENTRY_MODE_LABEL.get(mode, mode), key="sim_apple_entry_mode",
+            help="The setting that moves the fill most. On the 2026-07-27 SIP tape "
+                 "“Confirm” bought 337.45 / 338.67 / 336.35 and “Anticipate” bought the "
+                 "same three episodes at 336.56 / 338.20 / 335.99 — one to six bars "
+                 "earlier, while the regime was still balanced, taking the session from "
+                 "−0.41% to +0.08%. That is three trades on one day: a check that the "
+                 "wiring works, not a measurement of the edge.",
+        ) or defaults.entry_mode
+        st.caption(ENTRY_MODE_SUMMARY[entry_mode])
+
         keys = apple_models.keys()
         model_key = st.selectbox(
             "Model", keys,
             index=keys.index(defaults.model_key) if defaults.model_key in keys else 0,
-            format_func=lambda key: apple_models.get(key).label,
+            format_func=lambda key: apple_models.get(key).label
+            + ("" if apple_models.get(key).anticipates else " — cannot anticipate"),
             key="sim_apple_model",
-            help="Both models are handed the same 20 bars on the same tape and return one "
-                 "probability; only the way they reach it differs. Running a dataset "
-                 "through both is a straight comparison of the two.",
+            help="On the confirm entry both models are handed the same 20 bars on the "
+                 "same tape and return one probability, so running a dataset through "
+                 "both is a straight comparison. Only the forecaster can run the "
+                 "anticipate entry at all.",
         )
         model = apple_models.get(model_key)
         bundle = apple_models.load(model.key)
         st.caption(model.summary)
         if bundle is None:
             st.error(apple_models.unavailable_reason(model_key))
+        elif entry_mode == ENTRY_ANTICIPATE and not model.anticipates:
+            st.error(
+                f"{model.label} was fitted on regime-change bars only, so it cannot "
+                "forecast a change that has not happened yet. Pick a forecasting model "
+                "or switch the entry to “Confirm the turn”; this pairing stops the run "
+                "rather than producing an empty ledger."
+            )
         bundle_threshold = persistence_model.model_threshold(bundle)
 
         col_a, col_b = st.columns(2)
         prob_threshold = col_a.number_input(
-            "Persistence probability to buy", min_value=0.0, max_value=1.0,
+            ENTRY_MODE_PROB_LABEL[entry_mode], min_value=0.0, max_value=1.0,
             value=float(defaults.prob_threshold or bundle_threshold),
             step=0.01, format="%.2f",
             # Keyed by model so switching re-seeds the input with that model's
             # own cut-off: the two probabilities are not on a shared scale.
             key=f"sim_apple_prob_{model_key}",
             help=f"Default {bundle_threshold:g} is the cut-off this model chose on its own "
-                 "validation block. Its skill is in rejecting changes that cannot "
-                 "persist, so a permissive setting is the intended one — raising it "
-                 "discards plausible changes roughly at random.",
+                 "validation block — on the *confirm* question. On “Anticipate” it is a "
+                 "starting point rather than a tuned setting, and it is the first thing "
+                 "worth sweeping here: it decides how early in the build-up the entry "
+                 "fires.",
         )
         trail_pct = col_b.number_input(
             "Trailing stop (%)", min_value=0.05, max_value=10.0,
@@ -1119,6 +1162,7 @@ def _render_apple_params() -> AppleTraderConfig:
         )
     return AppleTraderConfig(
         model_key=str(model_key),
+        entry_mode=str(entry_mode),
         prob_threshold=float(prob_threshold),
         trail_pct=float(trail_pct),
         position_pct=float(position_pct),
@@ -1324,13 +1368,16 @@ def render_simulate_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tab 4 — results
+# Tabs 4 & 5 — summary (aggregates) and results (one run at a time)
 # ---------------------------------------------------------------------------
 
-# "Model" covers both the LLM behind a personality and the rule set behind the
-# rule-based agent -- both are the thing that varies while agent and dataset
-# are held fixed.
-_BREAKDOWN_DIMENSIONS = {"Model": "model", "Dataset": "dataset", "Agent": "agent"}
+# Agent first and by default: it is the thing under test. "Model" covers both
+# the LLM behind a personality and the rule set behind the rule-based agent --
+# both are what varies while agent and dataset are held fixed.
+_BREAKDOWN_DIMENSIONS = {"Agent": "agent", "Model": "model", "Dataset": "dataset"}
+
+# Ranking metrics for the top-runs cards, mapped to their `summary` keys.
+_TOP_RUN_METRICS = {"Best return": "return_pct", "Profit efficiency": "profit_efficiency"}
 
 
 # The breakdown table is hand-rolled HTML rather than st.dataframe: only a real
@@ -1432,24 +1479,73 @@ def _breakdown_bar(labels: list[str], values: list[float], title: str, color: st
     return fig
 
 
-def _render_results_filters(runs: list[dict]) -> list[dict]:
+def _render_run_filters(runs: list[dict], key_prefix: str) -> list[dict]:
     """Dataset / model filters over the stored runs. Selecting nothing in a
     filter leaves that dimension unrestricted, so the default view is all runs.
-    Everything below (breakdown, charts, run picker) works off the result."""
+    Everything below (breakdown, charts, run picker) works off the result.
+    Summary and Results each render their own copy -- hence the key prefix --
+    so filtering one tab doesn't silently reshape the other."""
     options = sim_results.filter_options(runs)
     col_datasets, col_models = st.columns(2)
     datasets = col_datasets.multiselect(
-        "Datasets", options["datasets"], key="results_filter_datasets",
+        "Datasets", options["datasets"], key=f"{key_prefix}_filter_datasets",
         placeholder="All datasets",
     )
     models = col_models.multiselect(
-        "Models", options["models"], key="results_filter_models",
+        "Models", options["models"], key=f"{key_prefix}_filter_models",
         placeholder="All models",
     )
     filtered = sim_results.filter_runs(runs, datasets=datasets, models=models)
     if datasets or models:
         st.caption(f"Showing {len(filtered)} of {len(runs)} runs.")
     return filtered
+
+
+def _short_model(key: str, limit: int = 46) -> str:
+    """Rule agents encode their entire rule set in the model string, which would
+    otherwise stretch one card far past the others. The full string is still in
+    the breakdown table and on the run itself."""
+    return key if len(key) <= limit else key[: limit - 1].rstrip() + "…"
+
+
+def _render_top_runs(runs: list[dict]) -> None:
+    """The three best single runs under the filters, on whichever metric is
+    picked. Return and profit efficiency disagree often -- a big return on an
+    easy tape can be a worse trade than a small one on a flat tape -- so both
+    are always shown, only the ranking changes."""
+    st.markdown("##### Top runs")
+    metric_label = st.segmented_control(
+        "Rank by", list(_TOP_RUN_METRICS), default="Best return",
+        key="summary_top_metric",
+    ) or "Best return"
+    metric = _TOP_RUN_METRICS[metric_label]
+    top = sim_results.top_runs(runs, by=metric, limit=3)
+    if not top:
+        st.caption(f"No runs scored on {metric_label.lower()} yet.")
+        return
+    for rank, (column, row) in enumerate(zip(st.columns(len(top)), top), start=1):
+        efficiency = row["profit_efficiency"]
+        return_pct = row["return_pct"]
+        headline = (
+            f"{return_pct:+.2f}%" if metric == "return_pct"
+            else f"{efficiency:.1%}"
+        )
+        if metric == "return_pct":
+            secondary = (
+                f"Profit efficiency {efficiency:.1%}" if efficiency is not None
+                else "Profit efficiency —"
+            )
+        else:
+            secondary = (
+                f"Return {return_pct:+.2f}%" if return_pct is not None
+                else "Return —"
+            )
+        with column.container(border=True):
+            st.metric(f"#{rank} · {_agent_label(row['personality'])}", headline)
+            st.caption(
+                f"{secondary}  \n{_short_model(row['model'])} · {row['dataset']}"
+                f"  \n`{row['run_id']}`"
+            )
 
 
 @st.dialog("Delete all runs?")
@@ -1464,7 +1560,11 @@ def _confirm_delete_all_runs(total: int) -> None:
     with st.container(horizontal=True):
         if st.button("Delete them", type="primary", icon=":material/delete_forever:"):
             removed = sim_results.delete_all_runs()
-            for key in ("last_run_id", "results_filter_datasets", "results_filter_models"):
+            for key in (
+                "last_run_id",
+                "results_filter_datasets", "results_filter_models",
+                "summary_filter_datasets", "summary_filter_models",
+            ):
                 st.session_state.pop(key, None)
             st.toast(f"Deleted {removed} run{'' if removed == 1 else 's'}",
                      icon=":material/delete_sweep:")
@@ -1473,22 +1573,25 @@ def _confirm_delete_all_runs(total: int) -> None:
             st.rerun()
 
 
-def render_results_tab() -> None:
+def render_summary_tab() -> None:
     all_runs = _runs()
     if not all_runs:
         st.info("No stored runs yet — queue an experiment in the Simulate tab.")
         return
 
-    runs = _render_results_filters(all_runs)
+    runs = _render_run_filters(all_runs, "summary")
     if not runs:
         st.info("No runs match the current filters.")
         return
 
+    _render_top_runs(runs)
+
+    st.divider()
     st.markdown("##### Breakdown")
     dim_label = st.segmented_control(
-        "Break down by", list(_BREAKDOWN_DIMENSIONS), default="Model",
+        "Break down by", list(_BREAKDOWN_DIMENSIONS), default="Agent",
         key="results_breakdown_dim",
-    ) or "Model"
+    ) or "Agent"
     dimension = _BREAKDOWN_DIMENSIONS[dim_label]
     rows = sim_results.breakdown(runs, dimension)
     if dimension == "agent":
@@ -1511,8 +1614,18 @@ def render_results_tab() -> None:
             "Avg judge score (0–10)", PALETTE["up"],
         ))
 
-    st.divider()
-    st.markdown("##### Runs")
+
+def render_results_tab() -> None:
+    all_runs = _runs()
+    if not all_runs:
+        st.info("No stored runs yet — queue an experiment in the Simulate tab.")
+        return
+
+    runs = _render_run_filters(all_runs, "results")
+    if not runs:
+        st.info("No runs match the current filters.")
+        return
+
     labels = {
         r["run_id"]: (
             f"{r['run_id']} · {r.get('config_summary', {}).get('personality')} · "
@@ -1551,9 +1664,10 @@ def build_ui() -> None:
         "Replay the trading agents against stored historical sessions: same prompts, same "
         "tools, same execution path as live — hours of tape in minutes of simulation."
     )
-    tab_agents, tab_datasets, tab_sim, tab_results = st.tabs(
+    tab_agents, tab_datasets, tab_sim, tab_summary, tab_results = st.tabs(
         [":material/smart_toy: Agents", ":material/database: Datasets",
-         ":material/play_circle: Simulate", ":material/insights: Results"]
+         ":material/play_circle: Simulate", ":material/leaderboard: Summary",
+         ":material/insights: Results"]
     )
     with tab_agents:
         render_agents_tab()
@@ -1561,5 +1675,7 @@ def build_ui() -> None:
         render_datasets_tab()
     with tab_sim:
         render_simulate_tab()
+    with tab_summary:
+        render_summary_tab()
     with tab_results:
         render_results_tab()

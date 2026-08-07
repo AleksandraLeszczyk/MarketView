@@ -266,6 +266,36 @@ def breakdown(runs: list[dict], by: str) -> list[dict]:
     return rows
 
 
+def top_runs(runs: list[dict], by: str = "return_pct", limit: int = 3) -> list[dict]:
+    """The best single runs by one summary metric, highest first. Runs missing
+    that metric (an oracle ceiling of 0 leaves no profit efficiency) drop out
+    rather than ranking as zero. Each row carries both metrics plus the run's
+    identity, so a card can show what it was ranked on and what it scored on
+    the other."""
+    if by not in ("return_pct", "profit_efficiency"):
+        raise ValueError(f"unknown top-run metric: {by}")
+    scored = []
+    for record in runs:
+        summary = record.get("summary") or {}
+        value = summary.get(by)
+        if value is None:
+            continue
+        config = record.get("config_summary") or {}
+        efficiency = summary.get("profit_efficiency")
+        return_pct = summary.get("return_pct")
+        scored.append({
+            "value": float(value),
+            "run_id": record.get("run_id") or "",
+            "personality": config.get("personality") or "",
+            "model": model_key(record),
+            "dataset": dataset_key(record),
+            "return_pct": None if return_pct is None else float(return_pct),
+            "profit_efficiency": None if efficiency is None else float(efficiency),
+        })
+    scored.sort(key=lambda row: -row["value"])
+    return scored[:limit]
+
+
 def delete_run(run_id: str) -> None:
     path = RUNS_DIR / f"{run_id}.json"
     if path.exists():

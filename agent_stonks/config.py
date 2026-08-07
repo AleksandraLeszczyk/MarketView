@@ -69,18 +69,31 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 
 # Apple Trader: the rule-based (non-LLM) loop that watches every closed AAPL
 # minute bar for a momentum-regime change into positive and asks a saved model
-# whether that change will hold (see agent_stonks.apple_trader).
+# about it (see agent_stonks.apple_trader).
+#
+# ENTRY_MODE decides *when* it asks, and it is the setting that changes what the
+# agent does most:
+#   "anticipate"  buy while the regime is still negative or balanced, on the
+#                 model's forecast that it turns positive on the next bar. Needs
+#                 a forecasting model, so only "nbeats" can run it.
+#   "confirm"     buy the bar the change has already happened on, if the model
+#                 rates it likely to hold. Either model can run this, and it is
+#                 what the agent did before anticipation existed -- but by then
+#                 momentum has already crossed the enter threshold, so the entry
+#                 lands after the move that produced the signal.
 #
 # MODEL names which of the saved models answers that question -- a key of
-# agent_stonks.apple_models.MODELS ("persistence", the incumbent classifier, or
-# "nbeats", the forecast-derived one). PROB_THRESHOLD is the probability a
-# change has to clear to be bought; None uses the cut-off the chosen model
-# picked on its own validation block, which is the intended setting because
-# those cut-offs are not on a shared scale (0.07 for the classifier's
-# posterior, 0.05 for N-BEATS' gated survival probability). TRAIL_PCT is the
-# whole exit rule: sell once price is that far below the highest price seen
-# since the entry.
-APPLE_TRADER_MODEL = "persistence"
+# agent_stonks.apple_models.MODELS ("nbeats", the forecast-derived one, or
+# "persistence", the incumbent classifier). It defaults to the forecaster
+# because the default entry mode is one only the forecaster can answer.
+# PROB_THRESHOLD is the probability a candidate has to clear to be bought; None
+# uses the cut-off the chosen model picked on its own validation block, which is
+# the intended setting because those cut-offs are not on a shared scale (0.07
+# for the classifier's posterior, 0.05 for N-BEATS' gated survival
+# probability). TRAIL_PCT is the whole exit rule: sell once price is that far
+# below the highest price seen since the entry.
+APPLE_TRADER_ENTRY_MODE = "anticipate"
+APPLE_TRADER_MODEL = "nbeats"
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_PROB_THRESHOLD: "float | None" = None
 APPLE_TRADER_TRAIL_PCT = 0.5

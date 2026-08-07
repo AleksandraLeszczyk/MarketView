@@ -60,6 +60,12 @@ class AppleModel:
     summary: str
     # What has to be installed for `load` to be able to return anything.
     requires: str
+    # Whether it can be asked about a change that has not happened yet, which
+    # is what Apple Trader's `anticipate` entry needs. Only a forecaster can:
+    # see `persistence_model.anticipates`, which is the authority at run time
+    # (it reads the loaded bundle). This flag is the same fact available before
+    # a 200 MB dependency is imported, so a picker can label the choice.
+    anticipates: bool
     # Registry data, not the entry point: everything loads through `load(key)`
     # below, so there is one seam for tests to replace and one place a caller
     # can reach a model from.
@@ -117,6 +123,7 @@ MODELS: "dict[str, AppleModel]" = {
             "hold, no better than a coin flip at ranking the ones that can."
         ),
         requires="scikit-learn and joblib",
+        anticipates=False,
         load=_load_persistence,
         path=_persistence_path,
     ),
@@ -130,6 +137,7 @@ MODELS: "dict[str, AppleModel]" = {
             "entrant above chance on all four walk-forward folds of the hard half."
         ),
         requires="PyTorch, plus the residual sidecar beside the checkpoint",
+        anticipates=True,
         load=_load_nbeats,
         path=_nbeats_path,
     ),

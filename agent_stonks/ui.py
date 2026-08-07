@@ -24,6 +24,11 @@ from .apple_trader import (
     APPLE_TRADER_AVATAR,
     APPLE_TRADER_KEY,
     APPLE_TRADER_LABEL,
+    ENTRY_ANTICIPATE,
+    ENTRY_MODE_LABEL,
+    ENTRY_MODE_PROB_LABEL,
+    ENTRY_MODE_SUMMARY,
+    ENTRY_MODES,
     AppleTraderConfig,
     launch_apple_trader,
 )
@@ -1580,22 +1585,39 @@ def _agent_report_section(symbols: list[str]) -> None:
 
 
 def _apple_trader_params() -> AppleTraderConfig:
-    """Apple Trader's tunables: which model answers the entry question, how
-    sure it has to be that a change into positive momentum will hold, and how
-    much of the run to give back."""
+    """Apple Trader's tunables: when it asks the model about a regime change,
+    which model answers, how sure it has to be, and how much of the run to give
+    back."""
     defaults = AppleTraderConfig()
     with st.expander("Apple Trader rules", expanded=True):
+        entry_mode = st.segmented_control(
+            "Entry",
+            ENTRY_MODES,
+            default=defaults.entry_mode,
+            format_func=lambda mode: ENTRY_MODE_LABEL.get(mode, mode),
+            key="apple_trader_entry_mode",
+            help=(
+                "**Anticipate** buys while the regime is still negative or balanced, on "
+                "the model's forecast that it turns positive next bar. **Confirm** waits "
+                "for the change to print — by which point the momentum score has already "
+                "crossed its threshold, so the entry lands after the move that produced "
+                "the signal. Only a forecasting model can anticipate."
+            ),
+        ) or defaults.entry_mode
+        st.caption(ENTRY_MODE_SUMMARY[entry_mode])
+
         keys = apple_models.keys()
         model_key = st.selectbox(
             "Model",
             keys,
             index=keys.index(defaults.model_key) if defaults.model_key in keys else 0,
-            format_func=lambda key: apple_models.get(key).label,
+            format_func=lambda key: apple_models.get(key).label
+            + ("" if apple_models.get(key).anticipates else " — cannot anticipate"),
             key="apple_trader_model",
             help=(
-                "Which saved TimeToChange2 model decides whether a momentum change will "
-                "hold. The rules around it are identical either way — same bars, same "
-                "20-bar window, same trailing stop."
+                "Which saved TimeToChange2 model answers the entry question. The rules "
+                "around it are identical either way — same bars, same 20-bar window, same "
+                "trailing stop."
             ),
         )
         model = apple_models.get(model_key)
@@ -1603,11 +1625,17 @@ def _apple_trader_params() -> AppleTraderConfig:
         st.caption(model.summary)
         if bundle is None:
             st.error(apple_models.unavailable_reason(model_key))
+        elif entry_mode == ENTRY_ANTICIPATE and not model.anticipates:
+            st.error(
+                f"{model.label} was fitted on regime-change bars only, so it cannot "
+                f"forecast a change that has not happened yet. Pick a forecasting model "
+                f"or switch the entry to “Confirm the turn”."
+            )
         bundle_threshold = persistence_model.model_threshold(bundle)
 
         c1, c2 = st.columns(2)
         prob_threshold = c1.number_input(
-            "Persistence probability to buy",
+            ENTRY_MODE_PROB_LABEL[entry_mode],
             min_value=0.0,
             max_value=1.0,
             value=float(defaults.prob_threshold or bundle_threshold),
@@ -1619,11 +1647,10 @@ def _apple_trader_params() -> AppleTraderConfig:
             # across the switch would silently change the strategy.
             key=f"apple_trader_prob_{model_key}",
             help=(
-                f"How likely the model must rate a change into positive momentum to hold "
-                f"before it is bought. The default {bundle_threshold:g} is the cut-off this "
-                "model chose on its own validation block — its skill is in rejecting "
-                "changes that cannot persist rather than ranking the plausible ones, so a "
-                "permissive setting is the intended one."
+                f"How sure the model has to be before the bar is bought. The default "
+                f"{bundle_threshold:g} is the cut-off this model chose on its own "
+                "validation block — but it was picked on the *confirm* question, so on "
+                "“Anticipate” treat it as a starting point and re-tune it in SimLab."
             ),
         )
         trail_pct = c2.number_input(
@@ -1649,6 +1676,7 @@ def _apple_trader_params() -> AppleTraderConfig:
         )
     return AppleTraderConfig(
         model_key=str(model_key),
+        entry_mode=str(entry_mode),
         prob_threshold=float(prob_threshold),
         trail_pct=float(trail_pct),
         position_pct=float(position_pct),
@@ -1709,13 +1737,14 @@ def _agent_panel(
         if personality == APPLE_TRADER_KEY:
             st.caption(
                 f"🍎 Apple Trader runs no LLM. Once a minute it reads the "
-                f"{APPLE_TRADER_TICKER} bar that just closed; when the momentum regime turns "
-                "positive on that bar it asks the saved model chosen below whether the "
-                "change will hold, and buys if it says yes. The position is then sold purely "
-                "on price: a trailing stop the configured percentage below the highest price "
-                f"seen since the entry. It trades {APPLE_TRADER_TICKER} only — that is the "
-                "one symbol the model was fitted on. The provider/model settings below do "
-                "not apply to it."
+                f"{APPLE_TRADER_TICKER} bar that just closed and asks the saved model "
+                "chosen below one question about the momentum regime — by default, "
+                "whether a regime that is still balanced or negative is about to turn "
+                "positive — and buys if it says yes. The position is then sold purely "
+                "on price: a trailing stop the configured percentage below the highest "
+                f"price seen since the entry. It trades {APPLE_TRADER_TICKER} only — "
+                "that is the one symbol the model was fitted on. The provider/model "
+                "settings below do not apply to it."
             )
         provider = st.selectbox(
             "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
