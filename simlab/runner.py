@@ -27,13 +27,13 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 
-from agent_stonks.apple_trader import APPLE_TRADER_KEY  # noqa: E402
 from simlab import experiments  # noqa: E402
 from simlab import judge as sim_judge  # noqa: E402
 from simlab import prompts as sim_prompts  # noqa: E402
 from simlab import results as sim_results  # noqa: E402
 from simlab.engine import SimulationConfig, SimulationEngine  # noqa: E402
 from simlab.market import SimMarket  # noqa: E402
+from simlab.rule_agents import is_rule_based  # noqa: E402
 
 
 def _progress(msg: str) -> None:
@@ -59,7 +59,7 @@ def run_experiment(experiment_id: str) -> dict:
         system_prompt_override=cfg.get("system_prompt_override"),
         rule_config=cfg.get("rule_config"),
     )
-    rule_based = config.personality == APPLE_TRADER_KEY
+    rule_based = is_rule_based(config.personality)
     market = SimMarket(config.symbols, days)
     engine = SimulationEngine(market, config, progress=_progress)
     result = engine.run()
@@ -70,10 +70,10 @@ def run_experiment(experiment_id: str) -> dict:
     )
     summary = sim_results.summarize_run(result, market)
     judge_report = None
-    # The judge grades an agent's *reasoning* against the tape it cited. The
-    # rule agent states no reasoning of its own -- its decisions are a fixed
-    # function of the model's output -- so there is nothing for a judge to
-    # assess beyond what the profit metrics already say. It is never judged,
+    # The judge grades an agent's *reasoning* against the tape it cited. A rule
+    # agent states no reasoning of its own -- its decisions are a fixed
+    # function of the bars -- so there is nothing for a judge to assess beyond
+    # what the profit metrics already say. Rule agents are never judged,
     # whatever the experiment record asks for.
     if cfg.get("run_judge") and not rule_based:
         strategy_prompt = cfg.get("system_prompt_override") or sim_prompts.get_prompt(

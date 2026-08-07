@@ -531,13 +531,25 @@ def build_sequence(
 
 
 def predict_proba(bundle: dict, X) -> np.ndarray:
-    """Persistence probability for a batch of `(n, seq_len, n_features)`."""
+    """Persistence probability for a batch of `(n, seq_len, n_features)`.
+
+    Two kinds of bundle answer this. The one loaded above carries a `pipeline`
+    -- a pickled sklearn classifier that was trained on the label directly.
+    `agent_stonks.nbeats_model` builds one carrying a `score` callable instead,
+    which reaches the same number by forecasting momentum and replaying the
+    regime rule over the forecast. Everything upstream of this line is
+    identical for both, which is what lets Apple Trader swap them without a
+    branch in its rules; see `agent_stonks.apple_models`.
+    """
     X = np.asarray(X, dtype=np.float32)
     if X.ndim == 2:
         X = X[None, ...]
     expected = (int(bundle["seq_len"]), len(bundle["feature_columns"]))
     if X.shape[1:] != expected:
         raise ValueError(f"expected sequences of shape {expected}, got {X.shape[1:]}")
+    scorer = bundle.get("score")
+    if scorer is not None:
+        return np.asarray(scorer(X), dtype=float)
     return bundle["pipeline"].predict_proba(X)[:, 1]
 
 

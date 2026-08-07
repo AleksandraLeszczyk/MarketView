@@ -11,7 +11,7 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from . import market_hours, persistence_model
+from . import apple_models, market_hours, persistence_model
 from .agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
@@ -1580,11 +1580,31 @@ def _agent_report_section(symbols: list[str]) -> None:
 
 
 def _apple_trader_params() -> AppleTraderConfig:
-    """Apple Trader's tunables: how sure the model has to be that a change into
-    positive momentum will hold, and how much of the run to give back."""
+    """Apple Trader's tunables: which model answers the entry question, how
+    sure it has to be that a change into positive momentum will hold, and how
+    much of the run to give back."""
     defaults = AppleTraderConfig()
-    bundle_threshold = persistence_model.model_threshold(persistence_model.load_bundle())
     with st.expander("Apple Trader rules", expanded=True):
+        keys = apple_models.keys()
+        model_key = st.selectbox(
+            "Model",
+            keys,
+            index=keys.index(defaults.model_key) if defaults.model_key in keys else 0,
+            format_func=lambda key: apple_models.get(key).label,
+            key="apple_trader_model",
+            help=(
+                "Which saved TimeToChange2 model decides whether a momentum change will "
+                "hold. The rules around it are identical either way — same bars, same "
+                "20-bar window, same trailing stop."
+            ),
+        )
+        model = apple_models.get(model_key)
+        bundle = apple_models.load(model.key)
+        st.caption(model.summary)
+        if bundle is None:
+            st.error(apple_models.unavailable_reason(model_key))
+        bundle_threshold = persistence_model.model_threshold(bundle)
+
         c1, c2 = st.columns(2)
         prob_threshold = c1.number_input(
             "Persistence probability to buy",
@@ -1593,11 +1613,15 @@ def _apple_trader_params() -> AppleTraderConfig:
             value=float(defaults.prob_threshold or bundle_threshold),
             step=0.01,
             format="%.2f",
-            key="apple_trader_prob",
+            # The model key is part of the widget key so switching models
+            # re-seeds this input with that model's own cut-off. The two
+            # probabilities are not on a shared scale, so carrying a number
+            # across the switch would silently change the strategy.
+            key=f"apple_trader_prob_{model_key}",
             help=(
                 f"How likely the model must rate a change into positive momentum to hold "
-                f"before it is bought. The default {bundle_threshold:g} is the cut-off the "
-                "model itself chose on its validation block — its skill is in rejecting "
+                f"before it is bought. The default {bundle_threshold:g} is the cut-off this "
+                "model chose on its own validation block — its skill is in rejecting "
                 "changes that cannot persist rather than ranking the plausible ones, so a "
                 "permissive setting is the intended one."
             ),
@@ -1624,6 +1648,7 @@ def _apple_trader_params() -> AppleTraderConfig:
             key="apple_trader_position_pct",
         )
     return AppleTraderConfig(
+        model_key=str(model_key),
         prob_threshold=float(prob_threshold),
         trail_pct=float(trail_pct),
         position_pct=float(position_pct),
@@ -1685,7 +1710,7 @@ def _agent_panel(
             st.caption(
                 f"🍎 Apple Trader runs no LLM. Once a minute it reads the "
                 f"{APPLE_TRADER_TICKER} bar that just closed; when the momentum regime turns "
-                "positive on that bar it asks the saved persistence classifier whether the "
+                "positive on that bar it asks the saved model chosen below whether the "
                 "change will hold, and buys if it says yes. The position is then sold purely "
                 "on price: a trailing stop the configured percentage below the highest price "
                 f"seen since the entry. It trades {APPLE_TRADER_TICKER} only — that is the "

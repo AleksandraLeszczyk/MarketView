@@ -435,12 +435,30 @@ class TestGuards:
         assert state.agent_running is False
         assert any("cannot run without it" in e.get("text", "") for e in state.agent_log)
 
+    def test_the_loop_loads_the_model_the_config_names(self, state, monkeypatch):
+        """A config naming an unavailable model stops on *that* model rather
+        than quietly running the one that happens to be loadable."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        monkeypatch.setattr(
+            at.apple_models, "load", lambda key: None if key == "nbeats" else BUNDLE
+        )
+        at._apple_trader_loop(
+            state, tracker, AppleTraderConfig(model_key="nbeats"), 60, threading.Event()
+        )
+        assert state.agent_running is False
+        assert any(
+            "timetochange2_nbeats.pt" in e.get("text", "") for e in state.agent_log
+        )
+
 
 class TestConfigSignature:
     def test_every_rule_that_changes_behaviour_is_in_the_signature(self):
         base = config_signature(AppleTraderConfig(prob_threshold=0.2, trail_pct=0.5))
         assert base != config_signature(AppleTraderConfig(prob_threshold=0.3, trail_pct=0.5))
         assert base != config_signature(AppleTraderConfig(prob_threshold=0.2, trail_pct=0.8))
+        assert base != config_signature(
+            AppleTraderConfig(prob_threshold=0.2, trail_pct=0.5, model_key="nbeats")
+        )
         assert base == config_signature(AppleTraderConfig(prob_threshold=0.2, trail_pct=0.5))
 
     def test_an_unset_threshold_names_the_model_that_supplies_it(self):

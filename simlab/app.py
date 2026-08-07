@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict
 from datetime import date, datetime, time, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -17,7 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from agent_stonks import clock, persistence_model
+from agent_stonks import apple_models, clock, persistence_model
 from agent_stonks import observability as obs
 from agent_stonks.agent import (
     AGENT_PERSONALITIES,
@@ -25,16 +24,16 @@ from agent_stonks.agent import (
     _dispatch_tool,
     selectable_personalities,
 )
-from agent_stonks.apple_trader import (
-    APPLE_TRADER_AVATAR,
-    APPLE_TRADER_KEY,
-    APPLE_TRADER_LABEL,
-    RULE_PROVIDER,
-    AppleTraderConfig,
-    config_signature,
+from agent_stonks.apple_trader import RULE_PROVIDER, APPLE_TRADER_KEY, AppleTraderConfig
+from agent_stonks.claude_rule_trader import (
+    TRADER_BY_CLAUDE_KEY,
+    TraderByClaudeConfig,
 )
-from agent_stonks.apple_trader import TICKER as APPLE_TRADER_TICKER
 from agent_stonks.config import PALETTE
+from agent_stonks.openai_rule_trader import (
+    TRADER_BY_CHATGPT_KEY,
+    TraderByChatGPTConfig,
+)
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
 from agent_stonks.market_hours import MARKET_TZ
 
@@ -45,6 +44,7 @@ from . import results as sim_results
 from .engine import SimulationConfig, SimulationEngine
 from .market import SimMarket
 from .patches import simulation_context
+from .rule_agents import RULE_AGENTS, rule_agent
 
 AVATAR_DIR = Path(__file__).resolve().parent.parent / "data" / "avatars"
 
@@ -52,28 +52,23 @@ AVATAR_DIR = Path(__file__).resolve().parent.parent / "data" / "avatars"
 # them -- the hand-tester exposes only the read/analysis tools.
 _UNTESTABLE_TOOLS = {"submit_decision", "set_tactics", "stand_down"}
 
-# Agents that are not LLM personalities and so have no entry in
-# AGENT_PERSONALITIES: label + avatar for the picker and the result tables.
-_NON_LLM_AGENTS: dict[str, tuple[str, str]] = {
-    APPLE_TRADER_KEY: (APPLE_TRADER_LABEL, APPLE_TRADER_AVATAR),
-}
-
-
 def _testable_agents() -> list[str]:
     """Every agent SimLab can replay, in picker order: the LLM personalities
-    first, the rule-based one last."""
-    return [*selectable_personalities(), APPLE_TRADER_KEY]
+    first, the rule-based ones last."""
+    return [*selectable_personalities(), *RULE_AGENTS]
 
 
 def _agent_label(key: "str | None") -> str:
-    if key in _NON_LLM_AGENTS:
-        return _NON_LLM_AGENTS[key][0]
+    """Rule agents have no entry in AGENT_PERSONALITIES, so their label comes
+    from the registry instead."""
+    if key in RULE_AGENTS:
+        return RULE_AGENTS[key].label
     return AGENT_PERSONALITIES.get(key or "", {}).get("label", key or "?")
 
 
 def _agent_avatar(key: str) -> Path:
-    if key in _NON_LLM_AGENTS:
-        return AVATAR_DIR / _NON_LLM_AGENTS[key][1]
+    if key in RULE_AGENTS:
+        return AVATAR_DIR / RULE_AGENTS[key].avatar
     return AVATAR_DIR / AGENT_PERSONALITIES.get(key, {}).get("avatar", "")
 
 
@@ -179,26 +174,109 @@ def _render_tool_tester(personality: str) -> None:
 
 
 def _render_rule_agent(personality: str) -> None:
-    """The Apple Trader's "prompt": its rules, and the model behind them.
+    """A rule agent's "prompt": its rules, and whatever they depend on.
 
     There is nothing to edit here the way a system prompt is edited -- the
     thresholds are per-simulation settings, picked in the Simulate tab -- so
-    this is a read-only description of what the loop does, plus the provenance
-    of the saved bundle it depends on.
+    this is a read-only description of what the loop does.
     """
     st.subheader(_agent_label(personality))
     st.caption(
         ":material/function: Rule-based — no LLM, no prompt, no tools. The same tape "
         "always produces the same trades."
     )
+    if personality == TRADER_BY_CHATGPT_KEY:
+        _render_chatgpt_rules()
+    elif personality == TRADER_BY_CLAUDE_KEY:
+        _render_claude_rules()
+    else:
+        _render_apple_rules()
+
+
+def _render_claude_rules() -> None:
+    """What TraderByClaude does, and what it is a counter-thesis to."""
+    ticker = rule_agent(TRADER_BY_CLAUDE_KEY).ticker
     st.markdown(
-        f"Once a minute it reads the **{APPLE_TRADER_TICKER}** bar that just closed and "
+        f"Once a minute it reads the **{ticker}** bar that just closed. Same family as "
+        "TraderByChatGPT — long-only, trend-aligned, sized on distance to the stop — "
+        "and a deliberate disagreement about *where in a trend you are allowed to buy*. "
+        "That one buys the breakout at the highs; this one buys the pullback back into "
+        "the trend:\n"
+        "- **Buy** when price has dipped to **the fast mean** somewhere in the last "
+        "**pullback window** bars *on below-median volume*, and this bar closes back "
+        "above that mean and through the previous bar's high — inside an established "
+        "uptrend (fast mean above slow mean and rising) above VWAP, and no more than "
+        "**the stretch limit** ATR above the mean so it is not chasing.\n"
+        "- The **quiet-pullback** test does the most work. A healthy pullback is "
+        "participation drying up; a dip on heavy volume is a seller working an order, "
+        "and the “support” under it is a queue.\n"
+        "- **Stop** goes under the pullback low, not a fixed ATR distance below the "
+        "entry — so the invalidation is structural (the low that defined the setup "
+        "broke) and usually much tighter, which buys a larger position for the same "
+        "risk. A setup whose stop is further than **the max risk** is skipped rather "
+        "than sized down.\n"
+        "- **Sell** on the stop, on a close back below the fast mean once the trade has "
+        "had a few bars to work, on the time stop, or at the pre-close flatten. The "
+        "stop ratchets to breakeven at **1R** and never moves back down.\n\n"
+        "Its rules are set per simulation in the **Simulate** tab, and it is never "
+        "scored by the LLM judge — profit, profit efficiency and the oracle ceiling are "
+        "the whole verdict."
+    )
+    st.warning(
+        ":material/warning: **What would falsify it.** The thesis is that near-support "
+        "entries lose less per failure than at-resistance entries, and that this pays "
+        "for the signals it skips by refusing to chase. On a tape that trends hard in "
+        "one direction all session the breakout agent should win outright, because the "
+        "pullback this one waits for never comes. Distinguishing those needs many "
+        "sessions — a two-day dataset cannot, and neither can a two-day head-to-head."
+    )
+
+
+def _render_chatgpt_rules() -> None:
+    """What TraderByChatGPT does. No model behind it -- nothing to load, and
+    nothing whose provenance needs stating."""
+    ticker = rule_agent(TRADER_BY_CHATGPT_KEY).ticker
+    st.markdown(
+        f"Once a minute it reads the **{ticker}** bar that just closed and asks one "
+        "boolean question about it — no model, no probability, no confirmation window:\n"
+        "- **Buy** when that single bar clears every condition at once: close above "
+        "session VWAP, EMA9 > EMA21 > EMA50, a close through **the breakout window**'s "
+        "highest high, volume at least **the relative-volume floor** times its 20-bar "
+        "median, RSI inside 55–75, and ATR at or above **the minimum ATR** (tape too "
+        "quiet for a breakout to travel anywhere is refused). Confluence rather than one "
+        "indicator, and entries only between 09:45 and 15:15.\n"
+        "- **Size** on risk, not on cash: the initial stop sits **the initial stop** ATRs "
+        "below the entry, and the quantity is whatever puts **the risk budget** of equity "
+        "between the fill and that stop — capped at **the position size**, since a "
+        "collapsing ATR would otherwise ask for an unbounded position.\n"
+        "- **Sell** on whichever comes first: the ATR stop (which ratchets up to **the "
+        "trail** ATRs under the running peak once the trade is 1R ahead), a time stop "
+        "after 60 bars, or the pre-close flatten.\n"
+        "- A day that is 1% down stops opening new trades; whatever is already on is "
+        "still managed to its stop.\n\n"
+        "Its rules are set per simulation in the **Simulate** tab, and it is never scored "
+        "by the LLM judge — it states no reasoning of its own to judge, so profit, profit "
+        "efficiency and the oracle ceiling are the whole verdict."
+    )
+    st.info(
+        ":material/info: Both rule agents trade the same symbol on the same tape, so a "
+        "dataset run through both is a straight comparison of two hand-written strategies "
+        "— one that asks a fitted model whether a momentum change will hold, one that "
+        "asks nothing at all."
+    )
+
+
+def _render_apple_rules() -> None:
+    """What Apple Trader does, plus the provenance of the bundle it needs."""
+    ticker = rule_agent(APPLE_TRADER_KEY).ticker
+    st.markdown(
+        f"Once a minute it reads the **{ticker}** bar that just closed and "
         "tracks the momentum regime — a Schmitt trigger over a volatility-normalised "
         "momentum score, so a value hovering near the line cannot emit a burst of fake "
         "changes:\n"
-        "- **Buy** when that bar is a regime change *into positive* and the saved "
-        "persistence classifier — given the 20 bars leading into it — puts the change at "
-        "or above **the persistence probability** to hold.\n"
+        "- **Buy** when that bar is a regime change *into positive* and **the model** — "
+        "given the 20 bars leading into it — puts the change at or above **the persistence "
+        "probability** to hold.\n"
         "- **Sell** when price falls **the trailing stop** below the highest price seen "
         "since the entry. The peak only ratchets up, so the rule starts as a stop under "
         "the entry and becomes a profit lock as the move runs.\n"
@@ -210,32 +288,42 @@ def _render_rule_agent(personality: str) -> None:
         "efficiency and the oracle ceiling are the whole verdict."
     )
 
-    bundle = persistence_model.load_bundle()
-    if bundle is None:
-        st.error(
-            f"No model at `{persistence_model.model_path()}` (or scikit-learn/joblib are "
-            "not installed). Simulations of this agent will fail until it is available."
-        )
-        return
-    metrics = bundle.get("metrics") or {}
-    st.markdown("##### Model")
-    cols = st.columns(4)
-    cols[0].metric("Sequence", f"{bundle['seq_len']} bars")
-    cols[1].metric("Features", len(bundle.get("feature_columns") or []))
-    cols[2].metric("Held-out AUC", f"{metrics.get('roc_auc', float('nan')):.2f}")
-    cols[3].metric("Own threshold", f"{persistence_model.model_threshold(bundle):g}")
+    st.markdown("##### Models")
     st.caption(
-        f"Fitted {bundle.get('trained_at', '?')}, excluding sessions from "
-        f"{bundle.get('excluded_sessions_from', '?')} onwards. {bundle.get('notes', '')}"
+        "The entry question can be put to either of two saved TimeToChange2 models, "
+        "chosen per simulation. Everything before the question — bars, momentum, regimes, "
+        "all 25 features, the 20-bar window — is identical for both, so a dataset run "
+        "through each is a comparison of the models and nothing else."
     )
-    with st.expander("Pipeline settings and held-out metrics"):
-        st.json({"settings": bundle.get("settings"), "metrics": metrics})
+    for model in (apple_models.get(key) for key in apple_models.keys()):
+        with st.expander(model.label, expanded=model.key == AppleTraderConfig().model_key):
+            st.markdown(model.summary)
+            bundle = apple_models.load(model.key)
+            if bundle is None:
+                st.error(
+                    f"{apple_models.unavailable_reason(model.key)} Simulations naming this "
+                    "model will fail until it is available."
+                )
+                continue
+            metrics = bundle.get("metrics") or {}
+            cols = st.columns(4)
+            cols[0].metric("Sequence", f"{bundle['seq_len']} bars")
+            cols[1].metric("Features", len(bundle.get("feature_columns") or []))
+            cols[2].metric("Held-out AUC", f"{metrics.get('roc_auc', float('nan')):.2f}")
+            cols[3].metric("Own threshold", f"{persistence_model.model_threshold(bundle):g}")
+            st.caption(
+                f"Fitted {bundle.get('trained_at', '?')}, excluding sessions from "
+                f"{bundle.get('excluded_sessions_from', '?')} onwards. "
+                f"{bundle.get('notes', '')}"
+            )
+            st.json({"settings": bundle.get("settings"), "metrics": metrics}, expanded=False)
     st.warning(
-        ":material/warning: That AUC covers *all* regime changes. On the changes that "
-        "already pass the observable “the old regime had held 15 bars” pre-condition the "
-        "model scores ~0.50 — it separates the impossible from the possible, not the "
-        "likely from the unlikely. The entry is best read as a change the model did not "
-        "veto, which is why the exit does not consult it at all."
+        ":material/warning: Those AUCs cover *all* regime changes, and roughly half of "
+        "them are decided by one observable boolean — the old regime had already held 15 "
+        "bars. On the changes that pass it the classifier scores ~0.50 and N-BEATS ~0.67, "
+        "and the interval on that 0.67 only just excludes chance. Either entry is best "
+        "read as a change the model did not veto, which is why the exit does not consult "
+        "it at all."
     )
 
 
@@ -783,25 +871,212 @@ def _render_model_picker() -> tuple[list[tuple[str, str]], dict[str, str]]:
     return model_choices, api_keys
 
 
-def _render_rule_params() -> AppleTraderConfig:
-    """Apple Trader's rules for this batch. One rule set per batch, the way one
-    prompt per personality applies to every LLM combination."""
+def _rule_agents_missing_ticker(
+    personalities: list[str], dataset_scope: dict, selected_names: list[str]
+) -> dict[str, list[str]]:
+    """Rule agent -> the selected datasets that do not carry its one symbol.
+
+    A dataset without it is not a strategy result, it is a run that cannot
+    trade, so it is worth catching before the experiments are queued.
+    """
+    missing: dict[str, list[str]] = {}
+    for personality in personalities:
+        ticker = rule_agent(personality).ticker
+        names = [
+            name for name in selected_names
+            if ticker not in (dataset_scope[name]["symbols"] or [])
+        ]
+        if names:
+            missing[personality] = names
+    return missing
+
+
+def _render_rule_params(personalities: list[str]) -> dict:
+    """One rule set per selected rule agent, the way one prompt per personality
+    applies to every LLM combination.
+
+    Keyed by personality, since the two rule agents share no tunables at all --
+    the returned configs are what the queued experiments carry.
+    """
+    renderers = {
+        APPLE_TRADER_KEY: _render_apple_params,
+        TRADER_BY_CHATGPT_KEY: _render_chatgpt_params,
+        TRADER_BY_CLAUDE_KEY: _render_claude_params,
+    }
+    return {key: renderers[key]() for key in personalities if key in renderers}
+
+
+def _render_claude_params() -> TraderByClaudeConfig:
+    """TraderByClaude's rules for this batch.
+
+    Exposed are the four numbers that change what the strategy *is*: how deep a
+    pullback it will look back for, how quiet that pullback has to be, how far
+    from the mean it will still buy, and how much equity it risks per trade.
+    The EMA pair, the entry window and the exits are the strategy's definition
+    rather than knobs, and stay at their defaults.
+    """
+    defaults = TraderByClaudeConfig()
+    with st.expander("TraderByClaude rules", expanded=True):
+        st.caption(
+            "The counter-thesis to TraderByChatGPT: buy the pullback into the trend, "
+            "not the breakout out of it. Each distinct rule set is tracked as its own "
+            "configuration in Results, so retuning is a new test rather than a repeat "
+            "of one already run."
+        )
+        col_a, col_b = st.columns(2)
+        pullback_lookback = col_a.number_input(
+            "Pullback window (bars)", min_value=3, max_value=60,
+            value=defaults.pullback_lookback, step=1, key="sim_claude_pullback",
+            help="How far back the dip to the mean may have happened. Longer accepts "
+                 "setups whose pullback is older, and puts the structural stop further "
+                 "away, since the stop goes under the lowest low in this window.",
+        )
+        quiet_pullback_ratio = col_b.number_input(
+            "Pullback volume (× median)", min_value=0.25, max_value=3.0,
+            value=defaults.quiet_pullback_ratio, step=0.05, format="%.2f",
+            key="sim_claude_quiet",
+            help="Average volume across the pullback, as a multiple of the 20-bar "
+                 "median. Below 1.0 means participation dried up on the dip — which is "
+                 "what separates a pullback from distribution. Raising it above 1.0 "
+                 "removes the test that does the most filtering.",
+        )
+        max_stretch_atr = col_a.number_input(
+            "Stretch limit (ATRs above the mean)", min_value=0.1, max_value=4.0,
+            value=defaults.max_stretch_atr, step=0.05, format="%.2f",
+            key="sim_claude_stretch",
+            help="The anti-chase rule: refuse a reclaim bar that has already run this "
+                 "far past the mean. This binds against the reclaim test — a bar that "
+                 "takes out the prior high tends to close some way above the mean — so "
+                 "it is the main control on how often the agent trades at all.",
+        )
+        risk_pct = col_b.number_input(
+            "Risk per trade (% of equity)", min_value=0.05, max_value=5.0,
+            value=defaults.risk_pct, step=0.05, format="%.2f", key="sim_claude_risk",
+            help="Dollars between the fill and the structural stop, as a share of "
+                 "equity. Because that stop sits under the pullback low rather than a "
+                 "fixed ATR away, the same percentage usually buys a larger position "
+                 "here than in a breakout entry.",
+        )
+        max_position_pct = col_a.number_input(
+            "Position cap (% of cash)", min_value=1.0, max_value=100.0,
+            value=defaults.max_position_pct, step=5.0, key="sim_claude_size",
+        )
+    return TraderByClaudeConfig(
+        pullback_lookback=int(pullback_lookback),
+        quiet_pullback_ratio=float(quiet_pullback_ratio),
+        max_stretch_atr=float(max_stretch_atr),
+        risk_pct=float(risk_pct),
+        max_position_pct=float(max_position_pct),
+    )
+
+
+def _render_chatgpt_params() -> TraderByChatGPTConfig:
+    """TraderByChatGPT's rules for this batch.
+
+    The entry is a confluence of seven conditions and the exit is an ATR trail;
+    exposed here are the four that change what the strategy *is* -- how far
+    back the breakout looks, how much volume confirmation it demands, how much
+    equity it risks per trade, and how far the stop trails. The rest (the RSI
+    band, the ATR regime filter, the entry window) are the strategy's
+    definition rather than knobs, and stay at their defaults.
+    """
+    defaults = TraderByChatGPTConfig()
+    with st.expander("TraderByChatGPT rules", expanded=True):
+        st.caption(
+            "No model to tune — the entry is a plain boolean over the bar that just "
+            "closed, so these are the numbers inside it. Each distinct rule set is "
+            "tracked as its own configuration in Results, so retuning is a new test "
+            "rather than a repeat of one already run."
+        )
+        col_a, col_b = st.columns(2)
+        breakout_lookback = col_a.number_input(
+            "Breakout window (bars)", min_value=5, max_value=120,
+            value=defaults.breakout_lookback, step=5, key="sim_chatgpt_lookback",
+            help="The bar has to close above the highest high of this many bars before "
+                 "it. Shorter fires more often on smaller ranges.",
+        )
+        min_relative_volume = col_b.number_input(
+            "Relative volume to confirm", min_value=1.0, max_value=5.0,
+            value=defaults.min_relative_volume, step=0.1, format="%.2f",
+            key="sim_chatgpt_rvol",
+            help="Volume as a multiple of its 20-bar median. A breakout without unusual "
+                 "participation is the one that fails back into the range.",
+        )
+        risk_pct = col_a.number_input(
+            "Risk per trade (% of equity)", min_value=0.05, max_value=5.0,
+            value=defaults.risk_pct, step=0.05, format="%.2f", key="sim_chatgpt_risk",
+            help="Dollars between the fill and the initial stop, as a share of equity. "
+                 "This sizes the position — the position cap only stops a tiny ATR from "
+                 "asking for an unbounded one.",
+        )
+        trail_atr = col_b.number_input(
+            "Trailing stop (ATRs under the peak)", min_value=0.25, max_value=5.0,
+            value=defaults.trail_atr, step=0.25, format="%.2f", key="sim_chatgpt_trail",
+            help="Once the trade is 1R ahead the stop ratchets up to this far under the "
+                 "highest price seen since the entry. Before that the initial "
+                 f"{defaults.initial_stop_atr:g} ATR stop stands.",
+        )
+        max_position_pct = col_a.number_input(
+            "Position cap (% of cash)", min_value=1.0, max_value=100.0,
+            value=defaults.max_position_pct, step=5.0, key="sim_chatgpt_size",
+        )
+        min_atr_pct = col_b.number_input(
+            "Minimum ATR (% of price)", min_value=0.0, max_value=1.0,
+            value=defaults.min_atr_pct * 100.0, step=0.01, format="%.3f",
+            key="sim_chatgpt_atr",
+            help="Refuse to buy a breakout on tape too quiet to travel anywhere. These "
+                 "are one-minute bars, where a liquid large cap runs a median ATR near "
+                 "0.08% of price — two orders of magnitude under the daily figure, so a "
+                 "daily-scale floor here rejects every bar of the session.",
+        )
+    return TraderByChatGPTConfig(
+        breakout_lookback=int(breakout_lookback),
+        min_relative_volume=float(min_relative_volume),
+        risk_pct=float(risk_pct),
+        trail_atr=float(trail_atr),
+        max_position_pct=float(max_position_pct),
+        min_atr_pct=float(min_atr_pct) / 100.0,
+    )
+
+
+def _render_apple_params() -> AppleTraderConfig:
+    """Apple Trader's rules for this batch."""
     defaults = AppleTraderConfig()
-    bundle_threshold = persistence_model.model_threshold(persistence_model.load_bundle())
     with st.expander("Apple Trader rules", expanded=True):
         st.caption(
-            "Two knobs decide everything: how sure the model has to be that a change into "
-            "positive momentum will hold, and how much of the run it gives back before "
-            "selling. Each distinct rule set is tracked as its own configuration in "
-            "Results, so retuning is a new test rather than a repeat of one already run."
+            "Three knobs decide everything: which saved model is asked whether a change "
+            "into positive momentum will hold, how sure it has to be, and how much of the "
+            "run the trade gives back before selling. Each distinct rule set is tracked as "
+            "its own configuration in Results, so swapping the model or retuning the stop "
+            "is a new test rather than a repeat of one already run."
         )
+        keys = apple_models.keys()
+        model_key = st.selectbox(
+            "Model", keys,
+            index=keys.index(defaults.model_key) if defaults.model_key in keys else 0,
+            format_func=lambda key: apple_models.get(key).label,
+            key="sim_apple_model",
+            help="Both models are handed the same 20 bars on the same tape and return one "
+                 "probability; only the way they reach it differs. Running a dataset "
+                 "through both is a straight comparison of the two.",
+        )
+        model = apple_models.get(model_key)
+        bundle = apple_models.load(model.key)
+        st.caption(model.summary)
+        if bundle is None:
+            st.error(apple_models.unavailable_reason(model_key))
+        bundle_threshold = persistence_model.model_threshold(bundle)
+
         col_a, col_b = st.columns(2)
         prob_threshold = col_a.number_input(
             "Persistence probability to buy", min_value=0.0, max_value=1.0,
             value=float(defaults.prob_threshold or bundle_threshold),
-            step=0.01, format="%.2f", key="sim_apple_prob",
-            help=f"Default {bundle_threshold:g} is the cut-off the model itself chose on "
-                 "its validation block. Its skill is in rejecting changes that cannot "
+            step=0.01, format="%.2f",
+            # Keyed by model so switching re-seeds the input with that model's
+            # own cut-off: the two probabilities are not on a shared scale.
+            key=f"sim_apple_prob_{model_key}",
+            help=f"Default {bundle_threshold:g} is the cut-off this model chose on its own "
+                 "validation block. Its skill is in rejecting changes that cannot "
                  "persist, so a permissive setting is the intended one — raising it "
                  "discards plausible changes roughly at random.",
         )
@@ -817,6 +1092,7 @@ def _render_rule_params() -> AppleTraderConfig:
             value=defaults.position_pct, step=5.0, key="sim_apple_size",
         )
     return AppleTraderConfig(
+        model_key=str(model_key),
         prob_threshold=float(prob_threshold),
         trail_pct=float(trail_pct),
         position_pct=float(position_pct),
@@ -850,8 +1126,8 @@ def render_simulate_tab() -> None:
     )
     llm_personalities = [p for p in personalities if sim_prompts.has_prompt(p)]
     rule_personalities = [p for p in personalities if not sim_prompts.has_prompt(p)]
-    rule_config = _render_rule_params() if rule_personalities else None
-    # The model picker only sizes the LLM grid: the rule agent runs the same
+    rule_configs = _render_rule_params(rule_personalities)
+    # The model picker only sizes the LLM grid: a rule agent runs the same
     # way whatever is selected there, so it is queued once per dataset instead.
     model_choices, api_keys = (
         _render_model_picker() if llm_personalities else ([], {})
@@ -873,9 +1149,11 @@ def render_simulate_tab() -> None:
         )
         if run_judge and rule_personalities:
             st.caption(
-                f":material/gavel: {_agent_label(rule_personalities[0])} is never judged — "
-                "it states no reasoning of its own, so profit, profit efficiency and the "
-                "oracle ceiling are its whole scorecard."
+                ":material/gavel: "
+                + ", ".join(_agent_label(p) for p in rule_personalities)
+                + (" are" if len(rule_personalities) > 1 else " is")
+                + " never judged — they state no reasoning of their own, so profit, "
+                "profit efficiency and the oracle ceiling are the whole scorecard."
             )
         # Judging with the agent's own model is per-combination; a single
         # explicit judge is shared by every experiment in the grid.
@@ -896,17 +1174,19 @@ def render_simulate_tab() -> None:
                 "Judge API key", value=_env_key(judge_provider), type="password"
             )
 
-    # One combination per (agent, model, dataset) for the LLM agents; the rule
-    # agent has no model dimension, so its rule set stands in for one -- which
-    # also means changing a threshold queues a genuinely new combination.
-    rule_signature = config_signature(rule_config)
+    # One combination per (agent, model, dataset) for the LLM agents; a rule
+    # agent has no model dimension, so its own rule set stands in for one --
+    # which also means retuning it queues a genuinely new combination.
+    rule_signatures = {
+        key: rule_agent(key).signature(config) for key, config in rule_configs.items()
+    }
     combos = [
         (personality, provider, model, name)
         for name in selected_names
         for personality in llm_personalities
         for provider, model in model_choices
     ] + [
-        (personality, RULE_PROVIDER, rule_signature, name)
+        (personality, RULE_PROVIDER, rule_signatures[personality], name)
         for name in selected_names
         for personality in rule_personalities
     ]
@@ -922,17 +1202,14 @@ def render_simulate_tab() -> None:
     if overridden:
         labels = ", ".join(_agent_label(p) for p in overridden)
         st.caption(f":material/edit: Runs with a **modified** prompt (Agents tab): {labels}.")
-    if rule_personalities:
-        missing_ticker = [
-            name for name in selected_names
-            if APPLE_TRADER_TICKER not in (dataset_scope[name]["symbols"] or [])
-        ]
-        if missing_ticker:
-            st.error(
-                f":material/error: {_agent_label(rule_personalities[0])} only trades "
-                f"{APPLE_TRADER_TICKER} (the one symbol its model was fitted on), which is "
-                f"not selected for: {', '.join(missing_ticker)}."
-            )
+    missing_ticker = _rule_agents_missing_ticker(rule_personalities, dataset_scope,
+                                                 selected_names)
+    for personality, names_missing in missing_ticker.items():
+        st.error(
+            f":material/error: {_agent_label(personality)} only trades "
+            f"{rule_agent(personality).ticker}, which is not selected for: "
+            f"{', '.join(names_missing)}."
+        )
     st.caption(
         ":material/monitoring: Langfuse export: "
         + ("enabled — cycles are traced and run scores registered." if obs.is_enabled()
@@ -972,19 +1249,16 @@ def render_simulate_tab() -> None:
         ]
         missing_keys = sorted({provider for provider, _ in model_choices
                                if not api_keys.get(provider)})
-        rule_without_ticker = rule_personalities and [
-            name for name in selected_names
-            if APPLE_TRADER_TICKER not in (dataset_scope[name]["symbols"] or [])
-        ]
         if empty:
             st.error(
                 "Pick at least one trading day and one symbol for: " + ", ".join(empty)
             )
-        elif rule_without_ticker:
+        elif missing_ticker:
+            personality, names_missing = next(iter(missing_ticker.items()))
             st.error(
-                f"Add {APPLE_TRADER_TICKER} to the symbols of "
-                f"{', '.join(rule_without_ticker)}, or deselect "
-                f"{_agent_label(rule_personalities[0])}."
+                f"Add {rule_agent(personality).ticker} to the symbols of "
+                f"{', '.join(names_missing)}, or deselect "
+                f"{_agent_label(personality)}."
             )
         elif missing_keys:
             st.error(f"An API key is required for: {', '.join(missing_keys)}.")
@@ -1005,8 +1279,11 @@ def render_simulate_tab() -> None:
                     "cycle_minutes": int(cycle_minutes),
                     "max_cycles_per_day": int(max_cycles),
                     "system_prompt_override": sim_prompts.get_override(personality),
-                    "rule_config": asdict(rule_config) if rule_based else None,
-                    # The rule agent is never judged: no reasoning of its own to
+                    "rule_config": (
+                        rule_agent(personality).to_record(rule_configs[personality])
+                        if rule_based else None
+                    ),
+                    # A rule agent is never judged: no reasoning of its own to
                     # grade, so the profit metrics are the whole scorecard.
                     "run_judge": bool(run_judge) and not rule_based,
                     "judge_provider": judge_provider or provider,

@@ -3,11 +3,17 @@
 Every other personality in `agent_stonks.agent` is a system prompt handed to a
 model that reasons its way to a decision. This one is a plain loop: once a
 minute it looks at the AAPL bar that just closed, and when the momentum regime
-has just turned positive it asks the persistence classifier from
-FinNotebooks/TimeToChange2 (see `agent_stonks.persistence_model`) whether that
-change is the kind that holds. Same paper ledger, same fill path, same log --
-only the decision-making is deterministic, so the same tape always produces the
-same trades.
+has just turned positive it asks a saved model from FinNotebooks/TimeToChange2
+whether that change is the kind that holds. Same paper ledger, same fill path,
+same log -- only the decision-making is deterministic, so the same tape always
+produces the same trades.
+
+Which model answers is a setting (`AppleTraderConfig.model_key`, see
+`agent_stonks.apple_models`): the incumbent persistence classifier, or the
+N-BEATS ensemble that forecasts momentum and derives the same probability from
+500 sampled futures. The rules below do not change with it -- both are handed
+the same 20-bar window on the same bars and return one number -- so a run's
+model is part of its configuration identity rather than a different agent.
 
 The rules
 ---------
@@ -56,13 +62,18 @@ the two tapes do not have to produce identical trades.
 
 What the model actually does
 ----------------------------
-TimeToChange2's own verdict is that the classifier is **a filter that separates
-the impossible from the possible, not the likely from the unlikely**: 0.82
-out-of-fold AUC over all regime changes, but 0.50 over the changes that already
-pass the observable "the old regime had held 15 bars" pre-condition. So the
-entry is best read as "a to-positive change the model did not veto", and the
-exit does not lean on the model at all -- once the position is on, only price
-decides when it comes off.
+TimeToChange2's own verdict on the incumbent classifier is that it is **a
+filter that separates the impossible from the possible, not the likely from the
+unlikely**: 0.82 out-of-fold AUC over all regime changes, but 0.50 over the
+changes that already pass the observable "the old regime had held 15 bars"
+pre-condition. The N-BEATS option is the one model in its benchmark that beats
+chance on that hard half (0.67 +/- 0.07 over four folds), which is a real
+effect and a small one -- see `apple_models` for what choosing it does and does
+not buy.
+
+Either way the entry is best read as "a to-positive change the model did not
+veto", and the exit does not lean on the model at all -- once the position is
+on, only price decides when it comes off.
 """
 
 from __future__ import annotations
@@ -72,7 +83,7 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from . import market_hours, persistence_model, scoring
+from . import apple_models, market_hours, persistence_model, scoring
 from . import observability as obs
 from .agent import _log, stop_agent
 from .clock import now as _now
@@ -80,6 +91,7 @@ from .config import (
     APPLE_TRADER_BAR_LAG_SEC,
     APPLE_TRADER_CYCLE_SEC,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
+    APPLE_TRADER_MODEL,
     APPLE_TRADER_POSITION_PCT,
     APPLE_TRADER_PROB_THRESHOLD,
     APPLE_TRADER_TRAIL_PCT,
@@ -102,10 +114,14 @@ TICKER = "AAPL"
 
 @dataclass
 class AppleTraderConfig:
-    """Tunables of the loop. `prob_threshold` and `trail_pct` are the two that
-    change what it does; the rest are sizing and housekeeping."""
+    """Tunables of the loop. `model_key`, `prob_threshold` and `trail_pct` are
+    the three that change what it does; the rest are sizing and housekeeping."""
 
-    # None -> the cut-off the bundle chose on its own validation block.
+    # Which saved model answers the entry question -- a key of
+    # `apple_models.MODELS`.
+    model_key: str = APPLE_TRADER_MODEL
+    # None -> the cut-off the chosen model picked on its own validation block,
+    # which is the only setting that means the same thing across models.
     prob_threshold: Optional[float] = APPLE_TRADER_PROB_THRESHOLD
     trail_pct: float = APPLE_TRADER_TRAIL_PCT
     position_pct: float = APPLE_TRADER_POSITION_PCT
@@ -117,17 +133,20 @@ def config_signature(
 ) -> str:
     """Compact identity of one rule set, standing in for a model name.
 
-    Two runs of this agent differ only in these numbers, so SimLab groups and
-    de-duplicates runs on this string exactly as it does on `provider/model`
-    for the LLM agents -- retuning the trailing stop is a new configuration to
-    test, not a repeat of one already tested.
+    Two runs of this agent differ only in these numbers and the model behind
+    them, so SimLab groups and de-duplicates runs on this string exactly as it
+    does on `provider/model` for the LLM agents -- retuning the trailing stop,
+    or swapping the classifier for the forecaster, is a new configuration to
+    test rather than a repeat of one already tested. The model leads the string
+    because a threshold read without it is meaningless: the two models' scales
+    are unrelated.
     """
     c = config or AppleTraderConfig()
     threshold = c.prob_threshold if c.prob_threshold is not None else model_threshold
     shown = f"{threshold:g}" if threshold is not None else "model"
     return (
-        f"persistence_{TICKER}(p>={shown},trail={c.trail_pct:g}%,"
-        f"size={c.position_pct:g}%)"
+        f"{apple_models.get(c.model_key).key}_{TICKER}(p>={shown},"
+        f"trail={c.trail_pct:g}%,size={c.position_pct:g}%)"
     )
 
 
@@ -389,16 +408,16 @@ def _apple_trader_loop(
     cycle_sec: int,
     stop_event: threading.Event,
 ) -> None:
-    bundle = persistence_model.load_bundle()
+    model = apple_models.get(config.model_key)
+    bundle = apple_models.load(config.model_key)
     if bundle is None:
         _log(
             state,
             {
                 "type": "error",
                 "text": (
-                    f"No momentum-persistence model at "
-                    f"{persistence_model.model_path()} (or scikit-learn/joblib are not "
-                    f"installed). Apple Trader cannot run without it."
+                    f"{apple_models.unavailable_reason(config.model_key)} "
+                    f"Apple Trader cannot run without it."
                 ),
             },
         )
@@ -413,7 +432,7 @@ def _apple_trader_loop(
         {
             "type": "status",
             "text": (
-                f"Apple Trader armed on the saved persistence classifier (fitted "
+                f"Apple Trader armed on {model.label} (fitted "
                 f"{bundle.get('trained_at', 'unknown')}, held-out AUC "
                 f"{metrics.get('roc_auc', float('nan')):.2f}): watching every {TICKER} minute "
                 f"bar for a regime change into positive momentum, buying one the model rates "

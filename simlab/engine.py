@@ -19,11 +19,10 @@ armed tactics are evaluated by the real ``TacticsExecutor`` matching logic
 wake-the-agent interrupt the live stream would. Hours of waiting collapse
 into however many LLM cycles the session actually needed.
 
-The rule-based Apple Trader (``agent_stonks.apple_trader``) replays through
-the same engine on a different day loop: it has no prompt, no tools and no
-LLM, and it scores *every* closed bar of the session instead of sleeping on
-armed conditions, so there is nothing to fast-forward past -- see
-``_run_rule_day``.
+The rule-based agents (``simlab.rule_agents``) replay through the same engine
+on a different day loop: they have no prompt, no tools and no LLM, and they
+score *every* closed bar of the session instead of sleeping on armed
+conditions, so there is nothing to fast-forward past -- see ``_run_rule_day``.
 """
 from __future__ import annotations
 
@@ -33,7 +32,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Optional
 
-from agent_stonks import clock, market_hours, persistence_model
+from agent_stonks import clock, market_hours
 from agent_stonks.agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
@@ -42,8 +41,6 @@ from agent_stonks.agent import (
     PREMARKET_PERSONALITY,
     run_agent_cycle,
 )
-from agent_stonks.apple_trader import APPLE_TRADER_KEY, AppleTrader, AppleTraderConfig
-from agent_stonks.apple_trader import TICKER as APPLE_TRADER_TICKER
 from agent_stonks.broker import Broker
 from agent_stonks.config import PREMARKET_LEAD_SEC
 from agent_stonks.decisions import DecisionTracker
@@ -53,6 +50,7 @@ from agent_stonks.tactics import TacticsExecutor
 
 from .market import BAR_SEC, SimMarket
 from .patches import simulation_context
+from .rule_agents import is_rule_based, rule_agent
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +77,10 @@ class SimulationConfig:
     # armed a hair from the price) stops burning tokens and fast-forwards.
     max_cycles_per_day: int = 40
     system_prompt_override: Optional[str] = None
-    # Apple Trader's rule set, as a JSON-ready dict (so it survives the
-    # experiment record). Ignored by every LLM personality; `provider`,
+    # The selected rule agent's rule set, as a JSON-ready dict (so it survives
+    # the experiment record). Ignored by every LLM personality; `provider`,
     # `model`, `api_key`, `cycle_minutes` and `max_cycles_per_day` are ignored
-    # in return, since the rule agent scores every bar and calls no LLM.
+    # in return, since a rule agent scores every bar and calls no LLM.
     rule_config: Optional[dict] = None
 
 
@@ -141,13 +139,11 @@ class SimulationEngine:
         self._cursors: dict[str, int] = {sym: 0 for sym in self.app.symbols}
         self._last_step: Optional[datetime] = None
         self._stop_requested = False
-        # The momentum-persistence bundle, loaded once per rule-based run.
-        self._bundle: Optional[dict] = None
 
     @property
     def rule_based(self) -> bool:
-        """Whether this run is the non-LLM Apple Trader loop."""
-        return self.config.personality == APPLE_TRADER_KEY
+        """Whether this run is one of the non-LLM rule agent loops."""
+        return is_rule_based(self.config.personality)
 
     # ------------------------------------------------------------------ API
 
@@ -328,33 +324,26 @@ class SimulationEngine:
 
     # --------------------------------------------------- rule-based day loop
 
-    def _build_rule_trader(self) -> AppleTrader:
-        """The Apple Trader state machine plus its model, or a clear failure.
+    def _build_rule_trader(self) -> Any:
+        """The selected rule agent's state machine, or a clear failure.
 
-        Both problems this catches are configuration mistakes that would
-        otherwise show up as an empty run: the ticker the model is fitted for
-        not being in the dataset, and the saved bundle not being installed.
+        The ticker check catches a configuration mistake that would otherwise
+        show up as an empty run: the one symbol the agent trades not being in
+        the dataset. Whatever else the agent needs (Apple Trader's saved
+        bundle) is the registry's problem, and fails just as loudly.
+
+        Every indicator these agents read is session-local, so one stored day
+        is a complete, like-live run -- there is nothing behind it to miss.
         """
-        if APPLE_TRADER_TICKER not in self.app.symbols:
+        agent = rule_agent(self.config.personality)
+        if agent.ticker not in self.app.symbols:
             raise RuntimeError(
-                f"Apple Trader only trades {APPLE_TRADER_TICKER}; this simulation's "
+                f"{agent.label} only trades {agent.ticker}; this simulation's "
                 f"symbols are {', '.join(self.app.symbols) or 'none'}."
             )
-        self._bundle = persistence_model.load_bundle()
-        if self._bundle is None:
-            raise RuntimeError(
-                f"no momentum-persistence model at {persistence_model.model_path()} "
-                "(or scikit-learn/joblib are not installed)."
-            )
-        config = AppleTraderConfig(**(self.config.rule_config or {}))
-        # Every indicator the model consumes is session-local, so one stored
-        # day is a complete, like-live run -- there is nothing behind it to
-        # miss.
-        return AppleTrader(
-            config, model_threshold=persistence_model.model_threshold(self._bundle)
-        )
+        return agent.build(agent.from_record(self.config.rule_config))
 
-    def _run_rule_day(self, day: date, trader: AppleTrader) -> None:
+    def _run_rule_day(self, day: date, trader: Any) -> None:
         """Score every closed bar of the session, in order.
 
         No wake logic and no fast-forward: the rule agent arms no tactics and
@@ -370,7 +359,7 @@ class SimulationEngine:
             if not market_hours.is_market_open(t):
                 continue
             self.cycles_run += 1
-            outcome = trader.run_cycle(self._bundle, self.app, self.tracker)
+            outcome = trader.run_cycle(self.app, self.tracker)
             if outcome in ("bought", "sold") or self.cycles_run % 60 == 0:
                 self.progress(
                     f"{day.isoformat()} {t.astimezone(MARKET_TZ).strftime('%H:%M')} — "
