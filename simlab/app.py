@@ -159,10 +159,10 @@ def _render_tool_tester(personality: str) -> None:
     args["symbol"] = symbol
 
     if st.button("Run tool", icon=":material/play_arrow:", type="primary", key="tt_run"):
-        market = SimMarket(ds.symbols, [day])
+        market = SimMarket(ds.symbols, [day], ds.feed)
         config = SimulationConfig(
             personality=personality, provider="openai", model="-", api_key="",
-            symbols=ds.symbols, days=[day],
+            symbols=ds.symbols, days=[day], feed=ds.feed,
         )
         engine = SimulationEngine(market, config)
         with simulation_context(market):
@@ -391,9 +391,26 @@ def render_agents_tab() -> None:
 
 def render_datasets_tab() -> None:
     st.caption(
-        "Datasets are named bundles of symbols + a date range. Minute bars (04:00–20:00 ET), "
-        "daily history, news, and SPY/VIX context are stored locally, deduplicated per "
-        "(symbol, day) — overlapping datasets never re-download a day."
+        "Datasets are named bundles of symbols + a date range + a **feed**. Minute bars "
+        "(04:00–20:00 ET), daily history, news, and SPY/VIX context are stored locally, "
+        "deduplicated per (feed, symbol, day) — overlapping datasets never re-download a day."
+    )
+    st.info(
+        ":material/info: **The feed is part of the data, not a download setting.** "
+        "`yfinance` (the default) is the consolidated tape — every venue — free, and the "
+        "same source the live volume tools read. `iex` is one venue, roughly 4% of "
+        "consolidated volume on a large cap, so its bars carry different closes, far "
+        "smaller volumes and occasionally an extra or missing minute; any agent whose "
+        "rules are thresholds over those bars can trade a different day on each tape. "
+        "The same day on two feeds is stored twice, on purpose."
+    )
+    st.warning(
+        f":material/schedule: **yfinance reaches back {sim_data.YF_MINUTE_WINDOW_DAYS} days.** "
+        "Yahoo serves 1-minute history for the last "
+        f"{sim_data.YF_MINUTE_WINDOW_DAYS} days only, so a yfinance dataset cannot start "
+        f"before **{date.today() - timedelta(days=sim_data.YF_MINUTE_WINDOW_DAYS)}** — "
+        "earlier days download empty. Use `sip` (needs a paid Alpaca data subscription) "
+        "for an older window. yfinance bars also carry no per-bar VWAP."
     )
     with st.form("dataset_form"):
         name = st.text_input("Dataset name", placeholder="e.g. nvda-earnings-week")
@@ -401,7 +418,7 @@ def render_datasets_tab() -> None:
         col_start, col_end, col_feed = st.columns(3)
         start = col_start.date_input("Start", value=date.today() - timedelta(days=7))
         end = col_end.date_input("End", value=date.today() - timedelta(days=1))
-        feed = col_feed.selectbox("Feed", ["iex", "sip"])
+        feed = col_feed.selectbox("Feed", list(sim_data.FEEDS))
         col_key, col_secret = st.columns(2)
         api_key = col_key.text_input(
             "Alpaca API key", value=os.getenv("ALPACA_API_KEY", ""), type="password"
@@ -409,14 +426,18 @@ def render_datasets_tab() -> None:
         api_secret = col_secret.text_input(
             "Alpaca secret", value=os.getenv("ALPACA_SECRET", ""), type="password"
         )
+        st.caption(
+            "Alpaca credentials are required for the `iex`/`sip` feeds. On `yfinance` "
+            "they are optional and fetch news only — without them the dataset has no news."
+        )
         submitted = st.form_submit_button("Download dataset", icon=":material/download:", type="primary")
 
     if submitted:
         symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
         if not name.strip() or not symbols:
             st.error("A dataset needs a name and at least one symbol.")
-        elif not api_key or not api_secret:
-            st.error("Alpaca credentials are required to download data.")
+        elif feed != "yfinance" and not (api_key and api_secret):
+            st.error(f"Alpaca credentials are required for the `{feed}` feed.")
         else:
             with st.status(f"Downloading '{name}'…", expanded=True) as status:
                 try:
@@ -442,7 +463,7 @@ def render_datasets_tab() -> None:
         with st.container(border=True, horizontal=True, vertical_alignment="center"):
             st.markdown(
                 f"**{ds.name}** — {', '.join(ds.symbols)} · {ds.start} → {ds.end} "
-                f"· {len(ds.days)} trading day(s)"
+                f"· {len(ds.days)} trading day(s) · `{ds.feed}`"
             )
             if st.button("Delete", key=f"del_ds_{ds.name}", icon=":material/delete:"):
                 sim_data.delete_dataset(ds.name)
@@ -557,6 +578,11 @@ def _render_run(record: dict) -> None:
             f":material/function: Rule-based run — {_agent_label(config.get('personality'))}, "
             f"no LLM and no judge. Rules: `{config.get('model')}`"
         )
+    # The tape is part of what produced these numbers: identical rules on
+    # `yfinance`, `iex` and `sip` are different bars and can be different
+    # trades. A record from before the feed was tracked ran on `iex`.
+    feed = config.get("feed") or sim_data.LEGACY_FEED
+    st.caption(f":material/database: Tape: `{feed}`")
 
     equity = record.get("equity") or []
     if equity:
@@ -567,7 +593,7 @@ def _render_run(record: dict) -> None:
     decisions = record.get("decisions") or []
     if symbols and days:
         try:
-            market = SimMarket(symbols, days)
+            market = SimMarket(symbols, days, feed)
             tabs = st.tabs(symbols)
             for tab, sym in zip(tabs, symbols):
                 with tab:
@@ -830,7 +856,7 @@ def _render_dataset_scope(datasets: list) -> dict[str, dict]:
     scope: dict[str, dict] = {}
     for ds in datasets:
         with st.container(border=True):
-            st.markdown(f"**{ds.name}** — {ds.start} → {ds.end}")
+            st.markdown(f"**{ds.name}** — {ds.start} → {ds.end} · tape `{ds.feed}`")
             col_days, col_symbols = st.columns(2)
             day_options = ds.days or []
             scope[ds.name] = {
@@ -1278,6 +1304,7 @@ def render_simulate_tab() -> None:
                     "starting_cash": float(starting_cash),
                     "cycle_minutes": int(cycle_minutes),
                     "max_cycles_per_day": int(max_cycles),
+                    "feed": by_name[name].feed,
                     "system_prompt_override": sim_prompts.get_override(personality),
                     "rule_config": (
                         rule_agent(personality).to_record(rule_configs[personality])

@@ -5,9 +5,10 @@ bars, news, market indicators) and answers every "as of simulated time t"
 question the engine and the patched fetchers need. All methods are pure reads
 over in-memory lists -- the simulation never touches the network.
 
-Time convention: an Alpaca minute bar stamped T covers [T, T+60). It is
-*completed* -- and therefore visible to the agent -- once t >= T + 60. The
-engine steps the clock to exactly those completion moments.
+Time convention: a minute bar stamped T covers [T, T+60) -- true of both
+sources the store holds, Alpaca and yfinance. It is *completed* -- and
+therefore visible to the agent -- once t >= T + 60. The engine steps the clock
+to exactly those completion moments.
 """
 from __future__ import annotations
 
@@ -32,11 +33,12 @@ def parse_ts(raw: object) -> Optional[datetime]:
 class _SymbolSeries:
     """One symbol's stored series for the simulated day range, pre-parsed."""
 
-    def __init__(self, symbol: str, days: list[date]) -> None:
+    def __init__(self, symbol: str, days: list[date], feed: str = data.DEFAULT_FEED) -> None:
         self.symbol = symbol
+        self.feed = feed
         self.minute_bars: list[dict] = []
         for day in days:
-            self.minute_bars.extend(data.load_day_bars(symbol, day))
+            self.minute_bars.extend(data.load_day_bars(symbol, day, feed))
         self.minute_ts: list[datetime] = []
         bars_clean: list[dict] = []
         for bar in self.minute_bars:
@@ -46,7 +48,7 @@ class _SymbolSeries:
                 self.minute_ts.append(ts)
         self.minute_bars = bars_clean
 
-        self.daily_bars: list[dict] = data.load_daily_bars(symbol)
+        self.daily_bars: list[dict] = data.load_daily_bars(symbol, feed)
         self.news: list[dict] = []
         for day in days:
             self.news.extend(data.load_news(symbol, day))
@@ -55,13 +57,22 @@ class _SymbolSeries:
 
 
 class SimMarket:
-    """Dataset-backed market data for one simulation run."""
+    """Dataset-backed market data for one simulation run.
 
-    def __init__(self, symbols: list[str], days: list[date]) -> None:
+    `feed` names which tape to read, and is not cosmetic: the same day on
+    `yfinance`, on `iex` and on `sip` is a different set of bars, so it belongs
+    to the identity of a run rather than to how the data happened to be
+    fetched. See the `simlab.data` module docstring.
+    """
+
+    def __init__(
+        self, symbols: list[str], days: list[date], feed: str = data.DEFAULT_FEED
+    ) -> None:
         self.symbols = [s.upper() for s in symbols]
         self.days = sorted(days)
+        self.feed = feed
         self.series: dict[str, _SymbolSeries] = {
-            sym: _SymbolSeries(sym, self.days) for sym in self.symbols
+            sym: _SymbolSeries(sym, self.days, feed) for sym in self.symbols
         }
         self.indicators = data.load_market_indicators()
 

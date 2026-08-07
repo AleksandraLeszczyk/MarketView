@@ -48,6 +48,7 @@ from agent_stonks.market_hours import MARKET_TZ
 from agent_stonks.state import AppState, alert_triggered, format_alert
 from agent_stonks.tactics import TacticsExecutor
 
+from . import data as sim_data
 from .market import BAR_SEC, SimMarket
 from .patches import simulation_context
 from .rule_agents import is_rule_based, rule_agent
@@ -82,6 +83,10 @@ class SimulationConfig:
     # `model`, `api_key`, `cycle_minutes` and `max_cycles_per_day` are ignored
     # in return, since a rule agent scores every bar and calls no LLM.
     rule_config: Optional[dict] = None
+    # The tape this run reads, carried from the dataset so the run record says
+    # which one it was. Two runs of identical rules on `yfinance` and on `iex`
+    # are not the same experiment and must not be read as one.
+    feed: str = sim_data.DEFAULT_FEED
 
 
 @dataclass
@@ -191,6 +196,7 @@ class SimulationEngine:
                 "model": self.config.model,
                 "symbols": self.app.symbols,
                 "days": [d.isoformat() for d in self.market.days],
+                "feed": self.market.feed,
                 "starting_cash": self.config.starting_cash,
                 "cycle_minutes": self.config.cycle_minutes,
                 "prompt_overridden": self.config.system_prompt_override is not None,

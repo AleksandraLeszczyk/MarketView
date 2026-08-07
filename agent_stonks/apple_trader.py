@@ -53,12 +53,23 @@ Two differences remain, deliberately:
   open of bar *t+1*; live there is no such price to wait for, so this loop
   sends a market order as soon as the bar closes.
 
-And one that is not in the code at all: the notebook's bars are the
-consolidated tape (yfinance), while the live/SimLab feed is IEX. A few cents of
-difference is enough to trip the regime trigger a minute earlier or later, or
-to insert a regime change the other tape never saw -- which moves `pre_dwell`,
-the model's strongest feature, and with it the probability. Identical rules on
-the two tapes do not have to produce identical trades.
+And one that is not in the code at all: the **tape**. The notebook's bars are
+consolidated (yfinance); live, and in SimLab unless the dataset says otherwise,
+they are Alpaca's IEX feed -- one venue, ~4% of consolidated volume. A few
+cents of difference is enough to trip the regime trigger a minute earlier or
+later, or to insert a regime change the other tape never saw, which moves
+`pre_dwell` -- the model's strongest feature -- and with it the probability.
+
+That difference is large enough to change the day's trades, so it is worth
+being concrete about. On 2026-07-27 the consolidated tape has four to-positive
+changes at 10:20, 11:00, 14:54 and 15:37 with `pre_dwell` 50, 28, 8 and 30. On
+IEX the first slips to 10:21 and the 11:00 change comes in at `pre_dwell` 10
+instead of 28 -- below the 15-bar precondition -- so that entry disappears and
+the session trades twice instead of three times. Download the SimLab dataset
+with `feed="sip"` and all four changes match the notebook minute for minute
+and dwell for dwell; `simlab.data` keeps the two tapes as separate stores for
+exactly this reason. A comparison against the notebook that does not check
+which feed the dataset holds is not a comparison of the rules.
 
 What the model actually does
 ----------------------------

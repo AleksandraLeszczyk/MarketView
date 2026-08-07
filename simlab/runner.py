@@ -27,6 +27,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 
+from simlab import data as sim_data  # noqa: E402
 from simlab import experiments  # noqa: E402
 from simlab import judge as sim_judge  # noqa: E402
 from simlab import prompts as sim_prompts  # noqa: E402
@@ -58,9 +59,12 @@ def run_experiment(experiment_id: str) -> dict:
         max_cycles_per_day=int(cfg["max_cycles_per_day"]),
         system_prompt_override=cfg.get("system_prompt_override"),
         rule_config=cfg.get("rule_config"),
+        # Records queued before the feed was tracked carry no `feed`, and IEX
+        # is what they ran on -- it was the downloader's only option.
+        feed=cfg.get("feed") or sim_data.LEGACY_FEED,
     )
     rule_based = is_rule_based(config.personality)
-    market = SimMarket(config.symbols, days)
+    market = SimMarket(config.symbols, days, config.feed)
     engine = SimulationEngine(market, config, progress=_progress)
     result = engine.run()
     _progress(

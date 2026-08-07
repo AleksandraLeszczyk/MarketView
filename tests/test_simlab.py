@@ -124,6 +124,302 @@ class TestDatasetStore:
         assert sim_data.get_dataset("wk") is None
 
 
+class TestFeedIsPartOfTheData:
+    """`iex` and `sip` are different bars for the same day, not two routes to
+    one answer -- one venue against the consolidated tape. Keying the store on
+    (symbol, day) alone made a `sip` request silently reuse `iex` bars, which
+    is how a run reproduces a study's dataset but not its trades."""
+
+    def _fetchers(self, monkeypatch, calls):
+        def fake_minute(symbol, day, key, secret, feed="iex"):
+            calls.append((day, feed))
+            # A thin feed is a different tape, not a scaled one: different
+            # closes, and here one bar fewer.
+            n = 3 if feed == "iex" else 5
+            open_utc = OPEN_UTC + timedelta(days=(day - DAY).days)
+            return [_bar(open_utc + timedelta(minutes=i),
+                         100.0 + i + (0.5 if feed == "iex" else 0.0)) for i in range(n)]
+
+        monkeypatch.setattr(sim_data, "fetch_minute_bars_day", fake_minute)
+        monkeypatch.setattr(sim_data, "fetch_news_day", lambda *a, **k: [])
+        monkeypatch.setattr(
+            sim_data, "fetch_daily_bars_range", lambda *a, **k: [_bar(OPEN_UTC, 99.0)]
+        )
+        monkeypatch.setattr(
+            sim_data, "fetch_market_indicator_closes",
+            lambda *a, **k: {"spy": [], "vix": [], "vix3m": []},
+        )
+
+    def test_the_two_feeds_are_stored_side_by_side(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        day = date(2026, 6, 16)
+
+        sim_data.create_dataset("d-iex", ["TEST"], day, day, "k", "s", feed="iex")
+        sim_data.create_dataset("d-sip", ["TEST"], day, day, "k", "s", feed="sip")
+
+        # The crux: the second request downloads rather than reusing the first.
+        assert calls == [(day, "iex"), (day, "sip")]
+        assert sim_data.bars_path("TEST", day, "iex") != sim_data.bars_path("TEST", day, "sip")
+        assert len(sim_data.load_day_bars("TEST", day, "iex")) == 3
+        assert len(sim_data.load_day_bars("TEST", day, "sip")) == 5
+
+    def test_coverage_answers_per_feed(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        day = date(2026, 6, 16)
+        sim_data.create_dataset("d-iex", ["TEST"], day, day, "k", "s", feed="iex")
+
+        assert sim_data.coverage(["TEST"], day, day, "iex")[day.isoformat()]["TEST"]
+        assert not sim_data.coverage(["TEST"], day, day, "sip")[day.isoformat()]["TEST"]
+
+    def test_the_dataset_records_the_tape_it_holds(self, store, monkeypatch):
+        self._fetchers(monkeypatch, [])
+        day = date(2026, 6, 16)
+        ds = sim_data.create_dataset("d-sip", ["TEST"], day, day, "k", "s", feed="sip")
+        assert ds.feed == "sip"
+        assert sim_data.get_dataset("d-sip").feed == "sip"
+
+    def test_an_unknown_feed_is_refused_before_anything_downloads(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        with pytest.raises(ValueError, match="unknown feed"):
+            sim_data.create_dataset(
+                "d", ["TEST"], DAY, DAY, "k", "s", feed="consolidated"
+            )
+        assert calls == []
+
+    def test_days_stored_before_feeds_were_tracked_still_load_as_iex(self, store):
+        """The fixture writes through the feed-scoped path, so this writes the
+        pre-feed layout by hand -- that is what every day downloaded before
+        this change looks like, and it must not force a re-download."""
+        day = date(2026, 6, 18)
+        sim_data._write_gz(
+            sim_data._legacy_bars_path("TEST", day), [_bar(OPEN_UTC, 101.0)]
+        )
+        assert len(sim_data.load_day_bars("TEST", day, "iex")) == 1
+        assert sim_data.coverage(["TEST"], day, day, "iex")[day.isoformat()]["TEST"]
+        # ...and is never mistaken for the consolidated tape it is not.
+        assert sim_data.load_day_bars("TEST", day, "sip") == []
+        assert not sim_data.coverage(["TEST"], day, day, "sip")[day.isoformat()]["TEST"]
+
+    def test_a_manifest_entry_without_a_feed_reads_as_iex(self, store):
+        sim_data.MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sim_data.MANIFEST_PATH.write_text(json.dumps([{
+            "name": "old", "symbols": ["TEST"], "start": "2026-06-15",
+            "end": "2026-06-15", "created_at": "", "days": ["2026-06-15"],
+        }]))
+        assert sim_data.get_dataset("old").feed == "iex"
+
+    def test_the_simulation_reads_the_tape_its_dataset_names(self, store, monkeypatch):
+        """The whole point of threading the feed through: a run on `sip` must
+        see `sip` bars, not whichever tape happened to be downloaded first."""
+        self._fetchers(monkeypatch, [])
+        day = date(2026, 6, 16)
+        for feed in ("iex", "sip"):
+            sim_data.create_dataset(f"d-{feed}", ["TEST"], day, day, "k", "s", feed=feed)
+
+        t = OPEN_UTC + timedelta(days=1, minutes=1)
+        assert SimMarket(["TEST"], [day], "iex").price_at("TEST", t) == 100.5
+        assert SimMarket(["TEST"], [day], "sip").price_at("TEST", t) == 100.0
+        assert SimMarket(["TEST"], [day], "sip").feed == "sip"
+
+    def test_the_run_record_states_which_tape_produced_it(self, store, monkeypatch):
+        self._fetchers(monkeypatch, [])
+        day = date(2026, 6, 16)
+        sim_data.create_dataset("d-sip", ["TEST"], day, day, "k", "s", feed="sip")
+        market = SimMarket(["TEST"], [day], "sip")
+        config = SimulationConfig(
+            personality=TRADER_BY_CHATGPT_KEY, provider=RULE_PROVIDER, model="rules",
+            api_key="", symbols=["TEST"], days=[day], feed="sip",
+        )
+        result = SimulationEngine(market, config).run()
+        assert result.config_summary["feed"] == "sip"
+
+
+class TestMinuteBarsComeFromYfinance:
+    """New datasets are consolidated-tape yfinance bars, not Alpaca IEX.
+
+    IEX is one venue (~4% of the tape); yfinance is the consolidated tape and
+    the same source the live volume tools read, so a simulated volume ratio is
+    like-for-like with the live one. The Alpaca feeds stay reachable for the
+    datasets already downloaded on them.
+    """
+
+    def _fake_yfinance(self, monkeypatch, frame, captured=None):
+        """Install a stand-in yfinance module for `_yf_frame`'s local import."""
+        import sys
+
+        def fake_download(symbol, **kwargs):
+            if captured is not None:
+                captured.append({"symbol": symbol, **kwargs})
+            return frame
+
+        monkeypatch.setitem(
+            sys.modules, "yfinance", SimpleNamespace(download=fake_download)
+        )
+
+    def _minute_frame(self, rows):
+        """rows: [(ET "HH:MM", close, volume)] -> a yfinance-shaped frame."""
+        import pandas as pd
+
+        index = pd.to_datetime(
+            [f"2026-06-15 {hhmm}" for hhmm, _, _ in rows]
+        ).tz_localize("America/New_York").tz_convert("UTC")
+        return pd.DataFrame(
+            {
+                "Open": [c for _, c, _ in rows],
+                "High": [c for _, c, _ in rows],
+                "Low": [c for _, c, _ in rows],
+                "Close": [c for _, c, _ in rows],
+                "Volume": [v for _, _, v in rows],
+            },
+            index=index,
+        )
+
+    def test_the_default_feed_is_yfinance(self):
+        assert sim_data.DEFAULT_FEED == "yfinance"
+        assert "yfinance" in sim_data.FEEDS
+        # ...and the pre-feed store layout is still read as the IEX it is.
+        assert sim_data.LEGACY_FEED == "iex"
+
+    def test_a_minute_day_is_fetched_from_yahoo_with_extended_hours(self, monkeypatch):
+        captured = []
+        self._fake_yfinance(
+            monkeypatch, self._minute_frame([("09:30", 100.0, 5000.0)]), captured
+        )
+
+        bars = sim_data.fetch_minute_bars_day("TEST", DAY)
+
+        assert len(captured) == 1
+        call = captured[0]
+        assert call["symbol"] == "TEST"
+        assert call["interval"] == "1m"
+        # prepost is the difference between the stored 04:00-20:00 window and
+        # the regular session alone.
+        assert call["prepost"] is True
+        assert bars == [{
+            "t": "2026-06-15T13:30:00Z", "o": 100.0, "h": 100.0,
+            "l": 100.0, "c": 100.0, "v": 5000.0,
+        }]
+
+    def test_no_alpaca_credentials_are_needed(self, monkeypatch):
+        """The signature keeps key/secret for the Alpaca feeds, but the
+        default path must not require them -- the datasets tab lets them be
+        blank now."""
+        self._fake_yfinance(monkeypatch, self._minute_frame([("09:30", 100.0, 1.0)]))
+
+        def no_alpaca(*a, **k):
+            raise AssertionError("the yfinance feed must not call Alpaca")
+
+        monkeypatch.setattr(sim_data, "_paged_get", no_alpaca)
+        assert len(sim_data.fetch_minute_bars_day("TEST", DAY)) == 1
+
+    def test_extended_hours_bars_are_kept_despite_zero_volume(self, monkeypatch):
+        """Yahoo serves real, moving prices before 09:30 but reports every one
+        of those minutes at volume 0. Dropping them on that basis would cut the
+        stored day down to the regular session and blind every pre-market read."""
+        self._fake_yfinance(monkeypatch, self._minute_frame([
+            ("04:00", 99.0, 0.0),
+            ("04:01", 99.4, 0.0),
+            ("09:30", 100.0, 5000.0),
+            ("18:00", 101.0, 0.0),
+        ]))
+
+        bars = sim_data.fetch_minute_bars_day("TEST", DAY)
+
+        assert [b["c"] for b in bars] == [99.0, 99.4, 100.0, 101.0]
+        assert [b["v"] for b in bars] == [0.0, 0.0, 5000.0, 0.0]
+
+    def test_a_minute_with_no_price_at_all_is_dropped(self, monkeypatch):
+        frame = self._minute_frame([("09:30", 100.0, 10.0), ("09:31", 101.0, 10.0)])
+        frame.iloc[1, :] = float("nan")
+        self._fake_yfinance(monkeypatch, frame)
+
+        assert [b["t"] for b in sim_data.fetch_minute_bars_day("TEST", DAY)] == [
+            "2026-06-15T13:30:00Z"
+        ]
+
+    def test_bars_carry_no_vwap_field(self, monkeypatch):
+        """Yahoo publishes no per-bar VWAP. Downstream (`analyze_intraday`,
+        the chart's VWAP line) branches on the key's presence, so omitting it
+        loses the VWAP note; inventing one would make it wrong instead."""
+        self._fake_yfinance(monkeypatch, self._minute_frame([("09:30", 100.0, 10.0)]))
+        assert "vw" not in sim_data.fetch_minute_bars_day("TEST", DAY)[0]
+
+    def test_a_day_outside_yahoos_window_is_empty_not_an_error(self, monkeypatch):
+        """Yahoo refuses 1-minute data older than 30 days; the fetch returns
+        the same "nothing for this day" a holiday gives, which create_dataset
+        already handles."""
+        self._fake_yfinance(monkeypatch, None)
+        assert sim_data.fetch_minute_bars_day("TEST", date(2020, 1, 6)) == []
+
+    def test_a_new_dataset_is_stored_under_the_yfinance_feed(self, store, monkeypatch):
+        calls = []
+
+        def fake_minute(symbol, day, key="", secret="", feed=sim_data.DEFAULT_FEED):
+            calls.append((day, feed))
+            return [_bar(OPEN_UTC + timedelta(days=(day - DAY).days), 100.0)]
+
+        monkeypatch.setattr(sim_data, "fetch_minute_bars_day", fake_minute)
+        monkeypatch.setattr(sim_data, "fetch_daily_bars_range", lambda *a, **k: [])
+        monkeypatch.setattr(
+            sim_data, "fetch_market_indicator_closes",
+            lambda *a, **k: {"spy": [], "vix": [], "vix3m": []},
+        )
+        day = date(2026, 6, 16)
+
+        ds = sim_data.create_dataset("yf", ["TEST"], day, day)
+
+        assert ds.feed == "yfinance"
+        assert calls == [(day, "yfinance")]
+        assert sim_data.bars_path("TEST", day, "yfinance").exists()
+        # The same day on the Alpaca tape is a different file and still absent.
+        assert not sim_data.bars_path("TEST", day, "iex").exists()
+
+    def test_the_thirty_day_horizon_is_announced_before_downloading(self, store, monkeypatch):
+        """A day Yahoo won't serve stores empty, which on disk is
+        indistinguishable from a holiday -- so say it up front."""
+        monkeypatch.setattr(sim_data, "fetch_minute_bars_day", lambda *a, **k: [])
+        monkeypatch.setattr(sim_data, "fetch_daily_bars_range", lambda *a, **k: [])
+        monkeypatch.setattr(
+            sim_data, "fetch_market_indicator_closes",
+            lambda *a, **k: {"spy": [], "vix": [], "vix3m": []},
+        )
+        old = date.today() - timedelta(days=sim_data.YF_MINUTE_WINDOW_DAYS + 5)
+        messages = []
+
+        sim_data.create_dataset("old", ["TEST"], old, old, progress=messages.append)
+
+        assert any("30 days" in m and m.startswith("warning") for m in messages)
+
+    def test_the_alpaca_feeds_still_require_credentials(self, store, monkeypatch):
+        monkeypatch.setattr(
+            sim_data, "fetch_minute_bars_day",
+            lambda *a, **k: pytest.fail("must not download without credentials"),
+        )
+        with pytest.raises(ValueError, match="Alpaca credentials"):
+            sim_data.create_dataset("d", ["TEST"], DAY, DAY, feed="iex")
+
+    def test_news_is_skipped_rather_than_failing_without_credentials(self, store, monkeypatch):
+        """News is Alpaca-only; a credential-free yfinance dataset has none."""
+        monkeypatch.setattr(
+            sim_data, "fetch_news_day",
+            lambda *a, **k: pytest.fail("must not reach Alpaca news without credentials"),
+        )
+        monkeypatch.setattr(sim_data, "fetch_minute_bars_day", lambda *a, **k: [])
+        monkeypatch.setattr(sim_data, "fetch_daily_bars_range", lambda *a, **k: [])
+        monkeypatch.setattr(
+            sim_data, "fetch_market_indicator_closes",
+            lambda *a, **k: {"spy": [], "vix": [], "vix3m": []},
+        )
+        day = date(2026, 6, 16)
+
+        sim_data.create_dataset("yf", ["TEST"], day, day)
+
+        assert sim_data.load_news("TEST", day) == []
+
+
 def _tool_call(call_id, name, arguments):
     return SimpleNamespace(
         id=call_id, function=SimpleNamespace(name=name, arguments=json.dumps(arguments))
