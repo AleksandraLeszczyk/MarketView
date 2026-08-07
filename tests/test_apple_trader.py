@@ -77,6 +77,7 @@ class Reads:
         change: bool = False,
         proba: "float | None" = None,
         turn_proba: "float | None" = None,
+        reversal_proba: "float | None" = None,
         pre_dwell: "int | None" = 20,
         bars_in_regime: int = 20,
         bars_today: int = 200,
@@ -103,6 +104,7 @@ class Reads:
             "bars_in_regime": bars_in_regime,
             "proba": proba,
             "turn_proba": turn_proba,
+            "reversal_proba": reversal_proba,
             "bars_today": bars_today,
             "warming_up": warming_up,
         }
@@ -527,8 +529,14 @@ class TestTrailingStop:
     def test_momentum_turning_negative_does_not_close_the_position(
         self, state, market_open, monkeypatch
     ):
-        """Only price decides the exit. The model called the entry; it gets no
-        vote on the way out, and neither does the regime it predicted."""
+        """The regime *having* turned is not an exit -- only price and the
+        model's forecast are, and this bar carries neither.
+
+        Momentum that has already gone negative is exactly the give-back the
+        trailing stop is measuring, so acting on it as well would be the same
+        rule twice at a worse level. What the forecast exit acts on is the bar
+        *before* this one, which is the whole distinction (see TestReversalExit).
+        """
         broker = FakeBroker(100.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         reads = Reads(monkeypatch, broker)
@@ -564,6 +572,154 @@ class TestTrailingStop:
         assert trader.entry["peak"] == pytest.approx(100.0)
         reads.set(price=99.4)
         assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
+
+
+def reversal_config(**kwargs) -> AppleTraderConfig:
+    """A rule set whose forecast exit is armed, on the `confirm` entry so the
+    position can be taken with one scripted bar."""
+    kwargs.setdefault("reversal_threshold", 0.30)
+    return confirm_config(**kwargs)
+
+
+class TestReversalExit:
+    """The second exit: the model calling the end of the regime it bought.
+
+    The stub supplies `reversal_proba` the way `read_latest` does -- filled in
+    only on a positive bar reached while holding, and None everywhere else --
+    so these pin the rule without depending on a 200 MB forecaster.
+    """
+
+    def test_sells_when_the_forecast_clears_the_threshold(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = _enter(state, tracker, reads, reversal_config(trail_pct=5.0))
+
+        reads.set(price=101.0, reversal_proba=0.29)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
+        reads.set(price=101.0, reversal_proba=0.30)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "Forecast reversal" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_sells_at_the_high_before_any_give_back(
+        self, state, market_open, monkeypatch
+    ):
+        """The point of the rule: out while the trade is still at its peak,
+        which the trailing stop can never do by construction."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = _enter(state, tracker, reads, reversal_config(trail_pct=0.5))
+
+        reads.set(price=103.0, reversal_proba=0.9)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "+3.00%" in reasoning and "90%" in reasoning
+
+    def test_off_by_default_for_records_that_never_had_it(
+        self, state, market_open, monkeypatch
+    ):
+        """`reversal_threshold=None` is the pre-existing strategy exactly: the
+        forecast is ignored however loud it gets."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = _enter(
+            state, tracker, reads, confirm_config(trail_pct=5.0, reversal_threshold=None)
+        )
+
+        reads.set(price=101.0, reversal_proba=0.99)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) > 0
+
+    def test_an_unasked_model_is_not_a_sell(self, state, market_open, monkeypatch):
+        """`read_latest` leaves the number None on any bar that does not pose
+        the question. An absent probability is not a quiet zero *or* a quiet
+        yes -- it is a bar with nothing to say."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = _enter(state, tracker, reads, reversal_config(trail_pct=5.0))
+
+        reads.set(price=101.0, reversal_proba=None)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) > 0
+
+    def test_the_trailing_stop_still_wins_a_bar_they_both_fire_on(
+        self, state, market_open, monkeypatch
+    ):
+        """Both exits close the position, so the only thing at stake is the
+        ledger's account of why -- and a give-back that actually happened is a
+        better explanation than a forecast that agreed with it."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch, broker)
+        trader = _enter(state, tracker, reads, reversal_config(trail_pct=0.5))
+
+        reads.set(price=99.0, reversal_proba=0.99)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
+        assert "Trailing stop" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_question_is_only_asked_while_holding(
+        self, state, market_open, monkeypatch
+    ):
+        """Every ask costs a full forecast and nothing acts on the answer with
+        the book flat, so `run_cycle` must not pay for it when it is not long."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        asked: list[bool] = []
+        monkeypatch.setattr(
+            at.persistence_model, "minute_frame", lambda *a, **k: pd.DataFrame({"x": [1]})
+        )
+        reads = Reads(monkeypatch, broker)
+
+        def spy(bundle, frame, holding=False):
+            asked.append(holding)
+            return reads.next_read
+
+        monkeypatch.setattr(at.persistence_model, "read_latest", spy)
+        trader = AppleTrader(reversal_config(trail_pct=5.0), model_threshold=0.07)
+
+        reads.set(price=100.0)  # flat
+        trader.run_cycle(BUNDLE, state, tracker)
+        reads.to_positive(proba=0.9, price=100.0)
+        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
+        reads.set(price=101.0)  # long
+        trader.run_cycle(BUNDLE, state, tracker)
+        assert asked == [False, False, True]
+
+    def test_a_disarmed_rule_never_pays_for_the_forecast(
+        self, state, market_open, monkeypatch
+    ):
+        """Holding is not enough: with the rule off the question is pointless,
+        and asking it would make switching the rule off cost the same as
+        leaving it on."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        asked: list[bool] = []
+        monkeypatch.setattr(
+            at.persistence_model, "minute_frame", lambda *a, **k: pd.DataFrame({"x": [1]})
+        )
+        reads = Reads(monkeypatch, broker)
+
+        def spy(bundle, frame, holding=False):
+            asked.append(holding)
+            return reads.next_read
+
+        monkeypatch.setattr(at.persistence_model, "read_latest", spy)
+        trader = _enter(
+            state, tracker, reads, confirm_config(trail_pct=5.0, reversal_threshold=None)
+        )
+        reads.set(price=101.0)
+        trader.run_cycle(BUNDLE, state, tracker)
+        assert asked == [False, False]
+
+    def test_an_out_of_range_threshold_is_refused(self):
+        with pytest.raises(ValueError, match="not a probability"):
+            AppleTraderConfig(reversal_threshold=1.5)
 
 
 class TestGuards:
@@ -622,6 +778,33 @@ class TestGuards:
             for e in state.agent_log
         )
 
+    def test_the_reversal_exit_on_a_model_that_cannot_forecast_stops_the_loop(
+        self, state, monkeypatch
+    ):
+        """Quieter than the entry version and caught for the same reason: the
+        run would trade normally and exit everything on the trailing stop,
+        which is indistinguishable from a rule that just never triggered."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        monkeypatch.setattr(at.apple_models, "load", lambda key: BUNDLE)
+        config = confirm_config(model_key="persistence", reversal_threshold=0.3)
+        at._apple_trader_loop(state, tracker, config, 60, threading.Event())
+        assert state.agent_running is False
+        assert any(
+            "cannot forecast the breakdown" in e.get("text", "") and e["type"] == "error"
+            for e in state.agent_log
+        )
+
+    def test_clearing_the_reversal_exit_lets_that_model_run(self, state, monkeypatch):
+        """The classifier is not disqualified -- only that one rule is."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        monkeypatch.setattr(at.apple_models, "load", lambda key: BUNDLE)
+        config = confirm_config(model_key="persistence", reversal_threshold=None)
+        assert at.config_error(config, BUNDLE) is None
+        stop = threading.Event()
+        stop.set()
+        at._apple_trader_loop(state, tracker, config, 60, stop)
+        assert not any(e["type"] == "error" for e in state.agent_log)
+
     def test_the_loop_loads_the_model_the_config_names(self, state, monkeypatch):
         """A config naming an unavailable model stops on *that* model rather
         than quietly running the one that happens to be loadable."""
@@ -651,6 +834,22 @@ class TestConfigSignature:
             confirm_config(prob_threshold=0.2, trail_pct=0.5)
         )
         assert base == config_signature(AppleTraderConfig(prob_threshold=0.2, trail_pct=0.5))
+
+    def test_arming_the_reversal_exit_is_a_new_configuration(self):
+        off = config_signature(AppleTraderConfig(prob_threshold=0.2, reversal_threshold=None))
+        armed = config_signature(AppleTraderConfig(prob_threshold=0.2, reversal_threshold=0.3))
+        assert off != armed
+        assert "rev>=0.3" in armed
+        # Retuning it is a new configuration too.
+        assert armed != config_signature(
+            AppleTraderConfig(prob_threshold=0.2, reversal_threshold=0.4)
+        )
+
+    def test_a_rule_set_without_it_signs_as_it_always_did(self):
+        """Runs recorded before this exit existed and runs configured without
+        it now are the same strategy, so Results must go on grouping them."""
+        off = config_signature(AppleTraderConfig(prob_threshold=0.2, reversal_threshold=None))
+        assert off == "nbeats_AAPL(anticipate,p>=0.2,trail=0.5%,size=95%)"
 
     def test_an_unset_threshold_names_the_model_that_supplies_it(self):
         config = AppleTraderConfig(prob_threshold=None)

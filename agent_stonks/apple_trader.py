@@ -36,10 +36,90 @@ The rules
   The one thing that overrides a signal either way is the clock: no position is
   opened inside the closing flatten window, because a long the next rule is
   about to shut is not a trade, it is two commissions.
-* SELL when price has fallen `trail_pct` below the highest price seen since the
-  entry. The peak ratchets up and never down, so the rule is a trailing stop
-  that starts `trail_pct` under the entry and turns into a profit lock as the
-  move runs.
+* SELL on either of two triggers, whichever comes first:
+
+  - **the trailing stop**: price has fallen `trail_pct` below the highest price
+    seen since the entry. The peak ratchets up and never down, so the rule
+    starts `trail_pct` under the entry and turns into a profit lock as the move
+    runs.
+  - **the forecast reversal** (`reversal_threshold`, None to switch it off):
+    the model puts the positive regime at that probability or better of
+    flipping to **negative** somewhere inside its 15-bar forecast horizon.
+
+  The two are deliberately different kinds of rule. The trailing stop is
+  backward-looking and unconditional: it waits for the give-back to actually
+  happen, and it is the only thing that can save a position the model is wrong
+  about. The reversal exit is the same forecast the entry was taken on, read in
+  the other direction -- it can leave while price is still at its high, which
+  is the entire point, and it can also be wrong in the one way the stop cannot
+  be, by selling a move that goes on without it. Neither subsumes the other,
+  so both run and either one closes the book.
+
+Why the reversal exit asks about *negative* and not "no longer positive"
+------------------------------------------------------------------------
+A regime that fades from positive to balanced is the ordinary shape of a move
+pausing; the Schmitt trigger's whole purpose is that `mom` dropping below
+`exit_threshold` is not the same event as it crossing `-enter_threshold`.
+Selling on the fade would exit most winners mid-move and duplicate what the
+trailing stop already does more cheaply. Selling on the flip is a claim the
+model is uniquely placed to make and that price has not made yet.
+
+The flip is checked anywhere inside the horizon rather than on the next bar,
+because positive to negative in one bar requires momentum to fall from above
+`exit_threshold` to below `-enter_threshold` at once -- a rule asking only
+about the next bar would essentially never fire. That makes the threshold the
+only thing standing between "the model sees some risk" and a sell, and unlike
+`prob_threshold` it has no notebook behind it: nothing in TimeToChange2 ever
+grid-searched an exit. `config.APPLE_TRADER_REVERSAL_THRESHOLD` carries the
+measurement the shipped default was picked from.
+
+What the rule actually fires on
+-------------------------------
+Worth being blunt about, because the name oversells it. Across five AAPL
+sessions (2026-07-27 SIP, 2026-08-03..06 yfinance) there are 21 positive-regime
+runs and **not one of them ends in negative** -- every single one decays to
+balanced first. On this tape the literal event the rule is named after does not
+happen.
+
+What the number is doing, then, is reading the lower tail of the forecast fan:
+it rises when enough sampled futures fall far enough to cross `-enter_threshold`
+that the regime is visibly fragile, and empirically those are the bars near the
+end of the run. Over 428 held bars it separates "within 3 bars of the run
+ending" from "8+ bars still to go" at 0.89 AUC, and at the shipped 0.30 it
+fires about twice a session with 55% of those firings landing near the end,
+against a 14.7% base rate.
+
+So read it as **an early warning that the positive regime is running out**, not
+as a prediction that price is about to trend down. That is still the useful
+thing for an exit -- the alternative framing, "will the regime stop being
+positive", scores a higher 0.955 AUC and is completely unusable as a rule,
+because 62% of all held bars clear 0.5 on it. Fading to balanced is what a move
+does constantly; it is not news. The strict definition is narrow on purpose,
+and its narrowness is what makes a threshold mean something.
+
+And whether it makes money is, so far, unknown
+----------------------------------------------
+Being able to see the run ending is not the same as being paid for it, and the
+only A/B run to date does not show that it is. Same model, same
+`anticipate,p>=0.05,trail=0.5%` rules, the exit off and then on:
+
+    2026-07-27 (SIP, 1 session)      off +0.140%   0.30 +0.042%   0.20 +0.293%
+    2026-08-03..06 (yf, 4 sessions)  off -0.577%   0.30 -0.637%   0.20 -0.818%
+
+Six round trips and twelve. That is noise, and it is quoted here so nobody
+reads the 0.89 AUC above as a result about P&L -- the rule demonstrably fires
+where it is supposed to and has not yet been shown to help. The mechanism it
+loses on is visible in the trades: selling early frees the book, and a freed
+book takes the *next* entry, so an exit change rewrites the rest of the
+session's trades rather than just closing one of them earlier. That cuts both
+ways and neither way is measured yet. `reversal_threshold=None` is a real
+setting, not a legacy path, for exactly this reason.
+
+Like `anticipate`, this rule is a question about a bar that is not a regime
+change, so only a forecasting model can be asked it; pairing it with the
+incumbent classifier fails at launch (`reversal_exit_error`) rather than
+holding every position to the trailing stop and looking like a rule that simply
+never triggered.
 
 Why `anticipate` is the default
 -------------------------------
@@ -78,7 +158,10 @@ launch (`entry_mode_error`) rather than producing an empty ledger.
 
 Nothing else closes the position except the closing bell: momentum, regimes and
 every feature the model uses are intraday and do not survive the overnight gap,
-so the book is flattened `flatten_before_close_min` before the close.
+so the book is flattened `flatten_before_close_min` before the close. That last
+rule is also why the reversal exit is not asked to look further than it does --
+a warning about a flip fifteen bars out is worth acting on at 11:00 and is
+nearly moot at 15:50.
 
 Against the notebook
 --------------------
@@ -93,10 +176,12 @@ in the notebook, which only ever scores change bars.
 
 Two differences remain, deliberately:
 
-* the **exit** is a trailing stop, where the notebook sells when actual
-  momentum drops below a level. Different rule, different holding times -- and
-  because a held position blocks the next entry, that alone can change which
-  later signals become trades.
+* the **exit**. The notebook sells when *actual* momentum drops below a level.
+  Here a trailing stop does that job on price, and -- when it is armed -- the
+  reversal rule does something the notebook has no analogue for: it sells on
+  *forecast* momentum, before the level is reached. Different rules, different
+  holding times, and because a held position blocks the next entry, that alone
+  can change which later signals become trades.
 * the **fill**. The notebook decides at the close of bar *t* and fills at the
   open of bar *t+1*; live there is no such price to wait for, so this loop
   sends a market order as soon as the bar closes.
@@ -131,8 +216,19 @@ effect and a small one -- see `apple_models` for what choosing it does and does
 not buy.
 
 Either way the entry is best read as "a to-positive change the model did not
-veto", and the exit does not lean on the model at all -- once the position is
-on, only price decides when it comes off.
+veto".
+
+The exit is where that reading matters most, because the reversal rule leans on
+the model in a way nothing else here does. Every AUC quoted above is measured on
+the *entry* question -- does a change into positive persist -- scored on regime
+change bars. The reversal rule asks a question no fold ever scored: on an
+ordinary positive bar, does this regime flip negative. It is the same forecast
+underneath, so it inherits the ensemble's honest 15-bar skill, but "the
+forecaster is better than chance at ranking to-positive changes" is not evidence
+that it times exits. Whether this exit beats holding to the trailing stop is an
+open question, and SimLab is where it gets answered -- run the same dataset with
+`reversal_threshold` set and cleared and compare, which is exactly what
+`config_signature` keeps as two configurations.
 """
 
 from __future__ import annotations
@@ -154,6 +250,7 @@ from .config import (
     APPLE_TRADER_MODEL,
     APPLE_TRADER_POSITION_PCT,
     APPLE_TRADER_PROB_THRESHOLD,
+    APPLE_TRADER_REVERSAL_THRESHOLD,
     APPLE_TRADER_TRAIL_PCT,
 )
 from .decisions import DecisionTracker
@@ -206,9 +303,9 @@ ENTRY_MODE_PROB_LABEL = {
 
 @dataclass
 class AppleTraderConfig:
-    """Tunables of the loop. `entry_mode`, `model_key`, `prob_threshold` and
-    `trail_pct` are the four that change what it does; the rest are sizing and
-    housekeeping."""
+    """Tunables of the loop. `entry_mode`, `model_key`, `prob_threshold`,
+    `trail_pct` and `reversal_threshold` are the five that change what it does;
+    the rest are sizing and housekeeping."""
 
     # Which saved model answers the entry question -- a key of
     # `apple_models.MODELS`.
@@ -221,6 +318,13 @@ class AppleTraderConfig:
     # which is the only setting that means the same thing across models.
     prob_threshold: Optional[float] = APPLE_TRADER_PROB_THRESHOLD
     trail_pct: float = APPLE_TRADER_TRAIL_PCT
+    # The second exit: sell when the forecaster puts the positive regime at
+    # this probability or better of flipping to negative. None switches the
+    # rule off and leaves the trailing stop as the only way out, which is what
+    # every run before this setting existed did -- and the only thing a
+    # non-forecasting model can do, checked before the loop starts by
+    # `reversal_exit_error`.
+    reversal_threshold: Optional[float] = APPLE_TRADER_REVERSAL_THRESHOLD
     position_pct: float = APPLE_TRADER_POSITION_PCT
     flatten_before_close_min: int = APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN
 
@@ -229,6 +333,16 @@ class AppleTraderConfig:
             raise ValueError(
                 f"unknown entry_mode {self.entry_mode!r}; expected one of {ENTRY_MODES}"
             )
+        if self.reversal_threshold is not None and not 0.0 <= self.reversal_threshold <= 1.0:
+            raise ValueError(
+                f"reversal_threshold {self.reversal_threshold!r} is not a probability; "
+                "pass None to switch the forecast exit off"
+            )
+
+    @property
+    def sells_on_reversal(self) -> bool:
+        """Whether the forecast exit is armed at all."""
+        return self.reversal_threshold is not None
 
 
 def config_signature(
@@ -245,13 +359,19 @@ def config_signature(
     threshold read without it is meaningless: the two models' scales are
     unrelated. The entry mode follows it because the same model answers a
     different question in each.
+
+    The forecast exit appears only when it is armed, so a rule set that does not
+    use it signs exactly as it did before the setting existed -- runs recorded
+    then and runs configured now really are the same strategy, and Results
+    should go on grouping them together.
     """
     c = config or AppleTraderConfig()
     threshold = c.prob_threshold if c.prob_threshold is not None else model_threshold
     shown = f"{threshold:g}" if threshold is not None else "model"
+    reversal = f",rev>={c.reversal_threshold:g}" if c.sells_on_reversal else ""
     return (
         f"{apple_models.get(c.model_key).key}_{TICKER}({c.entry_mode},p>={shown},"
-        f"trail={c.trail_pct:g}%,size={c.position_pct:g}%)"
+        f"trail={c.trail_pct:g}%{reversal},size={c.position_pct:g}%)"
     )
 
 
@@ -270,12 +390,49 @@ def entry_mode_error(config: AppleTraderConfig, bundle: "dict | None") -> "str |
     if persistence_model.anticipates(bundle):
         return None
     model = apple_models.get(config.model_key)
-    forecasters = ", ".join(m.label for m in apple_models.MODELS.values() if m.anticipates)
     return (
         f"{model.label} cannot forecast a regime change that has not happened yet, "
         f"so it cannot run the '{ENTRY_ANTICIPATE}' entry. Either switch the model "
-        f"({forecasters}) or switch the entry to '{ENTRY_CONFIRM}'."
+        f"({_forecasters()}) or switch the entry to '{ENTRY_CONFIRM}'."
     )
+
+
+def reversal_exit_error(config: AppleTraderConfig, bundle: "dict | None") -> "str | None":
+    """Why the forecast exit cannot run on this bundle, or None if it can.
+
+    The same shape of mistake `entry_mode_error` catches, on the way out
+    instead of the way in: a positive bar that is not a regime change is not a
+    question the incumbent classifier was fitted to answer. Left unchecked it
+    would fail even more quietly than the entry version -- `read_latest` leaves
+    `reversal_proba` as None, the exit reads None as "keep holding", and the
+    run finishes with a full ledger of trades that all exited on the trailing
+    stop, which is indistinguishable from the rule simply never triggering.
+    """
+    if not config.sells_on_reversal:
+        return None
+    if persistence_model.forecasts_reversal(bundle):
+        return None
+    model = apple_models.get(config.model_key)
+    return (
+        f"{model.label} cannot forecast the breakdown of a regime, so it cannot run "
+        f"the reversal exit. Either switch the model ({_forecasters()}) or clear the "
+        f"reversal threshold and exit on the trailing stop alone."
+    )
+
+
+def config_error(config: AppleTraderConfig, bundle: "dict | None") -> "str | None":
+    """The first reason this rule set cannot run on this bundle, or None.
+
+    One call for every caller that is about to start a run, so a rule added
+    later is checked everywhere it needs to be rather than in whichever launch
+    path was remembered.
+    """
+    return entry_mode_error(config, bundle) or reversal_exit_error(config, bundle)
+
+
+def _forecasters() -> str:
+    """The models that can answer a question about a bar that is not a change."""
+    return ", ".join(m.label for m in apple_models.MODELS.values() if m.anticipates)
 
 
 class AppleTrader:
@@ -300,6 +457,14 @@ class AppleTrader:
         threshold = self.config.prob_threshold
         return self.model_threshold if threshold is None else threshold
 
+    @property
+    def reversal_threshold(self) -> float:
+        """The forecast exit's cut-off. Only read behind `sells_on_reversal`,
+        which is what makes the fallback unreachable rather than a default
+        anybody trades on -- there is no model-chosen cut-off to fall back to
+        here, because no notebook ever fitted one for an exit."""
+        return self.config.reversal_threshold or 1.0
+
     # --- one cycle --------------------------------------------------------
 
     def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
@@ -317,8 +482,18 @@ class AppleTrader:
             )
             return "closed"
 
+        position = tracker.position_for(TICKER)
         frame = persistence_model.minute_frame(sym_state)
-        read = persistence_model.read_latest(bundle, frame) if len(frame) else None
+        # The reversal question costs a full forecast on every bar it is asked
+        # on, and only an open position can act on the answer -- so it is asked
+        # only when both are true.
+        read = (
+            persistence_model.read_latest(
+                bundle, frame, holding=position > 0 and self.config.sells_on_reversal
+            )
+            if len(frame)
+            else None
+        )
         if read is None:
             # Either the frame is too short to run the pipeline at all, or the
             # newest bar has no momentum yet -- the trailing window needs the
@@ -329,7 +504,6 @@ class AppleTrader:
             )
             return "no_data"
 
-        position = tracker.position_for(TICKER)
         fresh_bar = read["ts"] != self.last_bar_ts
         if fresh_bar:
             self.last_bar_ts = read["ts"]
@@ -397,6 +571,19 @@ class AppleTrader:
         proba = self._entry_probability(read)
         return proba is not None and proba >= self.prob_threshold
 
+    def _reversal_signal(self, read: dict) -> bool:
+        """Whether the model is calling the end of the regime on this bar.
+
+        `reversal_proba` is filled in only where the question was both armed
+        and applicable -- a positive regime, an open position, a forecasting
+        model -- so an absent number is a bar with nothing to say rather than a
+        quiet no, exactly as on the entry side.
+        """
+        if not self.config.sells_on_reversal:
+            return False
+        proba = read["reversal_proba"]
+        return proba is not None and proba >= self.reversal_threshold
+
     def _closing_soon(self) -> bool:
         """Whether the flatten-before-close rule is already in force."""
         to_close = market_hours.seconds_to_close()
@@ -405,7 +592,14 @@ class AppleTrader:
     # --- the check on an open position -------------------------------------
 
     def _exit_reason(self, read: dict) -> "str | None":
-        """Why this long should be closed on this bar, or None to keep holding."""
+        """Why this long should be closed on this bar, or None to keep holding.
+
+        Three ways out, checked in the order of how little discretion they
+        leave. The trailing stop is a fact about price and comes first. The
+        forecast reversal is a prediction and comes second, so a bar where both
+        fire is reported as the stop it actually was. The closing bell is last
+        because it is not about this position at all.
+        """
         entry = self.entry or {}
         entry_price = entry.get("price") or 0.0
         peak = entry.get("peak") or entry_price
@@ -418,6 +612,17 @@ class AppleTrader:
                 f"Trailing stop: ${price:,.2f} is {drawdown_pct:+.2f}% off the ${peak:,.2f} "
                 f"high since the ${entry_price:,.2f} entry, past the "
                 f"{self.config.trail_pct:.2f}% give-back. Selling at market ({pnl_pct:+.2f}%)."
+            )
+
+        if self._reversal_signal(read):
+            return (
+                f"Forecast reversal: the momentum regime is still "
+                f"{persistence_model.regime_name(read['regime'])} (momentum "
+                f"{read['mom']:+.2f}, {read['bars_in_regime']} bars in), but the model puts "
+                f"it at {read['reversal_proba']:.0%} (>= {self.reversal_threshold:.0%}) to "
+                f"flip negative inside the forecast horizon. Selling into the regime the "
+                f"trade was taken on rather than waiting for the give-back "
+                f"({pnl_pct:+.2f}%)."
             )
 
         if self._closing_soon():
@@ -523,6 +728,9 @@ class AppleTrader:
             )
         if read["warming_up"]:
             parts.append(f"warming up ({read['bars_today']} bars) -- not trading")
+        reversal = read["reversal_proba"]
+        if reversal is not None:
+            parts.append(f"flips negative {reversal:.0%} vs {self.reversal_threshold:.0%}")
         if position > 0 and self.entry:
             entry_price = self.entry["price"]
             pnl = (read["price"] / entry_price - 1) * 100 if entry_price else 0.0
@@ -588,7 +796,7 @@ def _apple_trader_loop(
         state.agent_running = False
         return
 
-    mismatch = entry_mode_error(config, bundle)
+    mismatch = config_error(config, bundle)
     if mismatch is not None:
         _log(state, {"type": "error", "text": mismatch})
         scoring.end_session(state, tracker)
@@ -597,6 +805,12 @@ def _apple_trader_loop(
 
     trader = AppleTrader(config, model_threshold=persistence_model.model_threshold(bundle))
     metrics = bundle.get("metrics") or {}
+    exit_rule = f"a {config.trail_pct:.2f}% trailing stop from the high since entry"
+    if config.sells_on_reversal:
+        exit_rule += (
+            f", or on the model putting the regime at {trader.reversal_threshold:.0%} "
+            "or better to flip negative"
+        )
     _log(
         state,
         {
@@ -606,8 +820,8 @@ def _apple_trader_loop(
                 f"{bundle.get('trained_at', 'unknown')}, held-out AUC "
                 f"{metrics.get('roc_auc', float('nan')):.2f}): watching every {TICKER} minute "
                 f"bar for a regime change into positive momentum, buying one the model rates "
-                f"at least {trader.prob_threshold:.0%} likely to persist, and exiting on a "
-                f"{config.trail_pct:.2f}% trailing stop from the high since entry."
+                f"at least {trader.prob_threshold:.0%} likely to persist, and exiting on "
+                f"{exit_rule}."
             ),
         },
     )

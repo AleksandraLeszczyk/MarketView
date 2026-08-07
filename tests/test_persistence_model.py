@@ -373,6 +373,86 @@ class TestAnticipationRead:
         assert bundle.turn_calls == []
 
 
+class ReversalStubBundle(TurnStubBundle):
+    """A forecasting bundle that answers the exit question too."""
+
+    def __init__(self, proba: float = 0.8, turn: float = 0.3, reversal: float = 0.6):
+        super().__init__(proba, turn)
+        self.reversal_calls: list = []
+
+        def score_reversal(X):
+            self.reversal_calls.append(np.asarray(X))
+            return np.full(len(X), reversal)
+
+        self["score_reversal"] = score_reversal
+
+
+class TestReversalRead:
+    """The third question: asked on a positive bar, and only while holding."""
+
+    def _positive_bar(self):
+        frame = _session()
+        scored = pm.add_momentum_regimes(frame, PARAMS)
+        change_ts = scored[scored["regime_change"] & (scored["regime"] == 1)].index[0]
+        after = frame.index[frame.index.get_loc(change_ts) + 1]
+        return frame.loc[:after]
+
+    def test_a_held_positive_bar_gets_the_reversal_question(self):
+        bundle = ReversalStubBundle()
+        read = pm.read_latest(bundle, self._positive_bar(), holding=True)
+        assert read["regime"] == 1
+        assert read["reversal_proba"] == pytest.approx(0.6)
+        assert bundle.reversal_calls[-1].shape == (1, 20, 25)
+
+    def test_the_same_bar_is_not_asked_with_the_book_flat(self):
+        """Every ask costs a full forecast and nothing acts on the answer when
+        there is no position, so the default must not pay for it."""
+        bundle = ReversalStubBundle()
+        read = pm.read_latest(bundle, self._positive_bar())
+        assert read["regime"] == 1
+        assert read["reversal_proba"] is None
+        assert bundle.reversal_calls == []
+
+    def test_a_non_positive_bar_is_never_asked(self):
+        """The question is about leaving a positive regime; a bar that is not
+        in one has not posed it, holding or not."""
+        bundle = ReversalStubBundle()
+        frame = _session()
+        scored = pm.add_momentum_regimes(frame, PARAMS)
+        balanced = scored[scored["regime"] != 1].index[-1]
+
+        read = pm.read_latest(bundle, frame.loc[:balanced], holding=True)
+        assert read["regime"] != 1
+        assert read["reversal_proba"] is None
+        assert bundle.reversal_calls == []
+
+    def test_the_change_bar_poses_the_entry_and_exit_questions_at_once(self):
+        """Entering on the anticipated turn means holding into the bar the
+        change prints on -- a bar that is both a to-positive change and a
+        position to manage. The two questions are about different things and
+        both get asked."""
+        bundle = ReversalStubBundle()
+        frame = _session()
+        scored = pm.add_momentum_regimes(frame, PARAMS)
+        change_ts = scored[scored["regime_change"] & (scored["regime"] == 1)].index[0]
+
+        read = pm.read_latest(bundle, frame.loc[:change_ts], holding=True)
+        assert read["to_positive"]
+        assert read["proba"] == pytest.approx(0.8)
+        assert read["reversal_proba"] == pytest.approx(0.6)
+        assert read["turn_proba"] is None
+
+    def test_a_classifier_is_never_asked_it(self):
+        bundle = StubBundle()
+        assert not pm.forecasts_reversal(bundle)
+        read = pm.read_latest(bundle, self._positive_bar(), holding=True)
+        assert read["reversal_proba"] is None
+
+    def test_asking_a_model_that_cannot_answer_raises(self):
+        with pytest.raises(ValueError, match="cannot forecast the breakdown"):
+            pm.predict_reversal_proba(StubBundle(), np.zeros((1, 20, 25), dtype=np.float32))
+
+
 class TestBundle:
     def test_the_path_is_overridable_by_environment(self, monkeypatch):
         assert pm.model_path().name == "apple_momentum_2.joblib"

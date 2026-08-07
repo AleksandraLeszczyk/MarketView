@@ -290,9 +290,13 @@ def _render_apple_rules() -> None:
         "the notebook's rule, and it is structurally late — the momentum score has "
         "already crossed its threshold by then, so the fill lands after the move that "
         "produced the signal.\n"
-        "- **Sell** when price falls **the trailing stop** below the highest price seen "
-        "since the entry. The peak only ratchets up, so the rule starts as a stop under "
-        "the entry and becomes a profit lock as the move runs.\n"
+        "- **Sell** on either of two triggers. Price falling **the trailing stop** below "
+        "the highest price seen since the entry — the peak only ratchets up, so the rule "
+        "starts as a stop under the entry and becomes a profit lock as the move runs. Or, "
+        "if it is armed, **the forecast reversal**: the model putting the positive regime "
+        "at the configured probability or better of flipping negative, which can close the "
+        "position while price is still at its high. The stop waits for the give-back; the "
+        "reversal acts before it.\n"
         "- Nothing else closes the position but the closing bell: every feature the model "
         "uses is intraday, so the book is flattened before the close rather than carried "
         "overnight.\n\n"
@@ -1090,12 +1094,13 @@ def _render_apple_params() -> AppleTraderConfig:
     defaults = AppleTraderConfig()
     with st.expander("Apple Trader rules", expanded=True):
         st.caption(
-            "Four knobs decide everything: **when** the saved model is asked about a "
-            "regime change, which model is asked, how sure it has to be, and how much of "
-            "the run the trade gives back before selling. Each distinct rule set is "
-            "tracked as its own configuration in Results, so moving the entry, swapping "
-            "the model or retuning the stop is a new test rather than a repeat of one "
-            "already run."
+            "Five knobs decide everything: **when** the saved model is asked about a "
+            "regime change, which model is asked, how sure it has to be, how much of "
+            "the run the trade gives back before selling, and whether the model also "
+            "gets to call the exit. Each distinct rule set is tracked as its own "
+            "configuration in Results, so moving the entry, swapping the model, "
+            "retuning the stop or arming the reversal exit is a new test rather than a "
+            "repeat of one already run."
         )
         entry_mode = st.segmented_control(
             "Entry", ENTRY_MODES, default=defaults.entry_mode,
@@ -1160,11 +1165,44 @@ def _render_apple_params() -> AppleTraderConfig:
             "Position size (% of cash)", min_value=1.0, max_value=100.0,
             value=defaults.position_pct, step=5.0, key="sim_apple_size",
         )
+
+        # The second exit, and the one most worth an A/B here: run the same
+        # dataset with it on and off and the two land in Results as separate
+        # configurations, which is the comparison nothing has made yet.
+        sells_on_reversal = col_b.checkbox(
+            "Also sell on a forecast reversal",
+            value=defaults.sells_on_reversal and model.anticipates,
+            disabled=not model.anticipates,
+            key=f"sim_apple_reversal_on_{model_key}",
+            help="Closes the position when the model puts the positive regime at the "
+                 "probability below or better of flipping negative — while price may "
+                 "still be at its high, rather than waiting for the trailing stop's "
+                 "give-back. Only a forecasting model can be asked.",
+        )
+        reversal_threshold = col_b.number_input(
+            "Reversal probability to sell", min_value=0.0, max_value=1.0,
+            value=float(defaults.reversal_threshold or 0.30), step=0.05, format="%.2f",
+            disabled=not sells_on_reversal, key="sim_apple_reversal",
+            help="Over five AAPL sessions this separates bars within three of a positive "
+                 "run's end from bars with 8+ to go at 0.89 AUC, and the cut-off picks "
+                 "where to sit on it: 0.20 fires on 11% of held bars, 0.30 on 2.6%, 0.40 "
+                 "on 0.9%, with about half of each landing near the end against a 15% "
+                 "base rate. It fires in the right places; whether that pays is untested "
+                 "— A/B-ing those same sessions moved them +0.14%→+0.04% and "
+                 "−0.58%→−0.64%, which is noise on 6 and 12 round trips. No notebook ever "
+                 "tuned an exit, so this is the thing most worth sweeping here.",
+        )
+        if not model.anticipates:
+            st.caption(
+                f"{model.label} cannot forecast the breakdown of a regime, so the "
+                "trailing stop is the only exit available to it."
+            )
     return AppleTraderConfig(
         model_key=str(model_key),
         entry_mode=str(entry_mode),
         prob_threshold=float(prob_threshold),
         trail_pct=float(trail_pct),
+        reversal_threshold=float(reversal_threshold) if sells_on_reversal else None,
         position_pct=float(position_pct),
     )
 

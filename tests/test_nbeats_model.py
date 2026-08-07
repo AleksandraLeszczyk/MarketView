@@ -210,6 +210,21 @@ class TestBundle:
         with pytest.raises(ValueError, match="expected sequences"):
             pm.predict_turn_proba(BUNDLE, np.zeros((1, 19, len(pm.FEATURE_COLUMNS))))
 
+    def test_the_forecaster_answers_the_exit_question_too(self):
+        X = self._anticipation_window(1.0, 40.0)
+        proba = pm.predict_reversal_proba(BUNDLE, X)
+        assert proba.shape == (1,)
+        assert 0.0 <= proba[0] <= 1.0
+        assert proba[0] == pytest.approx(pm.predict_reversal_proba(BUNDLE, X)[0])
+
+    def test_the_exit_question_carries_no_dwell_gate(self):
+        """A dwell that would zero the entry questions leaves this one alone:
+        a position taken on the turn is holding a young regime by design."""
+        assert pm.predict_reversal_proba(BUNDLE, self._anticipation_window(1.0, 4.0))[0] > 0.0
+
+    def test_a_bar_that_is_not_positive_is_not_asked(self):
+        assert pm.predict_reversal_proba(BUNDLE, self._anticipation_window(0.0, 40.0))[0] == 0.0
+
 
 class TestTurnProbability:
     """The forward-shifted twin of `persistence_probability`: the anchor bar is
@@ -248,6 +263,55 @@ class TestTurnProbability:
     def test_a_horizon_too_short_to_decide_raises(self):
         with pytest.raises(ValueError, match="too short"):
             nb.turn_probability(self._paths([1.2] * 10), 0, 40, MOMENTUM, 15)
+
+
+class TestReversalProbability:
+    """The exit question: anchored on a positive bar, does the regime flip
+    negative inside the horizon."""
+
+    def _paths(self, *rows) -> np.ndarray:
+        return np.asarray([list(rows)], dtype=float)
+
+    def test_a_path_that_crashes_through_the_band_counts(self):
+        # From +1 the trigger leaves below `exit_` and lands on -1 directly
+        # when the same bar is also below `-enter`.
+        out = nb.reversal_probability(self._paths([1.2] * 5 + [-1.5] * 10), 1, MOMENTUM)
+        assert out["p_reversal"][0] == pytest.approx(1.0)
+        assert out["expected_bars_to_reversal"][0] == pytest.approx(6.0)
+
+    def test_a_path_that_only_fades_to_balanced_does_not(self):
+        """The distinction the whole rule rests on: a move pausing is not a
+        move reversing, and only the second is news the trailing stop does not
+        already have."""
+        out = nb.reversal_probability(self._paths([1.2] * 5 + [0.0] * 10), 1, MOMENTUM)
+        assert out["p_reversal"][0] == 0.0
+        assert out["expected_bars_to_reversal"][0] == pytest.approx(16.0)
+
+    def test_a_slow_decline_through_neutral_still_counts(self):
+        """Reaching negative by way of balanced is a reversal too -- what is
+        excluded is stopping there, not passing through."""
+        paths = self._paths([1.2, 0.6, 0.2, -0.3, -0.7] + [-1.4] * 10)
+        out = nb.reversal_probability(paths, 1, MOMENTUM)
+        assert out["p_reversal"][0] == pytest.approx(1.0)
+        assert out["expected_bars_to_reversal"][0] == pytest.approx(6.0)
+
+    def test_the_probability_is_the_fraction_of_futures_that_flip(self):
+        paths = np.asarray([[[-1.5] * 15, [1.2] * 15, [-1.5] * 15, [0.0] * 15]])
+        assert nb.reversal_probability(paths, 1, MOMENTUM)["p_reversal"][0] == pytest.approx(0.5)
+
+    def test_there_is_no_dwell_gate(self):
+        """A position entered on the turn holds a regime a few bars old by
+        construction, so the gate the entry questions carry would switch this
+        rule off exactly when it is needed."""
+        out = nb.reversal_probability(self._paths([-1.5] * 15), 1, MOMENTUM)
+        assert out["p_reversal"][0] == pytest.approx(1.0)
+        assert "pre_dwell_gate" not in out
+
+    def test_a_short_horizon_is_accepted(self):
+        """Unlike the other two this decides nothing about survival, so there
+        is no minimum length below which the answer is meaningless."""
+        out = nb.reversal_probability(self._paths([-1.5] * 3), 1, MOMENTUM)
+        assert out["p_reversal"][0] == pytest.approx(1.0)
 
 
 class TestAppleModelsRegistry:

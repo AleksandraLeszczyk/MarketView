@@ -90,13 +90,46 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 # uses the cut-off the chosen model picked on its own validation block, which is
 # the intended setting because those cut-offs are not on a shared scale (0.07
 # for the classifier's posterior, 0.05 for N-BEATS' gated survival
-# probability). TRAIL_PCT is the whole exit rule: sell once price is that far
-# below the highest price seen since the entry.
+# probability).
+#
+# There are two exits, and either one closes the position. TRAIL_PCT is the
+# price rule: sell once price is that far below the highest price seen since
+# the entry. REVERSAL_THRESHOLD is the model rule: sell once the forecaster
+# puts the positive regime at that probability or better of flipping to
+# negative inside its 15-bar horizon -- the trailing stop waits for the
+# give-back to happen, this one acts on the same forecast the entry was taken
+# on. None switches it off, which is the only setting the incumbent classifier
+# can run: like "anticipate", it is a question about bars that are not regime
+# changes, so only a forecaster can be asked it.
+#
+# 0.30 is NOT a tuned number -- nothing in TimeToChange2 ever grid-searched an
+# exit -- but it is not a guess either. Over 428 positive-regime bars on five
+# AAPL sessions (2026-07-27 SIP, 2026-08-03..06 yfinance) the reversal
+# probability separates bars within 3 of the end of a positive run from bars
+# with 8+ bars still to go at AUC 0.89, and the cut-off picks where on that
+# curve to sit:
+#
+#     >= 0.20   11.2% of held bars (~10/session)   52% land near the run's end
+#     >= 0.30    2.6% of held bars (~2/session)    55%
+#     >= 0.40    0.9% of held bars (~1/session)    75%
+#
+# against a 14.7% base rate. 0.30 is the knee: a few signals a session at ~3.7x
+# base-rate precision, well past the 0.21 ninetieth percentile of the whole
+# distribution, so it stays an outlier rather than becoming a second trailing
+# stop. Lower exits earlier and far more often; much above 0.40 the rule stops
+# firing at all.
+#
+# That the rule fires in the right places is measured. That it *helps* is not:
+# A/B-ing those same five sessions moved the SIP day +0.140% -> +0.042% and the
+# four-day yfinance run -0.577% -> -0.637%, i.e. nothing either way on six and
+# twelve round trips. Sweep it in SimLab before trusting it, and treat None as
+# a live option rather than the old behaviour.
 APPLE_TRADER_ENTRY_MODE = "anticipate"
 APPLE_TRADER_MODEL = "nbeats"
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_PROB_THRESHOLD: "float | None" = None
 APPLE_TRADER_TRAIL_PCT = 0.5
+APPLE_TRADER_REVERSAL_THRESHOLD: "float | None" = 0.30
 APPLE_TRADER_POSITION_PCT = 95.0
 # Flatten this many minutes before the close: momentum, regimes and the model's
 # whole feature set are intraday, and none of it survives the overnight gap.

@@ -750,12 +750,23 @@ class TestRuleAgentEngine:
         config = agent.from_record({"prob_threshold": 0.5})
         assert (config.model_key, config.entry_mode) == ("persistence", "confirm")
         assert config.prob_threshold == pytest.approx(0.5)
+        # The trailing stop was the only exit then, so replaying such a record
+        # must not sell on a forecast the run it describes never consulted.
+        assert config.reversal_threshold is None
+        assert not config.sells_on_reversal
 
         # A record that does name them is taken at its word.
         newer = agent.from_record(
             {"prob_threshold": 0.5, "entry_mode": "anticipate", "model_key": "nbeats"}
         )
         assert (newer.model_key, newer.entry_mode) == ("nbeats", "anticipate")
+
+    def test_the_reversal_exit_survives_a_round_trip_through_the_record(self):
+        agent = rule_agent(APPLE_TRADER_KEY)
+        armed = AppleTraderConfig(model_key="nbeats", reversal_threshold=0.3)
+        assert agent.from_record(agent.to_record(armed)).reversal_threshold == pytest.approx(0.3)
+        off = AppleTraderConfig(model_key="nbeats", reversal_threshold=None)
+        assert agent.from_record(agent.to_record(off)).reversal_threshold is None
 
 
 class TestTraderByChatGPTEngine:

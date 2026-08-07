@@ -1586,8 +1586,8 @@ def _agent_report_section(symbols: list[str]) -> None:
 
 def _apple_trader_params() -> AppleTraderConfig:
     """Apple Trader's tunables: when it asks the model about a regime change,
-    which model answers, how sure it has to be, and how much of the run to give
-    back."""
+    which model answers, how sure it has to be, how much of the run to give
+    back, and whether the model gets a say in the exit too."""
     defaults = AppleTraderConfig()
     with st.expander("Apple Trader rules", expanded=True):
         entry_mode = st.segmented_control(
@@ -1615,9 +1615,11 @@ def _apple_trader_params() -> AppleTraderConfig:
             + ("" if apple_models.get(key).anticipates else " — cannot anticipate"),
             key="apple_trader_model",
             help=(
-                "Which saved TimeToChange2 model answers the entry question. The rules "
-                "around it are identical either way — same bars, same 20-bar window, same "
-                "trailing stop."
+                "Which saved TimeToChange2 model answers the questions. The rules around "
+                "it are identical either way — same bars, same 20-bar window, same "
+                "trailing stop — but only a forecasting model can be asked the two that "
+                "are about bars which are not regime changes: anticipating the entry, and "
+                "calling the exit."
             ),
         )
         model = apple_models.get(model_key)
@@ -1674,11 +1676,52 @@ def _apple_trader_params() -> AppleTraderConfig:
             step=5.0,
             key="apple_trader_position_pct",
         )
+
+        # The second exit. Off for a model that cannot forecast, since the
+        # question is about bars that are not regime changes -- the same reason
+        # such a model cannot anticipate.
+        sells_on_reversal = c2.checkbox(
+            "Also sell on a forecast reversal",
+            value=defaults.sells_on_reversal and model.anticipates,
+            disabled=not model.anticipates,
+            key=f"apple_trader_reversal_on_{model_key}",
+            help=(
+                "The trailing stop waits for the give-back to happen. This sells while "
+                "price may still be at its high, on the model's own forecast that the "
+                "positive regime is about to break down — the same forecast the entry was "
+                "taken on, read the other way. Only a forecasting model can be asked."
+            ),
+        )
+        reversal_threshold = c2.number_input(
+            "Reversal probability to sell",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(defaults.reversal_threshold or 0.30),
+            step=0.05,
+            format="%.2f",
+            disabled=not sells_on_reversal,
+            key="apple_trader_reversal",
+            help=(
+                "How much of the forecast has to fall into negative territory before the "
+                "position is closed. Measured over five AAPL sessions: 0.20 fires on ~11% "
+                "of held bars, 0.30 on ~2.6%, 0.40 on ~0.9%. Roughly half of those "
+                "firings land within three bars of the positive run ending, against a "
+                "15% base rate — a real signal, and a thin one. Whether acting on it "
+                "pays is untested: on those same sessions it moved the result by less "
+                "than the noise. Nothing validated this cut-off; sweep it in SimLab."
+            ),
+        )
+        if not model.anticipates:
+            st.caption(
+                f"{model.label} cannot forecast the breakdown of a regime, so the "
+                "trailing stop is the only exit available to it."
+            )
     return AppleTraderConfig(
         model_key=str(model_key),
         entry_mode=str(entry_mode),
         prob_threshold=float(prob_threshold),
         trail_pct=float(trail_pct),
+        reversal_threshold=float(reversal_threshold) if sells_on_reversal else None,
         position_pct=float(position_pct),
     )
 
@@ -1740,9 +1783,11 @@ def _agent_panel(
                 f"{APPLE_TRADER_TICKER} bar that just closed and asks the saved model "
                 "chosen below one question about the momentum regime — by default, "
                 "whether a regime that is still balanced or negative is about to turn "
-                "positive — and buys if it says yes. The position is then sold purely "
-                "on price: a trailing stop the configured percentage below the highest "
-                f"price seen since the entry. It trades {APPLE_TRADER_TICKER} only — "
+                "positive — and buys if it says yes. The position comes off on a "
+                "trailing stop the configured percentage below the highest price seen "
+                "since the entry, or — if the forecast exit is armed — as soon as the "
+                "model expects that regime to flip negative, which can be well before "
+                f"price gives anything back. It trades {APPLE_TRADER_TICKER} only — "
                 "that is the one symbol the model was fitted on. The provider/model "
                 "settings below do not apply to it."
             )

@@ -27,7 +27,7 @@ from agent_stonks.apple_trader import (
     ENTRY_CONFIRM,
     AppleTrader,
     AppleTraderConfig,
-    entry_mode_error,
+    config_error,
 )
 from agent_stonks.apple_trader import TICKER as APPLE_TRADER_TICKER
 from agent_stonks.apple_trader import config_signature as apple_config_signature
@@ -106,7 +106,7 @@ def _build_apple(config: AppleTraderConfig) -> _BundleBound:
     bundle = apple_models.load(config.model_key)
     if bundle is None:
         raise RuntimeError(apple_models.unavailable_reason(config.model_key))
-    mismatch = entry_mode_error(config, bundle)
+    mismatch = config_error(config, bundle)
     if mismatch is not None:
         raise RuntimeError(mismatch)
     return _BundleBound(
@@ -128,7 +128,15 @@ def _apple_signature(config: AppleTraderConfig) -> str:
 # key has to decode to the behaviour of the day it was written -- not to
 # today's default, which would silently replay a record under a different
 # strategy and file it in Results beside the original as though it matched.
-_APPLE_LEGACY = {"model_key": "persistence", "entry_mode": ENTRY_CONFIRM}
+_APPLE_LEGACY = {
+    "model_key": "persistence",
+    "entry_mode": ENTRY_CONFIRM,
+    # Before this key existed the trailing stop was the only exit, so a record
+    # without it describes a run that did not sell on a forecast reversal --
+    # replaying it under today's default would file a different strategy in
+    # Results beside the original.
+    "reversal_threshold": None,
+}
 
 
 def _apple_from_record(raw: "dict | None") -> AppleTraderConfig:

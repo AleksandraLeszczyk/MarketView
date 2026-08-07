@@ -585,6 +585,38 @@ def predict_turn_proba(bundle: dict, X) -> np.ndarray:
     return np.asarray(bundle["score_turn"](X), dtype=float)
 
 
+def forecasts_reversal(bundle: "dict | None") -> bool:
+    """Whether this bundle can be asked when a positive regime will break down.
+
+    The exit-side twin of `anticipates`, and true for the same reason: only a
+    model that produces future momentum can replay the trigger over it and see
+    the regime flip. The two are separate predicates rather than one
+    "is a forecaster" flag because they gate different rules -- Apple Trader's
+    entry mode and its forecast exit are configured independently, and a bundle
+    that grows one capability without the other should disable one rule, not
+    both.
+    """
+    return callable((bundle or {}).get("score_reversal"))
+
+
+def predict_reversal_proba(bundle: dict, X) -> np.ndarray:
+    """`P(the positive regime flips to negative inside the horizon)` for a batch.
+
+    Same shape contract as the other two scorers, and the same refusal to
+    substitute a different question's answer on a model that cannot be asked
+    this one.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim == 2:
+        X = X[None, ...]
+    expected = (int(bundle["seq_len"]), len(bundle["feature_columns"]))
+    if X.shape[1:] != expected:
+        raise ValueError(f"expected sequences of shape {expected}, got {X.shape[1:]}")
+    if not forecasts_reversal(bundle):
+        raise ValueError("this model cannot forecast the breakdown of a regime")
+    return np.asarray(bundle["score_reversal"](X), dtype=float)
+
+
 # --- the live minute grid ---------------------------------------------------
 
 def _frame_from_bars(bars: "list[dict]") -> pd.DataFrame:
@@ -641,29 +673,37 @@ def minute_frame(sym_state) -> pd.DataFrame:
     return live[live.index.date == today]
 
 
-def read_latest(bundle: dict, df: pd.DataFrame) -> "dict | None":
+def read_latest(bundle: dict, df: pd.DataFrame, holding: bool = False) -> "dict | None":
     """Score the newest bar of `df`: the regime it is in, whether it just
-    changed, and the model's probability for whichever of the two questions
-    that bar poses.
+    changed, and the model's probability for whichever question that bar poses.
 
     Returns `{"ts", "price", "high", "mom", "regime", "prev_regime",
     "regime_change", "to_positive", "pre_dwell", "bars_in_regime", "proba",
-    "turn_proba", "bars_today", "warming_up"}`, or None when the frame is too
-    short to score at all.
+    "turn_proba", "reversal_proba", "bars_today", "warming_up"}`, or None when
+    the frame is too short to score at all.
 
-    Two questions, and a bar is only ever one of them:
+    Three questions. The first two are about getting in, and a bar is only ever
+    one of them; the third is about getting out, and rides along with either:
 
-    `proba`      the bar IS a change into positive -- will the change hold?
-                 Consulted on exactly the bars TimeToChange2's own simulator
-                 consults it on (`mshift.backtest._signal_sequences`): a
-                 to-positive regime change with a complete, all-finite 20-bar
-                 feature window behind it, inside one session.
-    `turn_proba` the bar is NOT positive yet -- is it about to be? Only a
-                 forecasting bundle can answer this (see `anticipates`), so it
-                 is None on the incumbent classifier no matter which bar it is.
+    `proba`          the bar IS a change into positive -- will the change hold?
+                     Consulted on exactly the bars TimeToChange2's own simulator
+                     consults it on (`mshift.backtest._signal_sequences`): a
+                     to-positive regime change with a complete, all-finite
+                     20-bar feature window behind it, inside one session.
+    `turn_proba`     the bar is NOT positive yet -- is it about to be? Only a
+                     forecasting bundle can answer this (see `anticipates`), so
+                     it is None on the incumbent classifier no matter which bar
+                     it is.
+    `reversal_proba` the bar is positive and a position is open -- is the regime
+                     about to break down into negative? Asked only when
+                     `holding` is set, because it is the one question here with
+                     a price attached: it costs a full forecast on **every**
+                     bar it is asked on (there is no dwell gate to
+                     short-circuit, unlike the turn question), and nothing acts
+                     on it with the book flat. See `forecasts_reversal`.
 
-    Both are None wherever they do not apply -- an absent number rather than a
-    fabricated one -- which is what makes each entry mode's condition in
+    All three are None wherever they do not apply -- an absent number rather
+    than a fabricated one -- which is what makes each rule's condition in
     `apple_trader` a plain "is this number there and big enough".
 
     `warming_up` reports the opening window `mshift.momentum.build_events`
@@ -688,18 +728,25 @@ def read_latest(bundle: dict, df: pd.DataFrame) -> "dict | None":
 
     # A bar is either a completed to-positive change (the persistence
     # question) or one that has not turned positive yet (the anticipation
-    # question) -- never both, and never neither.
+    # question) -- never both, and never neither. The reversal question is
+    # orthogonal to that split: it is about the position rather than the entry,
+    # so a change-into-positive bar reached while already long poses it *and*
+    # the persistence question at once.
     ask_turn = regime != 1 and anticipates(bundle)
-    proba = turn_proba = None
-    if to_positive or ask_turn:
+    ask_reversal = holding and regime == 1 and forecasts_reversal(bundle)
+    proba = turn_proba = reversal_proba = None
+    if to_positive or ask_turn or ask_reversal:
         sequence = build_sequence(
             compute_features(scored), bundle["feature_columns"], int(bundle["seq_len"])
         )
         if sequence is not None:
+            batch = sequence[None, ...]
             if to_positive:
-                proba = float(predict_proba(bundle, sequence[None, ...])[0])
-            else:
-                turn_proba = float(predict_turn_proba(bundle, sequence[None, ...])[0])
+                proba = float(predict_proba(bundle, batch)[0])
+            elif ask_turn:
+                turn_proba = float(predict_turn_proba(bundle, batch)[0])
+            if ask_reversal:
+                reversal_proba = float(predict_reversal_proba(bundle, batch)[0])
 
     prev = last["prev_regime"]
     return {
@@ -718,6 +765,7 @@ def read_latest(bundle: dict, df: pd.DataFrame) -> "dict | None":
         "bars_in_regime": int(last["bars_in_regime"]),
         "proba": proba,
         "turn_proba": turn_proba,
+        "reversal_proba": reversal_proba,
         "bars_today": int(last["bar_of_day"]) + 1,
         "warming_up": warming_up,
     }

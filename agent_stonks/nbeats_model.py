@@ -472,6 +472,63 @@ def turn_probability(
     }
 
 
+def reversal_probability(samples: np.ndarray, start_regime, momentum: dict) -> dict:
+    """`P(the positive regime the anchor sits in flips to negative)`.
+
+    The third question a momentum forecast can answer, and the one Apple
+    Trader's forecast exit is built on. `persistence_probability` and
+    `turn_probability` are both about *getting into* a positive regime -- one
+    scored on the change bar, one a bar early. This one is asked while the
+    position is already on: the anchor bar is positive, and the paths are
+    checked for the regime reaching **-1** anywhere inside the horizon.
+
+    Three things it deliberately does not do:
+
+    * **No dwell gate.** The other two carry `pre_dwell >= min_dwell` because
+      the persistence *label* requires it. There is no label here -- this is
+      the trigger replayed over forecast momentum and nothing else -- and a
+      gate would be actively wrong: a position entered on the turn is holding
+      a regime that is a handful of bars old by construction, which is exactly
+      when the gate would be closed.
+    * **Negative, not merely not-positive.** A path that fades from positive to
+      balanced does not count. Balanced is where a fading move sits for a few
+      bars before it either resumes or turns, and treating that as a sell
+      signal would exit most winners in the middle -- the trailing stop already
+      covers a move that simply stops working.
+    * **Anywhere in the horizon, not on the next bar.** Positive -> negative in
+      a single bar needs momentum to fall from above `exit_threshold` to below
+      `-enter_threshold` at once, which almost never happens; asking only about
+      the next bar would produce a rule that never fires. So the number is
+      "somewhere in the next `horizon` bars", and it is the threshold's job to
+      decide how much of that is worth acting on.
+
+    Returns `p_reversal` alongside `expected_bars_to_reversal`, the mean bar
+    index the flip lands on over the paths where it happens (`horizon + 1` where
+    none do), which is what makes a probability of 0.6 readable: sixty percent
+    of futures flipping two bars out and sixty percent flipping fourteen bars
+    out are not the same warning.
+    """
+    samples = np.asarray(samples, dtype=np.float64)
+    n, n_paths, horizon = samples.shape
+
+    states = forward_regime_path(
+        samples.reshape(n * n_paths, horizon),
+        np.repeat(np.asarray(start_regime), n_paths),
+        float(momentum["enter_threshold"]),
+        float(momentum["exit_threshold"]),
+    )
+    negative = states == -1
+    flips = negative.any(axis=1)
+    # argmax on a boolean row is the first True; rows with none are pushed past
+    # the horizon rather than reported as a flip on bar 0.
+    first = np.where(flips, negative.argmax(axis=1) + 1, horizon + 1)
+
+    return {
+        "p_reversal": flips.reshape(n, n_paths).mean(axis=1),
+        "expected_bars_to_reversal": first.reshape(n, n_paths).mean(axis=1),
+    }
+
+
 # --- loading -----------------------------------------------------------------
 
 def model_path() -> Path:
@@ -646,9 +703,38 @@ def load_bundle() -> "dict | None":
             out[open_gate] = np.clip(result["p_full"], 0.0, 1.0)
             return out
 
+        def score_reversal(X) -> np.ndarray:
+            """`(n, seq_len, n_features)` sequences -> P(flips to negative).
+
+            The exit half of the interface. Anchored on a bar whose regime is
+            positive, so it is asked only while a position is open -- and
+            unlike `score_turn` there is no gate to short-circuit on, because
+            the question has no observable pre-condition (see
+            `reversal_probability`). Every call forecasts.
+
+            Rows whose anchor is not positive come back 0: the question is
+            about leaving a positive regime, and a bar that is not in one has
+            not posed it. `read_latest` never asks on such a bar, so this is a
+            guard on direct callers rather than a path the agent takes.
+            """
+            X = np.asarray(X, dtype=np.float32)
+            if len(X) == 0:
+                return np.array([])
+            regime = np.rint(X[:, -1, i_regime]).astype(int)
+            positive = regime == 1
+            out = np.zeros(len(X), dtype=float)
+            if not positive.any():
+                return out
+            result = reversal_probability(
+                _sampled_paths(X[positive]), regime[positive], momentum
+            )
+            out[positive] = np.clip(result["p_reversal"], 0.0, 1.0)
+            return out
+
         bundle = {
             "score": score,
             "score_turn": score_turn,
+            "score_reversal": score_reversal,
             "feature_columns": feature_columns,
             "seq_len": seq_len,
             "horizon": horizon,
