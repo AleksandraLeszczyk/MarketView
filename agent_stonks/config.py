@@ -124,8 +124,33 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 # four-day yfinance run -0.577% -> -0.637%, i.e. nothing either way on six and
 # twelve round trips. Sweep it in SimLab before trusting it, and treat None as
 # a live option rather than the old behaviour.
+# The "dayrange" model is the odd one out and ignores everything above. It
+# forecasts where the whole session's high and low will land, once, at 9:35,
+# and the rules built on it are TimeToChange3 notebook 05's: two resting levels
+# a fixed number of average daily ranges below the predicted high H, with A the
+# 14-day average daily range in dollars.
+#
+#     buy_level  = H - BUY_K  * A
+#     sell_level = H - SELL_K * A
+#
+# 0.75 and 0.10 are the notebook's own settings, and they were specified rather
+# than fitted -- which is the honest reason to leave them alone here. Notebook
+# 05.9 swept both over five sessions: the week total peaks away from them, but
+# the *count* of profitable sessions is flat at three in five across the whole
+# region where the rule trades at all. Moving the levels changes the price paid
+# on the same winning days, not how often the rule is right, and the grid's
+# best cell beats the specified one without winning a single extra day. Five
+# sessions across a 195-cell grid is selection noise; sweep them in SimLab
+# before believing any peak.
+#
+# What the sweep does establish is the shape: out to a buy distance of about
+# 0.85 every session trades and deeper entries simply fill better; past 0.90
+# days start dropping out entirely and the totals turn erratic on a handful of
+# trades. 0.75 sits inside the first regime, on the rising part of it.
 APPLE_TRADER_ENTRY_MODE = "anticipate"
 APPLE_TRADER_MODEL = "nbeats"
+APPLE_TRADER_BUY_K = 0.75
+APPLE_TRADER_SELL_K = 0.10
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_PROB_THRESHOLD: "float | None" = None
 APPLE_TRADER_TRAIL_PCT = 0.5

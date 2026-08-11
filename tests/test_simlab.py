@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from agent_stonks import apple_models, clock, persistence_model
@@ -100,6 +101,41 @@ class TestMarket:
         steps = market.step_times(DAY)
         assert len(steps) == 60
         assert steps[0] == OPEN_UTC + timedelta(minutes=1)
+
+    def test_completed_daily_bars_stop_before_today(self, store):
+        """The stricter daily view, for callers that must never be able to
+        reach the simulated day's outcome. `daily_bars_at` appends a partial
+        row for today; this one appends nothing."""
+        market = SimMarket(["TEST"], [DAY])
+        t = OPEN_UTC + timedelta(minutes=10)
+        bars = market.completed_daily_bars("TEST", t)
+        assert all(str(b["t"])[:10] < "2026-06-15" for b in bars)
+        assert len(bars) == len(market.daily_bars_at("TEST", t)) - 1
+
+    def test_the_session_open_is_available_and_the_rest_of_that_row_is_not(self, store):
+        """The 9:30 auction print is fixed at the open, so reading it during
+        the simulated day is point-in-time honest -- unlike the high, low and
+        close of the same stored row, which are the day's outcome."""
+        stored = sim_data._read_gz(sim_data.daily_path("TEST"))
+        stored["bars"].append(_bar(datetime(2026, 6, 15, tzinfo=timezone.utc), 123.0))
+        sim_data._write_gz(sim_data.daily_path("TEST"), stored)
+        market = SimMarket(["TEST"], [DAY])
+
+        opening = market.session_open_price("TEST", OPEN_UTC + timedelta(minutes=10))
+        assert opening == pytest.approx(122.95)  # `_bar` sets o = close - 0.05
+        assert all(
+            str(b["t"])[:10] != "2026-06-15"
+            for b in market.completed_daily_bars("TEST", OPEN_UTC + timedelta(minutes=10))
+        )
+
+    def test_no_session_open_before_the_bell(self, store):
+        """Otherwise a pre-market cycle could read the auction that has not
+        happened yet."""
+        stored = sim_data._read_gz(sim_data.daily_path("TEST"))
+        stored["bars"].append(_bar(datetime(2026, 6, 15, tzinfo=timezone.utc), 123.0))
+        sim_data._write_gz(sim_data.daily_path("TEST"), stored)
+        market = SimMarket(["TEST"], [DAY])
+        assert market.session_open_price("TEST", OPEN_UTC - timedelta(minutes=5)) is None
 
 
 class TestDatasetStore:
@@ -769,6 +805,162 @@ class TestRuleAgentEngine:
         assert agent.from_record(agent.to_record(off)).reversal_threshold is None
 
 
+class TestDayRangeEngine:
+    """The day-range rules replayed end to end on the engine.
+
+    The forecast itself is stubbed -- `tests/test_dayrange_model.py` pins that
+    against the notebook -- so what this covers is the wiring: the strategy the
+    model selects, the levels working over a real stored tape, and the daily
+    history reaching the trader through the patched fetch rather than through
+    yfinance.
+    """
+
+    # 105.50 predicted high on a $4 average daily range puts the shipped
+    # 0.75 / 0.10 levels at 102.50 and 105.10, which the tape below crosses in
+    # that order.
+    FORECAST = {
+        "pred_high": 105.5, "pred_low": 99.0, "prev_avg": 102.0,
+        "adr14_abs": 4.0, "or_high": 104.1, "or_low": 103.9,
+    }
+
+    @pytest.fixture()
+    def dayrange_store(self, tmp_path, monkeypatch):
+        """A stored AAPL session that dips under the buy level and recovers
+        through the sell level: five flat opening minutes the forecast is built
+        on, a slide to 102.4, then a climb to 105.5."""
+        monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
+        monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
+        prices = (
+            [104.0] * 5
+            + [104.0 - 0.16 * (i + 1) for i in range(10)]   # down to ~102.4
+            + [102.4 + 0.20 * (i + 1) for i in range(16)]   # back up to ~105.6
+            + [105.0] * 5
+        )
+        bars = [
+            _bar(OPEN_UTC + timedelta(minutes=i), price, volume=1000.0 + 37 * (i % 13))
+            for i, price in enumerate(prices)
+        ]
+        sim_data._write_gz(sim_data.bars_path("AAPL", DAY), bars)
+        sim_data._write_gz(sim_data.daily_path("AAPL"), {
+            "symbol": "AAPL", "start": "2026-05-16", "end": "2026-06-15",
+            "bars": [
+                _bar(datetime(2026, 6, 15, tzinfo=timezone.utc) - timedelta(days=i), 99.0)
+                for i in range(30, 0, -1)
+            ],
+        })
+        return tmp_path
+
+    def _stub_model(self, monkeypatch) -> dict:
+        """The bundle and the forecast, replaced at the model module so the
+        registry, the config check and the trader all see the stub."""
+        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
+        bundle = {
+            "model": None, "metadata": {}, "daily_models": ["lgbm", "nbeats", "nhits"],
+            "opening_minutes": 5, "lookback": 32, "trained_at": "2026-08-10",
+        }
+        seen: dict = {}
+
+        def forecast(bundle_, history, opening, session_date, open_price=None):
+            seen["history"] = history
+            seen["opening"] = opening
+            seen["open_price"] = open_price
+            return dict(self.FORECAST)
+
+        monkeypatch.setattr(dayrange, "load_bundle", lambda: bundle)
+        monkeypatch.setattr(dayrange, "forecast_session", forecast)
+        return seen
+
+    def _run(self, monkeypatch, rule_config: "dict | None" = None):
+        seen = self._stub_model(monkeypatch)
+        rules = {"model_key": "dayrange", **(rule_config or {})}
+        market = SimMarket(["AAPL"], [DAY])
+        config = SimulationConfig(
+            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER,
+            model=config_signature(AppleTraderConfig(**rules)), api_key="",
+            symbols=["AAPL"], days=[DAY], starting_cash=10_000.0, rule_config=rules,
+        )
+        return seen, SimulationEngine(market, config).run()
+
+    def test_buys_the_dip_under_the_buy_level_and_sells_at_the_target(
+        self, dayrange_store, monkeypatch
+    ):
+        _, result = self._run(monkeypatch)
+        assert result.error is None
+        actions = [(d["action"], d["status"]) for d in result.decisions]
+        assert actions[:2] == [("buy", "filled"), ("sell", "filled")]
+        buy, sell = result.decisions[0], result.decisions[1]
+        assert "102.50" in buy["reasoning"]
+        assert "Target" in sell["reasoning"]
+        assert float(buy["price"]) <= 102.6
+        assert float(sell["price"]) >= 105.0
+        assert parse_ts(sell["ts"]) > parse_ts(buy["ts"])
+
+    def test_moving_the_levels_moves_the_fills(self, dayrange_store, monkeypatch):
+        """The two knobs are the strategy: a shallower buy distance enters
+        higher up the slide, and an earlier sell exits sooner."""
+        _, deep = self._run(monkeypatch)
+        _, shallow = self._run(monkeypatch, {"buy_k": 0.2, "sell_k": 0.05})
+        assert float(shallow.decisions[0]["price"]) > float(deep.decisions[0]["price"])
+        assert parse_ts(shallow.decisions[0]["ts"]) < parse_ts(deep.decisions[0]["ts"])
+
+    def test_the_daily_history_comes_from_the_dataset_not_the_network(
+        self, dayrange_store, monkeypatch
+    ):
+        """The model needs a year of daily bars, which live is a yfinance
+        download of the last 420 days -- wall-clock days, not simulated ones.
+        Inside a run it has to be the stored history, clipped."""
+        seen, result = self._run(monkeypatch)
+        assert result.error is None
+        history = seen["history"]
+        assert len(history) == 30
+        assert history.index.max() < pd.Timestamp("2026-06-15")
+
+    def test_the_forecast_is_built_on_the_first_five_stored_minutes(
+        self, dayrange_store, monkeypatch
+    ):
+        seen, _ = self._run(monkeypatch)
+        opening = seen["opening"]
+        assert len(opening) == 5
+        assert opening.index[0].strftime("%H:%M") == "09:30"
+        assert opening.index[-1].strftime("%H:%M") == "09:34"
+
+    def test_the_entry_mode_and_reversal_defaults_do_not_block_the_run(
+        self, dayrange_store, monkeypatch
+    ):
+        """A day-range record carries `anticipate` and a reversal threshold
+        because one dataclass serves both strategies. Neither means anything
+        here, and neither may stop the run the way they would on a classifier.
+        """
+        _, result = self._run(
+            monkeypatch, {"entry_mode": "anticipate", "reversal_threshold": 0.3}
+        )
+        assert result.error is None
+        assert [d for d in result.decisions if d["action"] == "buy"]
+
+    def test_a_missing_bundle_fails_loudly(self, dayrange_store, monkeypatch):
+        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
+        monkeypatch.setattr(dayrange, "load_bundle", lambda: None)
+        market = SimMarket(["AAPL"], [DAY])
+        config = SimulationConfig(
+            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
+            api_key="", symbols=["AAPL"], days=[DAY],
+            rule_config={"model_key": "dayrange"},
+        )
+        result = SimulationEngine(market, config).run()
+        error = result.error or ""
+        assert "timetochange3_dayrange_AAPL.joblib" in error
+        assert "PyTorch" in error
+
+    def test_the_strategy_leads_the_configuration_signature(self, dayrange_store, monkeypatch):
+        """Results groups on this string. A day-range run and a momentum run
+        are different strategies, not two settings of one."""
+        _, result = self._run(monkeypatch)
+        assert result.config_summary["rule_based"] is True
+        assert config_signature(
+            AppleTraderConfig(model_key="dayrange")
+        ).startswith("dayrange_AAPL(buy=")
+
+
 class TestTraderByChatGPTEngine:
     """The second rule agent replays on the same day loop as the first, with
     nothing to load behind it: the rules are the whole agent."""
@@ -1085,6 +1277,24 @@ class TestPatches:
             assert list(series["spy"].values) == [500.0, 501.0]
             assert float(series["vix"].iloc[-1]) == 15.0
         assert not clock.is_simulated()
+
+    def test_the_daily_history_a_session_model_reads_is_dataset_backed(self, store):
+        """Live this is a yfinance download of the last 420 days. Inside a
+        simulation it has to be the stored bars, clipped to the simulated day,
+        or a per-session model forecasts today off a history that runs to
+        wall-clock today."""
+        from agent_stonks import historical
+
+        stored = sim_data._read_gz(sim_data.daily_path("TEST"))
+        stored["bars"].append(_bar(datetime(2026, 6, 15, tzinfo=timezone.utc), 123.0))
+        sim_data._write_gz(sim_data.daily_path("TEST"), stored)
+
+        with simulation_context(SimMarket(["TEST"], [DAY])):
+            clock.set_simulated(OPEN_UTC + timedelta(minutes=10))
+            bars = historical.fetch_daily_ohlc_bars("TEST")
+            assert bars and all(str(b["t"])[:10] < "2026-06-15" for b in bars)
+            assert set(bars[0]) == {"t", "o", "h", "l", "c", "v"}
+            assert historical.fetch_session_open("TEST") == pytest.approx(122.95)
 
     def test_patches_are_restored(self, store):
         from agent_stonks import historical

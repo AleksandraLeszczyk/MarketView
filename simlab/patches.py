@@ -22,6 +22,11 @@ duration of a simulation:
   day entirely; and a dated fetch of the simulated day would return bars from
   hours in the simulated future. Both leaks corrupted every stored
   volume_detective run before this patch existed.
+- ``historical.fetch_daily_ohlc_bars`` / ``fetch_session_open`` (the long
+  daily history and today's opening print a per-session model needs) ->
+  stored daily bars for days that finished before the simulated one, plus
+  the simulated day's own auction open, which is fixed at 9:30 and therefore
+  point-in-time honest
 Keeping every patch point in this one module means a new live fetch added to
 the app fails loudly here (the setattr asserts the attribute exists) instead
 of silently leaking real-time data into simulated sessions.
@@ -114,6 +119,19 @@ def simulation_context(market: SimMarket) -> Iterator[None]:
             for bar in market.daily_bars_at(str(symbol).upper(), clock.now())
         ]
 
+    def fake_daily_ohlc_bars(symbol, days=420, ttl_sec=0):
+        # Completed days only, matching the live fetch's contract -- so a model
+        # reading a year of daily history sees the same shape either way, and
+        # today's outcome is not sitting in the last row waiting to be used.
+        return [
+            {"t": str(bar.get("t", ""))[:10], "o": float(bar["o"]), "h": float(bar["h"]),
+             "l": float(bar["l"]), "c": float(bar["c"]), "v": float(bar.get("v") or 0.0)}
+            for bar in market.completed_daily_bars(str(symbol).upper(), clock.now())
+        ]
+
+    def fake_session_open(symbol, ttl_sec=0):
+        return market.session_open_price(str(symbol).upper(), clock.now())
+
     patches = [
         (agent_mod, "fetch_bars_window", fake_bars_window),
         (agent_mod, "fetch_corporate_actions", fake_corporate_actions),
@@ -123,6 +141,8 @@ def simulation_context(market: SimMarket) -> Iterator[None]:
         (historical, "fetch_intraday_volume_bars", fake_intraday_volume_bars),
         (historical, "fetch_intraday_bars_for_date", fake_intraday_bars_for_date),
         (historical, "fetch_daily_volume_bars", fake_daily_volume_bars),
+        (historical, "fetch_daily_ohlc_bars", fake_daily_ohlc_bars),
+        (historical, "fetch_session_open", fake_session_open),
     ]
     saved = []
     for module, name, replacement in patches:

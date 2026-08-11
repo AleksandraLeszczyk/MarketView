@@ -19,14 +19,14 @@ from dataclasses import asdict, dataclass
 from datetime import time
 from typing import Any, Callable, Optional
 
-from agent_stonks import apple_models, persistence_model
+from agent_stonks import apple_models
 from agent_stonks.apple_trader import (
     APPLE_TRADER_AVATAR,
     APPLE_TRADER_KEY,
     APPLE_TRADER_LABEL,
     ENTRY_CONFIRM,
-    AppleTrader,
     AppleTraderConfig,
+    build_trader,
     config_error,
 )
 from agent_stonks.apple_trader import TICKER as APPLE_TRADER_TICKER
@@ -84,7 +84,7 @@ class _BundleBound:
     on any rule agent without knowing which one it is holding.
     """
 
-    def __init__(self, trader: AppleTrader, bundle: dict) -> None:
+    def __init__(self, trader: Any, bundle: dict) -> None:
         self.trader = trader
         self.bundle = bundle
 
@@ -99,9 +99,11 @@ def _build_apple(config: AppleTraderConfig) -> _BundleBound:
     """The Apple Trader state machine plus the model its config names, or a
     clear failure.
 
-    A missing bundle would otherwise surface as a run that simply never
-    trades, which reads like a strategy result rather than the installation
-    problem it is.
+    Which state machine is `build_trader`'s decision, not this module's: the
+    model a config names decides whether the run is the momentum rules or the
+    day-range ones. A missing bundle would otherwise surface as a run that
+    simply never trades, which reads like a strategy result rather than the
+    installation problem it is.
     """
     bundle = apple_models.load(config.model_key)
     if bundle is None:
@@ -109,18 +111,21 @@ def _build_apple(config: AppleTraderConfig) -> _BundleBound:
     mismatch = config_error(config, bundle)
     if mismatch is not None:
         raise RuntimeError(mismatch)
-    return _BundleBound(
-        AppleTrader(config, model_threshold=persistence_model.model_threshold(bundle)),
-        bundle,
-    )
+    return _BundleBound(build_trader(config, bundle), bundle)
 
 
 def _apple_signature(config: AppleTraderConfig) -> str:
     # `prob_threshold=None` means "whatever cut-off the model chose", so the
-    # signature needs that model to name the configuration it actually ran.
-    return apple_config_signature(
-        config, model_threshold=apple_models.threshold(config.model_key)
+    # signature needs that model to name the configuration it actually ran --
+    # but only where a cut-off is a thing that exists. The day-range rules have
+    # no threshold, and asking for one would load a 200 MB bundle to answer a
+    # question its signature never asks.
+    threshold = (
+        apple_models.threshold(config.model_key)
+        if apple_models.is_momentum(config.model_key)
+        else None
     )
+    return apple_config_signature(config, model_threshold=threshold)
 
 
 # What Apple Trader's rule set meant before a field existed to say otherwise.

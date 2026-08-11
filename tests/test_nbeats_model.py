@@ -315,8 +315,9 @@ class TestReversalProbability:
 
 
 class TestAppleModelsRegistry:
-    def test_both_models_are_offered_with_the_forecaster_as_default(self):
-        assert apple_models.keys() == ["persistence", "nbeats"]
+    def test_both_momentum_models_are_offered_with_the_forecaster_as_default(self):
+        momentum = [k for k in apple_models.keys() if apple_models.is_momentum(k)]
+        assert momentum == ["persistence", "nbeats"]
         # Apple Trader's default entry (`anticipate`) is a question only a
         # forecaster can answer, so the default model has to be one.
         assert apple_models.DEFAULT_MODEL == "nbeats"
@@ -324,7 +325,11 @@ class TestAppleModelsRegistry:
     def test_only_the_forecaster_claims_it_can_anticipate(self):
         """The flag a picker reads, without importing 200 MB of PyTorch to
         find out. `persistence_model.anticipates` is the authority at run
-        time; these two must not disagree."""
+        time; these two must not disagree.
+
+        Only asked of the momentum models: the entry mode is not part of the
+        day-range strategy's configuration, so its flag says nothing.
+        """
         assert apple_models.get("nbeats").anticipates is True
         assert apple_models.get("persistence").anticipates is False
 

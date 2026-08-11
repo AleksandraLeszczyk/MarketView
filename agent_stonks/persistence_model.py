@@ -647,6 +647,17 @@ def _frame_from_bars(bars: "list[dict]") -> pd.DataFrame:
     return add_session_columns(df)
 
 
+def frame_from_bars(bars: "list[dict]") -> pd.DataFrame:
+    """Public name for the bar-list -> mshift-frame conversion.
+
+    `minute_frame` is the normal way in and reads the live buffer; this is for
+    the callers that have bars from somewhere else -- a REST window recovering
+    an opening range the buffer no longer covers, or a test's fixture -- and
+    want them shaped the same way.
+    """
+    return _frame_from_bars(bars)
+
+
 def add_session_columns(bars: pd.DataFrame) -> pd.DataFrame:
     """Attach the per-day bookkeeping the rest of the pipeline groups on."""
     out = bars.copy()

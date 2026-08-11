@@ -139,6 +139,43 @@ class SimMarket:
             )
         return out
 
+    def completed_daily_bars(self, symbol: str, t: datetime) -> list[dict]:
+        """Stored daily bars for days that finished strictly before t's date.
+
+        `daily_bars_at` is the mid-session view -- completed days plus today
+        rebuilt from the minute tape -- and is what the live REST daily fetch
+        shows. This is the stricter one: no partial row at all, matching
+        `historical.fetch_daily_ohlc_bars`, whose contract is that a caller can
+        never reach today's outcome through a row it cannot tell apart.
+        """
+        today = t.astimezone(MARKET_TZ).date().isoformat()
+        return [b for b in self.series[symbol].daily_bars if str(b.get("t", ""))[:10] < today]
+
+    def session_open_price(self, symbol: str, t: datetime) -> Optional[float]:
+        """Today's official opening print from the stored daily bar, or None.
+
+        This is the one field of the simulated day's *stored* daily bar that
+        may be read during that day, and it is worth being precise about why
+        it is not look-ahead: the open is fixed by the 9:30 auction and never
+        changes afterwards, so a bar stored after the close carries the same
+        number a live fetch would have returned at 9:31. Nothing else from that
+        row is exposed -- `completed_daily_bars` excludes it entirely, and the
+        high, low and close are the day's outcome.
+
+        Returns None before the open, so a caller cannot read tomorrow's
+        auction out of a pre-market cycle.
+        """
+        today = t.astimezone(MARKET_TZ).date()
+        if t.astimezone(MARKET_TZ).time() < time(9, 30):
+            return None
+        for bar in self.series[symbol].daily_bars:
+            if str(bar.get("t", ""))[:10] == today.isoformat():
+                try:
+                    return float(bar["o"])
+                except (KeyError, TypeError, ValueError):
+                    return None
+        return None
+
     def prev_close(self, symbol: str, t: datetime) -> Optional[float]:
         today = t.astimezone(MARKET_TZ).date().isoformat()
         prior = [b for b in self.series[symbol].daily_bars if str(b.get("t", ""))[:10] < today]

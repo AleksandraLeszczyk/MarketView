@@ -6,6 +6,7 @@ import pandas as pd
 import yfinance as yf
 
 from .datalog import log_fetch, log_fetch_failure
+from .market_hours import MARKET_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +219,116 @@ def fetch_daily_volume_bars(symbol: str, days: int = 90, ttl_sec: int = _VOLUME_
     log_fetch("daily volume", "yfinance", symbol=symbol, detail=f"{len(bars)} days")
     _daily_volume_cache[symbol] = {"ts": now, "bars": bars}
     return bars
+
+
+# A year of daily bars is a slow download and never changes during a session,
+# so this one is cached for far longer than the volume reads above -- long
+# enough that a per-minute trading loop asks yfinance once a day.
+_daily_ohlc_cache: dict[str, dict] = {}
+_DAILY_OHLC_CACHE_TTL_SEC = 3600
+
+
+def fetch_daily_ohlc_bars(
+    symbol: str, days: int = 420, ttl_sec: int = _DAILY_OHLC_CACHE_TTL_SEC
+) -> list[dict]:
+    """Completed daily OHLCV bars from yfinance, oldest-first, **unadjusted**.
+
+    The long daily history behind a per-session model (see
+    `agent_stonks.dayrange_model`), in the same {"t","o","h","l","c","v"} shape
+    the rest of the app uses -- `t` is a plain "YYYY-MM-DD".
+
+    Two properties this deliberately has:
+
+    * `auto_adjust=False`, so prices are on the raw scale a live tape prints at
+      and a dividend does not silently reprice the whole history. Any model
+      fitted on unadjusted bars needs them; `fetch_close_series` adjusts, which
+      is right for the return-based reads that use it and wrong here.
+    * **today's partial row is dropped.** A daily bar mid-session has a real
+      open and a high/low/close that are only true so far, and a caller that
+      cannot tell the two apart will happily read the day's outcome out of it.
+      Callers that legitimately need today's open ask `fetch_session_open`,
+      which returns that one number and nothing else.
+
+    Cached for `ttl_sec`; [] (or the last good cache) on failure.
+    """
+    now = datetime.now(timezone.utc)
+    cached = _daily_ohlc_cache.get(symbol)
+    if cached and (now - cached["ts"]).total_seconds() < ttl_sec:
+        return cached["bars"]
+    start = now - timedelta(days=days)
+    try:
+        df = yf.download(
+            symbol, start=start, end=now + timedelta(days=1), interval="1d",
+            auto_adjust=False, progress=False,
+        )
+    except Exception as exc:
+        log_fetch_failure("daily ohlc", [("yfinance", exc)], symbol=symbol)
+        return cached["bars"] if cached else []
+    if df is None or df.empty:
+        return cached["bars"] if cached else []
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    today = datetime.now(timezone.utc).astimezone(MARKET_TZ).date()
+    bars = [
+        {
+            "t": ts.date().isoformat(),
+            "o": float(row.Open), "h": float(row.High),
+            "l": float(row.Low), "c": float(row.Close), "v": float(row.Volume),
+        }
+        for ts, row in zip(pd.to_datetime(df.index), df.itertuples(index=False))
+        if row.Close == row.Close and ts.date() < today
+    ]
+    log_fetch("daily ohlc", "yfinance", symbol=symbol, detail=f"{len(bars)} days")
+    _daily_ohlc_cache[symbol] = {"ts": now, "bars": bars}
+    return bars
+
+
+def fetch_session_open(symbol: str, ttl_sec: int = 300) -> Optional[float]:
+    """Today's official opening print, or None before it exists.
+
+    Split out from `fetch_daily_ohlc_bars` because it is the one part of
+    today's daily bar that is *finished*: the open is set at 9:30 and never
+    moves, while the same row's high, low and close keep changing until the
+    bell. Returning it alone is what lets a model use today's open without any
+    caller being able to reach the day's outcome through the same object.
+
+    Sourced from the daily bar rather than from the first minute bar on
+    purpose: it is the print models fitted on daily data were trained against,
+    and the two differ by a few basis points on about half of all sessions
+    (a minute bar's open is the first *trade* the feed saw, not the auction).
+    """
+    for bar in reversed(_todays_daily_row(symbol, ttl_sec)):
+        return float(bar["o"])
+    return None
+
+
+_session_open_cache: dict[str, dict] = {}
+
+
+def _todays_daily_row(symbol: str, ttl_sec: int) -> list[dict]:
+    """Today's daily bar as a 0- or 1-element list, cached."""
+    now = datetime.now(timezone.utc)
+    cached = _session_open_cache.get(symbol)
+    if cached and (now - cached["ts"]).total_seconds() < ttl_sec:
+        return cached["rows"]
+    today = now.astimezone(MARKET_TZ).date()
+    try:
+        df = yf.download(
+            symbol, start=today.isoformat(), end=(today + timedelta(days=1)).isoformat(),
+            interval="1d", auto_adjust=False, progress=False,
+        )
+    except Exception as exc:
+        log_fetch_failure("session open", [("yfinance", exc)], symbol=symbol)
+        return cached["rows"] if cached else []
+    rows: list[dict] = []
+    if df is not None and not df.empty:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        for ts, row in zip(pd.to_datetime(df.index), df.itertuples(index=False)):
+            if ts.date() == today and row.Open == row.Open:
+                rows = [{"t": today.isoformat(), "o": float(row.Open)}]
+    _session_open_cache[symbol] = {"ts": now, "rows": rows}
+    return rows
 
 
 def fetch_market_indicators(days: int = 365, ttl_sec: int = 300) -> dict:
