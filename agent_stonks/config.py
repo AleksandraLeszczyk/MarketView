@@ -163,46 +163,6 @@ APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN = 5
 # the bar that just closed.
 APPLE_TRADER_BAR_LAG_SEC = 5.0
 
-# TraderByChatGPT: the other rule-based (non-LLM) AAPL loop, a long-only
-# intraday breakout state machine with no model behind it at all -- its entry
-# is a pure confluence predicate on the just-closed bar and its exit is an ATR
-# stop that ratchets up behind the trade's peak (see
-# agent_stonks.openai_rule_trader).
-#
-# POSITION_PCT caps the notional of one position, since ATR-based risk sizing
-# can ask for an unbounded quantity when volatility collapses. TRAIL_PCT is an
-# optional percentage stop measured from the running peak: it can only tighten
-# the ATR trail, and 0 leaves the ATR trail as the sole exit.
-TRADER_BY_CHATGPT_CYCLE_SEC = 60
-TRADER_BY_CHATGPT_TRAIL_PCT = 0.0
-TRADER_BY_CHATGPT_POSITION_PCT = 95.0
-# Flatten this many minutes before the close: every feature the entry rule
-# reads is intraday, and none of it survives the overnight gap.
-TRADER_BY_CHATGPT_FLATTEN_BEFORE_CLOSE_MIN = 5
-# Seconds after a minute boundary to score, giving the stream time to deliver
-# the bar that just closed.
-TRADER_BY_CHATGPT_BAR_LAG_SEC = 5.0
-
-# TraderByClaude: the third rule-based (non-LLM) AAPL loop, and the deliberate
-# counter-thesis to TraderByChatGPT -- it buys the pullback inside an
-# established uptrend rather than the breakout out of one, so its stop sits
-# under the pullback low instead of a fixed ATR distance (see
-# agent_stonks.claude_rule_trader).
-#
-# RISK_PCT is what actually sizes a position: the dollars between the fill and
-# that structural stop, as a share of equity. POSITION_PCT only caps the
-# notional, for when the stop is a few cents away and the risk formula asks for
-# a position several times the account.
-TRADER_BY_CLAUDE_CYCLE_SEC = 60
-TRADER_BY_CLAUDE_RISK_PCT = 0.25
-TRADER_BY_CLAUDE_POSITION_PCT = 95.0
-# Flatten this many minutes before the close: the trend structure the entry
-# reads is intraday, and it does not survive the overnight gap.
-TRADER_BY_CLAUDE_FLATTEN_BEFORE_CLOSE_MIN = 5
-# Seconds after a minute boundary to score, giving the stream time to deliver
-# the bar that just closed.
-TRADER_BY_CLAUDE_BAR_LAG_SEC = 5.0
-
 # Tactics executor: the stream nudges it on every tick, so this poll is only a
 # fallback cadence covering the non-stream condition fields (vix, momentum) and
 # REST-fallback sessions. The momentum window is the lookback (in minutes) for

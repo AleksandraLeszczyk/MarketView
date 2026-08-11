@@ -190,14 +190,6 @@ agent_stonks/
                   model expects to persist and exit on a trailing stop (or a forecast reversal);
                   the day-range rules rest a buy and a sell at fixed distances below the
                   forecast high and hold them all session
-  openai_rule_trader.py — TraderByChatGPT: rule-based (no LLM, no model) loop that buys a
-                  VWAP/EMA/volume-confirmed 20-bar breakout, sizes on risk-to-stop, and exits on an
-                  ATR stop that ratchets under the running peak
-  claude_rule_trader.py — TraderByClaude: the counter-thesis to the above — buys the quiet
-                  pullback to the 20-bar mean once it is reclaimed, stops under the pullback low
-                  rather than a fixed ATR distance, exits on a close back below the mean
-  intraday_bars.py — the session-bar reader and shared indicators (ATR, VWAP) the rule-based
-                  traders have in common, so only their strategy differs
   scoring.py    — per-session grounding/accuracy scorecard and daily (UTC day, 1hr-runtime-gated)
                   aggregate scoring report
   performance.py— replays decisions against price bars to build the equity curve

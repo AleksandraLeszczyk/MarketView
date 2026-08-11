@@ -34,15 +34,7 @@ from agent_stonks.apple_trader import (
     RULE_PROVIDER,
     AppleTraderConfig,
 )
-from agent_stonks.claude_rule_trader import (
-    TRADER_BY_CLAUDE_KEY,
-    TraderByClaudeConfig,
-)
 from agent_stonks.config import PALETTE
-from agent_stonks.openai_rule_trader import (
-    TRADER_BY_CHATGPT_KEY,
-    TraderByChatGPTConfig,
-)
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
 from agent_stonks.market_hours import MARKET_TZ
 
@@ -194,85 +186,7 @@ def _render_rule_agent(personality: str) -> None:
         ":material/function: Rule-based — no LLM, no prompt, no tools. The same tape "
         "always produces the same trades."
     )
-    if personality == TRADER_BY_CHATGPT_KEY:
-        _render_chatgpt_rules()
-    elif personality == TRADER_BY_CLAUDE_KEY:
-        _render_claude_rules()
-    else:
-        _render_apple_rules()
-
-
-def _render_claude_rules() -> None:
-    """What TraderByClaude does, and what it is a counter-thesis to."""
-    ticker = rule_agent(TRADER_BY_CLAUDE_KEY).ticker
-    st.markdown(
-        f"Once a minute it reads the **{ticker}** bar that just closed. Same family as "
-        "TraderByChatGPT — long-only, trend-aligned, sized on distance to the stop — "
-        "and a deliberate disagreement about *where in a trend you are allowed to buy*. "
-        "That one buys the breakout at the highs; this one buys the pullback back into "
-        "the trend:\n"
-        "- **Buy** when price has dipped to **the fast mean** somewhere in the last "
-        "**pullback window** bars *on below-median volume*, and this bar closes back "
-        "above that mean and through the previous bar's high — inside an established "
-        "uptrend (fast mean above slow mean and rising) above VWAP, and no more than "
-        "**the stretch limit** ATR above the mean so it is not chasing.\n"
-        "- The **quiet-pullback** test does the most work. A healthy pullback is "
-        "participation drying up; a dip on heavy volume is a seller working an order, "
-        "and the “support” under it is a queue.\n"
-        "- **Stop** goes under the pullback low, not a fixed ATR distance below the "
-        "entry — so the invalidation is structural (the low that defined the setup "
-        "broke) and usually much tighter, which buys a larger position for the same "
-        "risk. A setup whose stop is further than **the max risk** is skipped rather "
-        "than sized down.\n"
-        "- **Sell** on the stop, on a close back below the fast mean once the trade has "
-        "had a few bars to work, on the time stop, or at the pre-close flatten. The "
-        "stop ratchets to breakeven at **1R** and never moves back down.\n\n"
-        "Its rules are set per simulation in the **Simulate** tab, and it is never "
-        "scored by the LLM judge — profit, profit efficiency and the oracle ceiling are "
-        "the whole verdict."
-    )
-    st.warning(
-        ":material/warning: **What would falsify it.** The thesis is that near-support "
-        "entries lose less per failure than at-resistance entries, and that this pays "
-        "for the signals it skips by refusing to chase. On a tape that trends hard in "
-        "one direction all session the breakout agent should win outright, because the "
-        "pullback this one waits for never comes. Distinguishing those needs many "
-        "sessions — a two-day dataset cannot, and neither can a two-day head-to-head."
-    )
-
-
-def _render_chatgpt_rules() -> None:
-    """What TraderByChatGPT does. No model behind it -- nothing to load, and
-    nothing whose provenance needs stating."""
-    ticker = rule_agent(TRADER_BY_CHATGPT_KEY).ticker
-    st.markdown(
-        f"Once a minute it reads the **{ticker}** bar that just closed and asks one "
-        "boolean question about it — no model, no probability, no confirmation window:\n"
-        "- **Buy** when that single bar clears every condition at once: close above "
-        "session VWAP, EMA9 > EMA21 > EMA50, a close through **the breakout window**'s "
-        "highest high, volume at least **the relative-volume floor** times its 20-bar "
-        "median, RSI inside 55–75, and ATR at or above **the minimum ATR** (tape too "
-        "quiet for a breakout to travel anywhere is refused). Confluence rather than one "
-        "indicator, and entries only between 09:45 and 15:15.\n"
-        "- **Size** on risk, not on cash: the initial stop sits **the initial stop** ATRs "
-        "below the entry, and the quantity is whatever puts **the risk budget** of equity "
-        "between the fill and that stop — capped at **the position size**, since a "
-        "collapsing ATR would otherwise ask for an unbounded position.\n"
-        "- **Sell** on whichever comes first: the ATR stop (which ratchets up to **the "
-        "trail** ATRs under the running peak once the trade is 1R ahead), a time stop "
-        "after 60 bars, or the pre-close flatten.\n"
-        "- A day that is 1% down stops opening new trades; whatever is already on is "
-        "still managed to its stop.\n\n"
-        "Its rules are set per simulation in the **Simulate** tab, and it is never scored "
-        "by the LLM judge — it states no reasoning of its own to judge, so profit, profit "
-        "efficiency and the oracle ceiling are the whole verdict."
-    )
-    st.info(
-        ":material/info: Every rule agent trades the same symbol on the same tape, so a "
-        "dataset run through each is a straight comparison of hand-written strategies — "
-        "one that asks a fitted model whether a momentum change will hold, one that asks "
-        "a fitted model how wide the day will be, and one that asks nothing at all."
-    )
+    _render_apple_rules()
 
 
 def _render_apple_rules() -> None:
@@ -1019,148 +933,13 @@ def _render_rule_params(personalities: list[str]) -> dict:
     """One rule set per selected rule agent, the way one prompt per personality
     applies to every LLM combination.
 
-    Keyed by personality, since the two rule agents share no tunables at all --
-    the returned configs are what the queued experiments carry.
+    Keyed by personality, since rule agents share no tunables at all -- the
+    returned configs are what the queued experiments carry.
     """
     renderers = {
         APPLE_TRADER_KEY: _render_apple_params,
-        TRADER_BY_CHATGPT_KEY: _render_chatgpt_params,
-        TRADER_BY_CLAUDE_KEY: _render_claude_params,
     }
     return {key: renderers[key]() for key in personalities if key in renderers}
-
-
-def _render_claude_params() -> TraderByClaudeConfig:
-    """TraderByClaude's rules for this batch.
-
-    Exposed are the four numbers that change what the strategy *is*: how deep a
-    pullback it will look back for, how quiet that pullback has to be, how far
-    from the mean it will still buy, and how much equity it risks per trade.
-    The EMA pair, the entry window and the exits are the strategy's definition
-    rather than knobs, and stay at their defaults.
-    """
-    defaults = TraderByClaudeConfig()
-    with st.expander("TraderByClaude rules", expanded=True):
-        st.caption(
-            "The counter-thesis to TraderByChatGPT: buy the pullback into the trend, "
-            "not the breakout out of it. Each distinct rule set is tracked as its own "
-            "configuration in Results, so retuning is a new test rather than a repeat "
-            "of one already run."
-        )
-        col_a, col_b = st.columns(2)
-        pullback_lookback = col_a.number_input(
-            "Pullback window (bars)", min_value=3, max_value=60,
-            value=defaults.pullback_lookback, step=1, key="sim_claude_pullback",
-            help="How far back the dip to the mean may have happened. Longer accepts "
-                 "setups whose pullback is older, and puts the structural stop further "
-                 "away, since the stop goes under the lowest low in this window.",
-        )
-        quiet_pullback_ratio = col_b.number_input(
-            "Pullback volume (× median)", min_value=0.25, max_value=3.0,
-            value=defaults.quiet_pullback_ratio, step=0.05, format="%.2f",
-            key="sim_claude_quiet",
-            help="Average volume across the pullback, as a multiple of the 20-bar "
-                 "median. Below 1.0 means participation dried up on the dip — which is "
-                 "what separates a pullback from distribution. Raising it above 1.0 "
-                 "removes the test that does the most filtering.",
-        )
-        max_stretch_atr = col_a.number_input(
-            "Stretch limit (ATRs above the mean)", min_value=0.1, max_value=4.0,
-            value=defaults.max_stretch_atr, step=0.05, format="%.2f",
-            key="sim_claude_stretch",
-            help="The anti-chase rule: refuse a reclaim bar that has already run this "
-                 "far past the mean. This binds against the reclaim test — a bar that "
-                 "takes out the prior high tends to close some way above the mean — so "
-                 "it is the main control on how often the agent trades at all.",
-        )
-        risk_pct = col_b.number_input(
-            "Risk per trade (% of equity)", min_value=0.05, max_value=5.0,
-            value=defaults.risk_pct, step=0.05, format="%.2f", key="sim_claude_risk",
-            help="Dollars between the fill and the structural stop, as a share of "
-                 "equity. Because that stop sits under the pullback low rather than a "
-                 "fixed ATR away, the same percentage usually buys a larger position "
-                 "here than in a breakout entry.",
-        )
-        max_position_pct = col_a.number_input(
-            "Position cap (% of cash)", min_value=1.0, max_value=100.0,
-            value=defaults.max_position_pct, step=5.0, key="sim_claude_size",
-        )
-    return TraderByClaudeConfig(
-        pullback_lookback=int(pullback_lookback),
-        quiet_pullback_ratio=float(quiet_pullback_ratio),
-        max_stretch_atr=float(max_stretch_atr),
-        risk_pct=float(risk_pct),
-        max_position_pct=float(max_position_pct),
-    )
-
-
-def _render_chatgpt_params() -> TraderByChatGPTConfig:
-    """TraderByChatGPT's rules for this batch.
-
-    The entry is a confluence of seven conditions and the exit is an ATR trail;
-    exposed here are the four that change what the strategy *is* -- how far
-    back the breakout looks, how much volume confirmation it demands, how much
-    equity it risks per trade, and how far the stop trails. The rest (the RSI
-    band, the ATR regime filter, the entry window) are the strategy's
-    definition rather than knobs, and stay at their defaults.
-    """
-    defaults = TraderByChatGPTConfig()
-    with st.expander("TraderByChatGPT rules", expanded=True):
-        st.caption(
-            "No model to tune — the entry is a plain boolean over the bar that just "
-            "closed, so these are the numbers inside it. Each distinct rule set is "
-            "tracked as its own configuration in Results, so retuning is a new test "
-            "rather than a repeat of one already run."
-        )
-        col_a, col_b = st.columns(2)
-        breakout_lookback = col_a.number_input(
-            "Breakout window (bars)", min_value=5, max_value=120,
-            value=defaults.breakout_lookback, step=5, key="sim_chatgpt_lookback",
-            help="The bar has to close above the highest high of this many bars before "
-                 "it. Shorter fires more often on smaller ranges.",
-        )
-        min_relative_volume = col_b.number_input(
-            "Relative volume to confirm", min_value=1.0, max_value=5.0,
-            value=defaults.min_relative_volume, step=0.1, format="%.2f",
-            key="sim_chatgpt_rvol",
-            help="Volume as a multiple of its 20-bar median. A breakout without unusual "
-                 "participation is the one that fails back into the range.",
-        )
-        risk_pct = col_a.number_input(
-            "Risk per trade (% of equity)", min_value=0.05, max_value=5.0,
-            value=defaults.risk_pct, step=0.05, format="%.2f", key="sim_chatgpt_risk",
-            help="Dollars between the fill and the initial stop, as a share of equity. "
-                 "This sizes the position — the position cap only stops a tiny ATR from "
-                 "asking for an unbounded one.",
-        )
-        trail_atr = col_b.number_input(
-            "Trailing stop (ATRs under the peak)", min_value=0.25, max_value=5.0,
-            value=defaults.trail_atr, step=0.25, format="%.2f", key="sim_chatgpt_trail",
-            help="Once the trade is 1R ahead the stop ratchets up to this far under the "
-                 "highest price seen since the entry. Before that the initial "
-                 f"{defaults.initial_stop_atr:g} ATR stop stands.",
-        )
-        max_position_pct = col_a.number_input(
-            "Position cap (% of cash)", min_value=1.0, max_value=100.0,
-            value=defaults.max_position_pct, step=5.0, key="sim_chatgpt_size",
-        )
-        min_atr_pct = col_b.number_input(
-            "Minimum ATR (% of price)", min_value=0.0, max_value=1.0,
-            value=defaults.min_atr_pct * 100.0, step=0.01, format="%.3f",
-            key="sim_chatgpt_atr",
-            help="Refuse to buy a breakout on tape too quiet to travel anywhere. These "
-                 "are one-minute bars, where a liquid large cap runs a median ATR near "
-                 "0.08% of price — two orders of magnitude under the daily figure, so a "
-                 "daily-scale floor here rejects every bar of the session.",
-        )
-    return TraderByChatGPTConfig(
-        breakout_lookback=int(breakout_lookback),
-        min_relative_volume=float(min_relative_volume),
-        risk_pct=float(risk_pct),
-        trail_atr=float(trail_atr),
-        max_position_pct=float(max_position_pct),
-        min_atr_pct=float(min_atr_pct) / 100.0,
-    )
 
 
 def _render_apple_params() -> AppleTraderConfig:

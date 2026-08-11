@@ -15,8 +15,6 @@ from agent_stonks.apple_trader import (
     AppleTraderConfig,
     config_signature,
 )
-from agent_stonks.claude_rule_trader import TRADER_BY_CLAUDE_KEY
-from agent_stonks.openai_rule_trader import TRADER_BY_CHATGPT_KEY
 from simlab import data as sim_data
 from simlab import prompts as sim_prompts
 from simlab import results as sim_results
@@ -266,7 +264,7 @@ class TestFeedIsPartOfTheData:
         sim_data.create_dataset("d-sip", ["TEST"], day, day, "k", "s", feed="sip")
         market = SimMarket(["TEST"], [day], "sip")
         config = SimulationConfig(
-            personality=TRADER_BY_CHATGPT_KEY, provider=RULE_PROVIDER, model="rules",
+            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
             api_key="", symbols=["TEST"], days=[day], feed="sip",
         )
         result = SimulationEngine(market, config).run()
@@ -961,253 +959,12 @@ class TestDayRangeEngine:
         ).startswith("dayrange_AAPL(buy=")
 
 
-class TestTraderByChatGPTEngine:
-    """The second rule agent replays on the same day loop as the first, with
-    nothing to load behind it: the rules are the whole agent."""
-
-    @staticmethod
-    def _bars(breakout_volume: float = 2600.0) -> list[dict]:
-        """A stored AAPL session shaped like the setup this agent trades.
-
-        55 bars of a saw-toothed climb (+0.06, +0.06, -0.08) -- an EMA stack
-        and a drift, but pullbacks often enough to keep RSI inside the 55-75
-        band instead of pinning it at 100, and no single bar clearing the
-        20-bar high; then one +0.30 breakout bar on double volume, which is the
-        first bar to satisfy all seven entry conditions at once; then a
-        give-back steep enough to take out the 1.3-ATR initial stop. Volume
-        varies bar to bar because the breakout is measured against its median.
-        """
-        prices, price = [], 100.0
-        for i in range(55):
-            price += 0.06 if i % 3 != 2 else -0.08
-            prices.append(round(price, 2))
-        breakout = round(price + 0.30, 2)
-        prices.append(breakout)
-        prices += [round(breakout - 0.09 * (i + 1), 2) for i in range(12)]
-
-        bars = [
-            _bar(OPEN_UTC + timedelta(minutes=i), price,
-                 volume=1000.0 + 37 * (i % 13))
-            for i, price in enumerate(prices)
-        ]
-        bars[55]["v"] = breakout_volume
-        return bars
-
-    @pytest.fixture()
-    def chatgpt_store(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
-        monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
-        return lambda breakout_volume=2600.0: (
-            sim_data._write_gz(
-                sim_data.bars_path("AAPL", DAY), self._bars(breakout_volume)
-            ),
-            sim_data._write_gz(sim_data.daily_path("AAPL"), {
-                "symbol": "AAPL", "start": "2026-05-16", "end": "2026-06-15",
-                "bars": [],
-            }),
-        )
-
-    @staticmethod
-    def _run(rule_config: "dict | None" = None):
-        agent = rule_agent(TRADER_BY_CHATGPT_KEY)
-        # Through JSON exactly as the experiment record carries it: the entry
-        # window is a `datetime.time`, which does not survive json.dumps raw.
-        record = json.loads(json.dumps(rule_config or agent.to_record(
-            agent.from_record(None)
-        )))
-        market = SimMarket(["AAPL"], [DAY])
-        config = SimulationConfig(
-            personality=TRADER_BY_CHATGPT_KEY, provider=RULE_PROVIDER,
-            model=agent.signature(agent.from_record(record)), api_key="",
-            symbols=["AAPL"], days=[DAY], starting_cash=10_000.0,
-            rule_config=record,
-        )
-        engine = SimulationEngine(market, config)
-        return market, engine, engine.run()
-
-    def test_reads_every_session_bar_and_needs_no_llm(self, chatgpt_store):
-        chatgpt_store()
-        # No client is passed and none is built: a rule run that quietly tried
-        # to reach an LLM would raise here instead.
-        _, engine, result = self._run()
-        assert result.error is None
-        assert engine.rule_based
-        # 68 stored bars complete at 09:31..10:38 ET, all inside the session.
-        assert result.cycles_run == 68
-        assert not clock.is_simulated()
-
-    def test_buys_the_confluence_breakout_then_stops_out(self, chatgpt_store):
-        chatgpt_store()
-        _, _, result = self._run()
-        actions = [(d["action"], d["status"]) for d in result.decisions]
-        assert actions[:2] == [("buy", "filled"), ("sell", "filled")]
-        buy, sell = result.decisions[0], result.decisions[1]
-        assert "above VWAP with EMA9>EMA21>EMA50" in buy["reasoning"]
-        assert "20-bar breakout" in buy["reasoning"]
-        assert "ATR stop" in sell["reasoning"]
-        # Bought the breakout bar and stopped out on the give-back below it.
-        assert parse_ts(sell["ts"]) > parse_ts(buy["ts"])
-        assert float(sell["price"]) < float(buy["price"])
-
-    def test_a_breakout_without_volume_is_never_bought(self, chatgpt_store):
-        # Same price path, ordinary volume on the breakout bar: participation
-        # is the one condition that fails, and one failed condition is enough.
-        chatgpt_store(breakout_volume=1000.0)
-        _, _, result = self._run()
-        assert result.error is None
-        assert [d for d in result.decisions if d["action"] in ("buy", "sell")] == []
-
-    def test_records_its_rules_instead_of_a_prompt(self, chatgpt_store):
-        chatgpt_store()
-        _, _, result = self._run()
-        assert result.prompt_used is None
-        assert result.tool_names == []
-        assert result.config_summary["rule_based"] is True
-        # The stored rules rebuild the exact config the run used, entry window
-        # included -- a run record that could not be replayed is not a record.
-        agent = rule_agent(TRADER_BY_CHATGPT_KEY)
-        stored = result.config_summary["rule_config"]
-        assert agent.from_record(stored) == agent.from_record(None)
-        assert stored["entry_start"] == "09:45"
-
-    def test_a_dataset_without_the_ticker_fails_loudly(self, store):
-        market = SimMarket(["TEST"], [DAY])
-        config = SimulationConfig(
-            personality=TRADER_BY_CHATGPT_KEY, provider=RULE_PROVIDER,
-            model="rules", api_key="", symbols=["TEST"], days=[DAY],
-        )
-        result = SimulationEngine(market, config).run()
-        assert "only trades AAPL" in (result.error or "")
-
-
-class TestTraderByClaudeEngine:
-    """The pullback agent on the same day loop: it must buy the dip that gets
-    reclaimed, and refuse the one that arrives on heavy volume."""
-
-    @staticmethod
-    def _bars(pullback_volume: float = 400.0) -> list[dict]:
-        """A session shaped like the setup this agent trades.
-
-        45 bars of a steady climb to build the EMA20 > EMA50 stack; then an
-        8-bar dip back to the mean on `pullback_volume` (the quiet-pullback
-        test is what `pullback_volume` switches on and off); then one bar that
-        closes back above the mean and through the previous bar's high -- the
-        reclaim this agent buys; then a continuation, and finally a slide that
-        breaks back under the mean to take the position out.
-        """
-        prices, price = [], 100.0
-        for _ in range(45):                       # impulse: trend and stack
-            price += 0.05
-            prices.append((round(price, 2), 1000.0))
-        top = price
-        for i in range(8):                        # the pullback, into the mean
-            prices.append((round(top - 0.05 * (i + 1), 2), pullback_volume))
-        prices.append((round(top - 0.40 + 0.22, 2), 1500.0))   # the reclaim bar
-        for i in range(6):                        # continuation
-            prices.append((round(top - 0.18 + 0.05 * (i + 1), 2), 1200.0))
-        for i in range(14):                       # slide back under the mean
-            prices.append((round(top + 0.12 - 0.07 * (i + 1), 2), 1200.0))
-
-        return [
-            _bar(OPEN_UTC + timedelta(minutes=i), price, volume=volume)
-            for i, (price, volume) in enumerate(prices)
-        ]
-
-    @pytest.fixture()
-    def claude_store(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
-        monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
-        return lambda pullback_volume=400.0: (
-            sim_data._write_gz(
-                sim_data.bars_path("AAPL", DAY), self._bars(pullback_volume)
-            ),
-            sim_data._write_gz(sim_data.daily_path("AAPL"), {
-                "symbol": "AAPL", "start": "2026-05-16", "end": "2026-06-15",
-                "bars": [],
-            }),
-        )
-
-    @staticmethod
-    def _run(**overrides):
-        agent = rule_agent(TRADER_BY_CLAUDE_KEY)
-        config_obj = replace(agent.from_record(None), **overrides) if overrides \
-            else agent.from_record(None)
-        record = json.loads(json.dumps(agent.to_record(config_obj)))
-        market = SimMarket(["AAPL"], [DAY])
-        config = SimulationConfig(
-            personality=TRADER_BY_CLAUDE_KEY, provider=RULE_PROVIDER,
-            model=agent.signature(config_obj), api_key="", symbols=["AAPL"],
-            days=[DAY], starting_cash=10_000.0, rule_config=record,
-        )
-        engine = SimulationEngine(market, config)
-        return market, engine, engine.run()
-
-    def test_reads_every_session_bar_and_needs_no_llm(self, claude_store):
-        claude_store()
-        _, engine, result = self._run()
-        assert result.error is None
-        assert engine.rule_based
-        assert result.cycles_run == 74
-        assert not clock.is_simulated()
-
-    def test_buys_the_reclaimed_pullback(self, claude_store):
-        claude_store()
-        _, _, result = self._run()
-        actions = [(d["action"], d["status"]) for d in result.decisions]
-        assert actions[:2] == [("buy", "filled"), ("sell", "filled")]
-        buy, sell = result.decisions[0], result.decisions[1]
-        assert "pullback to the 20-bar mean" in buy["reasoning"]
-        assert "median volume" in buy["reasoning"]
-        # The stop is structural: under the pullback low, not a fixed distance
-        # below the entry. That is the whole difference from the breakout agent.
-        assert "under the pullback low" in buy["reasoning"]
-        assert parse_ts(sell["ts"]) > parse_ts(buy["ts"])
-
-    def test_a_pullback_on_heavy_volume_is_not_a_pullback(self, claude_store):
-        # Same price path, but the dip arrives on above-median volume: a seller
-        # working an order, not participation drying up.
-        claude_store(pullback_volume=3000.0)
-        _, _, result = self._run()
-        assert result.error is None
-        assert [d for d in result.decisions if d["action"] == "buy"] == []
-
-    def test_a_stop_further_than_max_risk_is_skipped_not_resized(self, claude_store):
-        claude_store()
-        # Nothing can be risked in less than 0 ATR, so every otherwise-valid
-        # signal is refused rather than sized down to fit.
-        _, _, result = self._run(max_risk_atr=0.0)
-        assert result.error is None
-        assert [d for d in result.decisions if d["action"] == "buy"] == []
-
-    def test_records_its_rules_instead_of_a_prompt(self, claude_store):
-        claude_store()
-        _, _, result = self._run()
-        assert result.prompt_used is None
-        assert result.tool_names == []
-        assert result.config_summary["rule_based"] is True
-        agent = rule_agent(TRADER_BY_CLAUDE_KEY)
-        stored = result.config_summary["rule_config"]
-        assert agent.from_record(stored) == agent.from_record(None)
-        assert stored["entry_start"] == "09:45"
-
-    def test_a_dataset_without_the_ticker_fails_loudly(self, store):
-        market = SimMarket(["TEST"], [DAY])
-        config = SimulationConfig(
-            personality=TRADER_BY_CLAUDE_KEY, provider=RULE_PROVIDER,
-            model="rules", api_key="", symbols=["TEST"], days=[DAY],
-        )
-        result = SimulationEngine(market, config).run()
-        assert "only trades AAPL" in (result.error or "")
-
-
 class TestRuleAgentRegistry:
     """What the engine, the runner and the UI rely on being true of *every*
     rule agent, so adding one cannot half-wire it."""
 
     def test_every_rule_agent_is_replayable(self):
-        assert set(RULE_AGENTS) == {
-            APPLE_TRADER_KEY, TRADER_BY_CHATGPT_KEY, TRADER_BY_CLAUDE_KEY,
-        }
+        assert set(RULE_AGENTS) == {APPLE_TRADER_KEY}
         for key, agent in RULE_AGENTS.items():
             assert agent.key == key
             assert agent.ticker and agent.label
@@ -1223,14 +980,16 @@ class TestRuleAgentRegistry:
 
     def test_signatures_separate_configurations(self):
         # Results groups runs on this string, so two rule sets that trade
-        # differently must not collapse into one "already tested" row.
-        agent = rule_agent(TRADER_BY_CHATGPT_KEY)
-        base = agent.from_record(None)
-        assert agent.signature(base) == agent.signature(agent.from_record(None))
+        # differently must not collapse into one "already tested" row. Signed
+        # on the day-range model, whose signature reads no threshold and so
+        # needs no bundle on disk to answer.
+        agent = rule_agent(APPLE_TRADER_KEY)
+        base = agent.from_record({"model_key": "dayrange"})
+        assert agent.signature(base) == agent.signature(
+            agent.from_record({"model_key": "dayrange"})
+        )
         for field, value in (
-            ("breakout_lookback", 40), ("min_relative_volume", 2.0),
-            ("risk_pct", 1.0), ("trail_atr", 3.0), ("max_position_pct", 50.0),
-            ("min_atr_pct", 0.002),
+            ("buy_k", 0.2), ("sell_k", 0.3), ("position_pct", 50.0),
         ):
             other = replace(base, **{field: value})
             assert agent.signature(other) != agent.signature(base), field

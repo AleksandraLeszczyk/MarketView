@@ -1,7 +1,7 @@
 """The rule-based (non-LLM) agents SimLab can replay, behind one interface.
 
 Every other agent SimLab runs is a prompt handed to a model, so the engine can
-treat them as one thing. The rule agents are each a hand-written state machine
+treat them as one thing. A rule agent is instead a hand-written state machine
 with its own tunables, its own dependencies and -- in Apple Trader's case -- a
 saved model to load first. This module is where those differences are
 absorbed, so the engine, the runner and the UI branch on "is this rule-based?"
@@ -16,7 +16,6 @@ what hides Apple Trader's extra ``bundle`` argument from the day loop.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import time
 from typing import Any, Callable, Optional
 
 from agent_stonks import apple_models
@@ -31,28 +30,6 @@ from agent_stonks.apple_trader import (
 )
 from agent_stonks.apple_trader import TICKER as APPLE_TRADER_TICKER
 from agent_stonks.apple_trader import config_signature as apple_config_signature
-from agent_stonks.claude_rule_trader import (
-    TRADER_BY_CLAUDE_AVATAR,
-    TRADER_BY_CLAUDE_KEY,
-    TRADER_BY_CLAUDE_LABEL,
-    TraderByClaude,
-    TraderByClaudeConfig,
-)
-from agent_stonks.claude_rule_trader import TICKER as TRADER_BY_CLAUDE_TICKER
-from agent_stonks.claude_rule_trader import (
-    config_signature as claude_config_signature,
-)
-from agent_stonks.openai_rule_trader import (
-    TRADER_BY_CHATGPT_AVATAR,
-    TRADER_BY_CHATGPT_KEY,
-    TRADER_BY_CHATGPT_LABEL,
-    TraderByChatGPT,
-    TraderByChatGPTConfig,
-)
-from agent_stonks.openai_rule_trader import TICKER as TRADER_BY_CHATGPT_TICKER
-from agent_stonks.openai_rule_trader import (
-    config_signature as chatgpt_config_signature,
-)
 
 
 @dataclass(frozen=True)
@@ -62,9 +39,9 @@ class RuleAgent:
     key: str
     label: str
     avatar: str
-    # The single symbol it trades. Both rule agents are single-symbol by
-    # design, and a dataset without that symbol is a configuration mistake
-    # worth catching before the run produces an empty ledger.
+    # The single symbol it trades. A rule agent is single-symbol by design,
+    # and a dataset without that symbol is a configuration mistake worth
+    # catching before the run produces an empty ledger.
     ticker: str
     # config -> a trader exposing `run_cycle(state, tracker)`. May raise
     # RuntimeError when something the agent depends on is not installed.
@@ -148,37 +125,6 @@ def _apple_from_record(raw: "dict | None") -> AppleTraderConfig:
     return AppleTraderConfig(**{**_APPLE_LEGACY, **(raw or {})})
 
 
-# ------------------------------------- TraderByChatGPT / TraderByClaude
-
-# Both keep their entry window as `datetime.time`, which is not JSON, and the
-# experiment record has to survive a round trip to disk.
-_TIME_FIELDS = ("entry_start", "entry_stop")
-
-
-def _to_record(config) -> dict:
-    """`asdict` with the entry window rendered as "HH:MM"."""
-    raw = asdict(config)
-    for field in _TIME_FIELDS:
-        if field in raw:
-            raw[field] = raw[field].strftime("%H:%M")
-    return raw
-
-
-def _from_record(config_cls):
-    """A decoder for `config_cls` that parses the entry window back."""
-
-    def decode(raw: Optional[dict]):
-        data = dict(raw or {})
-        for field in _TIME_FIELDS:
-            value = data.get(field)
-            if isinstance(value, str):
-                hour, minute = value.split(":")[:2]
-                data[field] = time(int(hour), int(minute))
-        return config_cls(**data)
-
-    return decode
-
-
 # ------------------------------------------------------------------ registry
 
 RULE_AGENTS: dict[str, RuleAgent] = {
@@ -191,27 +137,6 @@ RULE_AGENTS: dict[str, RuleAgent] = {
         signature=_apple_signature,
         to_record=asdict,
         from_record=_apple_from_record,
-    ),
-    TRADER_BY_CHATGPT_KEY: RuleAgent(
-        key=TRADER_BY_CHATGPT_KEY,
-        label=TRADER_BY_CHATGPT_LABEL,
-        avatar=TRADER_BY_CHATGPT_AVATAR,
-        ticker=TRADER_BY_CHATGPT_TICKER,
-        # Nothing to load: the rules are the whole agent.
-        build=TraderByChatGPT,
-        signature=chatgpt_config_signature,
-        to_record=_to_record,
-        from_record=_from_record(TraderByChatGPTConfig),
-    ),
-    TRADER_BY_CLAUDE_KEY: RuleAgent(
-        key=TRADER_BY_CLAUDE_KEY,
-        label=TRADER_BY_CLAUDE_LABEL,
-        avatar=TRADER_BY_CLAUDE_AVATAR,
-        ticker=TRADER_BY_CLAUDE_TICKER,
-        build=TraderByClaude,
-        signature=claude_config_signature,
-        to_record=_to_record,
-        from_record=_from_record(TraderByClaudeConfig),
     ),
 }
 
