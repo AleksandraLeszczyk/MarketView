@@ -14,6 +14,16 @@ cannot leave a widget holding the value that belonged to its neighbour. Loading
 a preset hands out fresh ids for the same reason: the new widgets have keys
 nothing has written to, which is the only way to reseed a widget Streamlit
 refuses to let you assign to after it has rendered.
+
+The instrument is picked here too, above the rules, because it decides what the
+rules may say: the signal picker offers `apple_rules.signals_for(ticker)`, so a
+model nothing was fitted on for that symbol is simply not in the list. Changing
+the instrument does *not* rewrite the rules -- silently editing somebody's
+strategy because they looked at another symbol would be worse than the problem
+-- so a set carried across is left intact, the conditions that no longer read
+are marked in place, and `_verdict` refuses to call it runnable until they are
+gone. `presets_for` narrows the same way, and every instrument has at least the
+model-free preset to start from.
 """
 
 from __future__ import annotations
@@ -39,6 +49,10 @@ _OP_LABEL = {ar.OP_ABOVE: "at or above ≥", ar.OP_BELOW: "at or below ≤"}
 
 def _state_key(prefix: str) -> str:
     return f"{prefix}_rules"
+
+
+def _ticker_key(prefix: str) -> str:
+    return f"{prefix}_ticker"
 
 
 def _next_id(prefix: str) -> int:
@@ -69,16 +83,18 @@ def _with_ids(prefix: str, ruleset: ar.RuleSet) -> "list[dict]":
     return rules
 
 
-def _rules(prefix: str) -> "list[dict]":
+def _rules(prefix: str, ticker: "str | None" = None) -> "list[dict]":
     key = _state_key(prefix)
     if key not in st.session_state:
-        st.session_state[key] = _with_ids(prefix, ar.preset())
+        # A fresh builder starts on a preset that runs where it is pointed --
+        # on a symbol with no saved model that is the model-free one.
+        st.session_state[key] = _with_ids(prefix, ar.preset(None, ticker))
     return st.session_state[key]
 
 
-def load_preset(prefix: str, name: str) -> None:
+def load_preset(prefix: str, name: str, ticker: "str | None" = None) -> None:
     """Replace the editor's contents with a named preset."""
-    st.session_state[_state_key(prefix)] = _with_ids(prefix, ar.preset(name))
+    st.session_state[_state_key(prefix)] = _with_ids(prefix, ar.preset(name, ticker))
 
 
 def set_rules(prefix: str, ruleset: ar.RuleSet) -> None:
@@ -136,22 +152,32 @@ def _move_rule(prefix: str, index: int, delta: int) -> None:
 
 
 def rules_panel(
-    prefix: str, *, defaults: "AppleTrader2Config | None" = None
+    prefix: str,
+    *,
+    defaults: "AppleTrader2Config | None" = None,
+    symbols: "list[str] | None" = None,
 ) -> AppleTrader2Config:
     """Render the builder and return the configuration it currently describes.
 
     Called on every rerun, so it both draws the widgets and reads them back: the
     editor's dicts are updated in place from the widget values, which is what
     keeps an edit alive across the rerun that an add or a delete causes.
+
+    `symbols` is what the surrounding app can actually supply bars for -- the
+    streamed tickers live, the dataset's symbols in SimLab. They are offered
+    alongside the modelled ones, and the picker still accepts anything typed
+    into it, because a rule set written on the tape runs on any symbol the app
+    is streaming.
     """
     if defaults is not None and _state_key(prefix) not in st.session_state:
         set_rules(prefix, defaults.rules)
     flatten_default = (defaults or AppleTrader2Config()).flatten_before_close_min
 
-    _preset_row(prefix)
-    rules = _rules(prefix)
+    ticker = _instrument_row(prefix, defaults, symbols)
+    _preset_row(prefix, ticker)
+    rules = _rules(prefix, ticker)
     for index, raw in enumerate(rules):
-        _rule_editor(prefix, index, raw, len(rules))
+        _rule_editor(prefix, index, raw, len(rules), ticker)
 
     st.button(
         "Add a rule", icon=":material/add:", key=f"{prefix}_add_rule",
@@ -171,31 +197,93 @@ def rules_panel(
     )
 
     config = AppleTrader2Config(
-        rules=_ruleset_from(rules), flatten_before_close_min=int(flatten)
+        rules=_ruleset_from(rules), flatten_before_close_min=int(flatten), ticker=ticker
     )
     _verdict(config)
     return config
 
 
-def _preset_row(prefix: str) -> None:
-    names = list(ar.PRESETS)
+def _instrument_row(
+    prefix: str,
+    defaults: "AppleTrader2Config | None",
+    symbols: "list[str] | None",
+) -> str:
+    """The symbol every rule below is evaluated against.
+
+    The options are the modelled tickers first (those are the ones where the
+    full catalogue is available), then whatever the app is streaming, and the
+    box accepts a symbol typed into it as well -- being unmodelled is not being
+    untradeable, it just means the rules have to be written on the tape.
+    """
+    modelled = apple_models.tickers()
+    current = st.session_state.get(_ticker_key(prefix)) or (
+        defaults or AppleTrader2Config()
+    ).ticker
+    options = list(modelled)
+    # The current value is in the list whatever it is -- including a symbol
+    # typed into the box on an earlier rerun, which is otherwise in none of
+    # these sources and would be dropped the next time the app reruns.
+    for symbol in [*(symbols or []), current]:
+        symbol = str(symbol).strip().upper()
+        if symbol and symbol not in options:
+            options.append(symbol)
+
+    ticker = st.selectbox(
+        "Instrument", options,
+        index=options.index(current) if current in options else 0,
+        key=_ticker_key(prefix), accept_new_options=True,
+        help=(
+            "Which symbol's minute bars the rules are read off. "
+            + ", ".join(modelled)
+            + " have saved models, so their forecasts appear as signals; on any other "
+            "symbol the catalogue narrows to what is computed from the tape — price, "
+            "the momentum regime, the position and the clock — which means the same "
+            "thing everywhere. The symbol has to be one this app is streaming (or one "
+            "in the simulated dataset); it is not checked here."
+        ),
+    )
+    ticker = str(ticker or apple_models.DEFAULT_TICKER).strip().upper()
+
+    keys = apple_models.keys_for(ticker)
+    if keys:
+        st.caption(
+            f":material/model_training: Models fitted on {ticker}: "
+            + ", ".join(apple_models.get(k).label for k in keys)
+            + "."
+        )
+    else:
+        st.caption(
+            f":material/model_training: No saved model covers {ticker}, so the rules "
+            "below can only read the tape, the momentum regime, the position and the "
+            "clock. Everything a model would add is absent rather than approximated."
+        )
+    return ticker
+
+
+def _preset_row(prefix: str, ticker: str) -> None:
+    names = ar.presets_for(ticker)
+    default = ar.default_preset(ticker)
     with st.container(horizontal=True, vertical_alignment="bottom"):
         name = st.selectbox(
-            "Start from", names, index=names.index(ar.DEFAULT_PRESET),
-            key=f"{prefix}_preset",
+            "Start from", names, index=names.index(default) if default in names else 0,
+            # Scoped to the instrument: the list of presets that can run changes
+            # with it, and a widget holding a name that is no longer an option
+            # would be a stale selection rather than a choice.
+            key=f"{prefix}_preset_{ticker}",
             help=(
-                "The first three are the strategies Apple Trader 1 ships, written out as "
+                "Only the presets that can run on this instrument are listed. The first "
+                "three (on AAPL) are the strategies Apple Trader 1 ships, written out as "
                 "rules — load one to see how a shipped strategy decomposes, or to have "
                 "something measured to edit away from. Loading replaces everything below."
             ),
         )
         st.button(
             "Load", icon=":material/download:", key=f"{prefix}_load_preset",
-            on_click=load_preset, args=(prefix, name),
+            on_click=load_preset, args=(prefix, name, ticker),
         )
 
 
-def _rule_editor(prefix: str, index: int, raw: dict, total: int) -> None:
+def _rule_editor(prefix: str, index: int, raw: dict, total: int, ticker: str) -> None:
     """One action item. Reads its widgets back into `raw` as it goes."""
     rid = raw["id"]
     with st.container(border=True):
@@ -259,7 +347,7 @@ def _rule_editor(prefix: str, index: int, raw: dict, total: int) -> None:
             )
 
         for cond_index, cond in enumerate(raw["conditions"]):
-            _condition_editor(prefix, index, cond_index, cond)
+            _condition_editor(prefix, index, cond_index, cond, ticker)
 
         with st.container(horizontal=True, vertical_alignment="bottom"):
             st.button(
@@ -283,15 +371,29 @@ def _rule_editor(prefix: str, index: int, raw: dict, total: int) -> None:
             )
 
 
-def _condition_editor(prefix: str, index: int, cond_index: int, cond: dict) -> None:
-    """One condition. Flags get true/false instead of a number."""
+def _condition_editor(
+    prefix: str, index: int, cond_index: int, cond: dict, ticker: str
+) -> None:
+    """One condition. Flags get true/false instead of a number.
+
+    The options are the signals this instrument has, plus -- if the condition
+    already names one it does not -- that signal, kept in the list so switching
+    the instrument shows what is wrong instead of silently rewriting the rule to
+    something else. `_verdict` refuses the set while one is still there.
+    """
     cid = cond["id"]
-    keys = list(ar.SIGNALS)
-    current = cond["field"] if cond["field"] in ar.SIGNALS else keys[0]
+    keys = list(ar.signals_for(ticker))
+    stale = cond["field"] in ar.SIGNALS and cond["field"] not in keys
+    if stale:
+        keys = [cond["field"], *keys]
+    current = cond["field"] if cond["field"] in keys else keys[0]
     with st.container(horizontal=True, vertical_alignment="bottom"):
         cond["field"] = st.selectbox(
             "Signal", keys, index=keys.index(current),
-            format_func=_signal_option, key=f"{prefix}_c{cid}_field",
+            format_func=lambda key: _signal_option(key, ticker),
+            # Instrument-scoped for the same reason the preset box is: the
+            # option list changes with it.
+            key=f"{prefix}_c{cid}_field_{ticker}",
             label_visibility="collapsed" if cond_index else "visible",
         )
         spec = ar.SIGNALS[cond["field"]]
@@ -324,12 +426,21 @@ def _condition_editor(prefix: str, index: int, cond_index: int, cond: dict) -> N
             on_click=_drop_condition, args=(prefix, index, cond_index),
             help="Remove this condition.",
         )
+    if not ar.readable_on(cond["field"], ticker):
+        model = apple_models.get(ar.SIGNALS[cond["field"]].model)
+        st.caption(
+            f":material/error: `{cond['field']}` does not exist on {ticker} — "
+            f"{model.label} was fitted on {', '.join(model.tickers)} only. Pick another "
+            "signal or delete this condition."
+        )
+        return
     st.caption(f":material/info: {spec.label} — {spec.help}")
 
 
-def _signal_option(key: str) -> str:
+def _signal_option(key: str, ticker: str) -> str:
     spec = ar.SIGNALS[key]
-    return f"{spec.group} · {spec.label}  ({key})"
+    mark = "" if ar.readable_on(key, ticker) else f" — not available on {ticker}"
+    return f"{spec.group} · {spec.label}  ({key}){mark}"
 
 
 def _ruleset_from(rules: "list[dict]") -> ar.RuleSet:
@@ -379,10 +490,10 @@ def _verdict(config: AppleTrader2Config) -> None:
     )
 
     needed = config.rules.models()
-    bundles = {key: apple_models.load(key) for key in needed}
+    bundles = {key: apple_models.load(key, config.ticker) for key in needed}
     if needed:
         st.caption(
-            ":material/memory: Models these rules load: "
+            f":material/memory: Models these rules load for {config.ticker}: "
             + ", ".join(apple_models.get(k).label for k in needed)
             + ". Every other bar signal is free."
         )
@@ -392,19 +503,25 @@ def _verdict(config: AppleTrader2Config) -> None:
             "agent runs with no saved artifacts at all."
         )
 
-    error = ar.ruleset_error(config.rules, bundles)
+    error = ar.ruleset_error(config.rules, bundles, config.ticker)
     if error:
         st.error(error)
     else:
         st.success(
-            f"Runnable. Filed in Results as `{ar.signature(config.rules, 'AAPL')}`."
+            f"Runnable on {config.ticker}. Filed in Results as "
+            f"`{ar.signature(config.rules, config.ticker)}`."
         )
 
 
-def signal_catalogue() -> None:
-    """The whole vocabulary, grouped -- rendered wherever the agent is described."""
+def signal_catalogue(ticker: "str | None" = None) -> None:
+    """The vocabulary, grouped -- rendered wherever the agent is described.
+
+    With no ticker this is the whole catalogue (what the agent *can* read, on
+    the instrument that has every model); with one it is what that instrument
+    offers.
+    """
     for group in ar.SIGNAL_GROUPS:
-        rows = ar.signals_in(group)
+        rows = ar.signals_in(group, ticker)
         if not rows:
             continue
         with st.expander(f"{group} — {len(rows)} signals"):

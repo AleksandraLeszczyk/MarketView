@@ -8,10 +8,16 @@ absorbed, so the engine, the runner and the UI branch on "is this rule-based?"
 and never on *which* rule agent it is.
 
 A `RuleAgent` supplies everything the rest of SimLab needs about one of them:
-what to call it, the one ticker it trades, how its config survives a round trip
-through the JSON experiment record, how to name that config in Results, and how
-to build a trader exposing a uniform ``run_cycle(state, tracker)`` -- which is
-what hides Apple Trader's extra ``bundle`` argument from the day loop.
+what to call it, the one ticker a given config trades, how its config survives a
+round trip through the JSON experiment record, how to name that config in
+Results, and how to build a trader exposing a uniform
+``run_cycle(state, tracker)`` -- which is what hides Apple Trader's extra
+``bundle`` argument from the day loop.
+
+The ticker is asked of the *config* rather than of the agent, because it is one
+for Apple Trader (whose strategy is a saved AAPL model) and a setting for Apple
+Trader 2 (whose strategy is a list of rules, most of which read the tape). Both
+are still single-symbol per run, which is what the dataset check depends on.
 """
 from __future__ import annotations
 
@@ -36,7 +42,7 @@ from agent_stonks.apple_trader2 import (
     APPLE_TRADER2_LABEL,
     AppleTrader2Config,
 )
-from agent_stonks.apple_trader2 import TICKER as APPLE_TRADER2_TICKER
+from agent_stonks.apple_trader2 import DEFAULT_TICKER as APPLE_TRADER2_TICKER
 from agent_stonks.apple_trader2 import build_trader as build_apple2
 from agent_stonks.apple_trader2 import config_error as apple2_config_error
 from agent_stonks.apple_trader2 import config_signature as apple2_config_signature
@@ -50,10 +56,15 @@ class RuleAgent:
     key: str
     label: str
     avatar: str
-    # The single symbol it trades. A rule agent is single-symbol by design,
-    # and a dataset without that symbol is a configuration mistake worth
-    # catching before the run produces an empty ledger.
-    ticker: str
+    # config -> the single symbol that config trades. A rule agent is
+    # single-symbol per run by design, and a dataset without that symbol is a
+    # configuration mistake worth catching before the run produces an empty
+    # ledger.
+    ticker: Callable[[Any], str]
+    # The symbol a config that has not been built yet would trade -- what a
+    # description page names, and the fallback wherever there is no config in
+    # hand.
+    default_ticker: str
     # config -> a trader exposing `run_cycle(state, tracker)`. May raise
     # RuntimeError when something the agent depends on is not installed.
     build: Callable[[Any], Any]
@@ -166,7 +177,10 @@ RULE_AGENTS: dict[str, RuleAgent] = {
         key=APPLE_TRADER_KEY,
         label=APPLE_TRADER_LABEL,
         avatar=APPLE_TRADER_AVATAR,
-        ticker=APPLE_TRADER_TICKER,
+        # Not configurable: both of this agent's strategies *are* a saved AAPL
+        # model, so there is nothing to point at another symbol.
+        ticker=lambda config: APPLE_TRADER_TICKER,
+        default_ticker=APPLE_TRADER_TICKER,
         build=_build_apple,
         signature=_apple_signature,
         to_record=asdict,
@@ -176,7 +190,8 @@ RULE_AGENTS: dict[str, RuleAgent] = {
         key=APPLE_TRADER2_KEY,
         label=APPLE_TRADER2_LABEL,
         avatar=APPLE_TRADER2_AVATAR,
-        ticker=APPLE_TRADER2_TICKER,
+        ticker=lambda config: config.ticker,
+        default_ticker=APPLE_TRADER2_TICKER,
         build=_build_apple2,
         signature=apple2_config_signature,
         # The config owns its own JSON shape here rather than falling out of

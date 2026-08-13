@@ -15,6 +15,14 @@ is the strategy.
     orders    one market order per bar at most, through the same
               `DecisionTracker` as every other personality.
 
+It also picks its own instrument, which Apple Trader cannot. There the strategy
+*is* a saved AAPL model, so the symbol is not a choice; here a model is one
+signal among many, and the rest of the vocabulary is computed from bars and
+means the same thing on every symbol. So the config names a ticker, the
+catalogue narrows to what exists for it (`apple_rules.signals_for`) and a rule
+naming a model that symbol has none of is refused before the run rather than
+sitting permanently unmet inside it.
+
 Three properties worth stating, because they are what make a list of rules
 behave predictably rather than merely expressively:
 
@@ -77,21 +85,32 @@ APPLE_TRADER2_KEY = "apple_trader2"
 APPLE_TRADER2_LABEL = "Apple Trader 2 (adjustable rules)"
 APPLE_TRADER2_AVATAR = "Multiavatar-088d131670fd0343f5.png"
 
-# Same one symbol as Apple Trader, and for the same reason: every model a rule
-# can name was fitted on AAPL alone and none of the notebooks claims transfer.
-TICKER = "AAPL"
+# The symbol a run trades unless its config says otherwise. Unlike Apple Trader
+# (which is AAPL-only because both its strategies *are* a saved model) the
+# instrument here is configuration: a rule set written on the bar, the momentum
+# regime, the position and the clock is computed from the tape and means the
+# same thing on any symbol, and the models that are not symbol-agnostic are
+# simply not offered elsewhere -- see `apple_rules.signals_for`.
+DEFAULT_TICKER = apple_models.DEFAULT_TICKER
 
 
 @dataclass
 class AppleTrader2Config:
-    """The whole configuration: a rule set, and the one rule that is not in it.
+    """The whole configuration: an instrument, a rule set, and the one rule that
+    is not in it.
 
     `flatten_before_close_min` is deliberately outside the list -- see the
     module docstring. Everything else a run does is in `rules`.
+
+    `ticker` is not a signal and not a rule: it decides which symbol's bars the
+    whole list is evaluated against, and therefore which model signals exist at
+    all. Which is why it is validated together with the rules
+    (`apple_rules.ruleset_error`) rather than on its own.
     """
 
     rules: RuleSet = field(default_factory=apple_rules.preset)
     flatten_before_close_min: int = APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN
+    ticker: str = DEFAULT_TICKER
 
     def __post_init__(self) -> None:
         # A config reconstructed from a stored SimLab record arrives with plain
@@ -99,11 +118,13 @@ class AppleTrader2Config:
         if not isinstance(self.rules, RuleSet):
             self.rules = RuleSet.from_record(self.rules)
         self.flatten_before_close_min = int(self.flatten_before_close_min)
+        self.ticker = (self.ticker or DEFAULT_TICKER).strip().upper()
 
     def to_record(self) -> dict:
         return {
             "rules": self.rules.to_record(),
             "flatten_before_close_min": self.flatten_before_close_min,
+            "ticker": self.ticker,
         }
 
     @classmethod
@@ -114,30 +135,43 @@ class AppleTrader2Config:
             flatten_before_close_min=raw.get(
                 "flatten_before_close_min", APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN
             ),
+            # A record written before the instrument was configurable describes
+            # an AAPL run, which is what the default decodes to -- the same
+            # reason `rule_agents._APPLE_LEGACY` exists.
+            ticker=raw.get("ticker") or DEFAULT_TICKER,
         )
 
 
 def config_signature(config: "AppleTrader2Config | None" = None) -> str:
-    """The compact identity SimLab groups runs on. See `apple_rules.signature`."""
-    return apple_rules.signature((config or AppleTrader2Config()).rules, TICKER)
+    """The compact identity SimLab groups runs on. See `apple_rules.signature`.
+
+    The instrument is in it because it is part of the strategy: the same rules
+    over GOOGL are a different experiment from the same rules over AAPL, and
+    filing them together would average two tapes into one row.
+    """
+    config = config or AppleTrader2Config()
+    return apple_rules.signature(config.rules, config.ticker)
 
 
 def load_bundles(config: AppleTrader2Config) -> "dict[str, dict | None]":
-    """Every model bundle the enabled rules name, loaded once.
+    """Every model bundle the enabled rules name, for this config's instrument,
+    loaded once.
 
     A rule set that names no model loads nothing at all and needs neither the
     saved artifacts nor PyTorch -- a set written entirely out of price, momentum
     and the position is a perfectly good strategy and should not pay for a
     200 MB dependency it never calls.
     """
-    return {key: apple_models.load(key) for key in config.rules.models()}
+    return {
+        key: apple_models.load(key, config.ticker) for key in config.rules.models()
+    }
 
 
 def config_error(
     config: AppleTrader2Config, bundles: "dict[str, dict | None]"
 ) -> "str | None":
     """Why this configuration cannot run, or None. See `apple_rules.ruleset_error`."""
-    return apple_rules.ruleset_error(config.rules, bundles)
+    return apple_rules.ruleset_error(config.rules, bundles, config.ticker)
 
 
 def _dayrange():
@@ -160,7 +194,8 @@ class SessionForecaster:
     and a half hours.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ticker: str = DEFAULT_TICKER) -> None:
+        self.ticker = ticker
         self.plan: "dict | None" = None
         self.blocked: "dict | None" = None
 
@@ -181,13 +216,15 @@ class SessionForecaster:
         if len(frame) < want:
             return None
         try:
-            opening = fetch_opening_window(state, frame, want)
+            opening = fetch_opening_window(state, frame, want, ticker=self.ticker)
             history = dayrange.daily_frame_from_bars(
-                historical.fetch_daily_ohlc_bars(TICKER, days=dayrange.DAILY_HISTORY_DAYS)
+                historical.fetch_daily_ohlc_bars(
+                    self.ticker, days=dayrange.DAILY_HISTORY_DAYS
+                )
             )
             forecast = dayrange.forecast_session(
                 bundle, history, opening, today,
-                open_price=historical.fetch_session_open(TICKER),
+                open_price=historical.fetch_session_open(self.ticker),
             )
         except Exception as exc:
             self.blocked = {"date": today, "reason": str(exc)}
@@ -196,8 +233,8 @@ class SessionForecaster:
                 {
                     "type": "error",
                     "text": (
-                        f"No {TICKER} day-range forecast for this session, so every rule "
-                        f"written on it is dormant today: {exc}"
+                        f"No {self.ticker} day-range forecast for this session, so every "
+                        f"rule written on it is dormant today: {exc}"
                     ),
                 },
             )
@@ -212,7 +249,7 @@ class SessionForecaster:
             {
                 "type": "analysis",
                 "text": (
-                    f"{TICKER} forecast for the session: high "
+                    f"{self.ticker} forecast for the session: high "
                     f"${forecast['pred_high']:,.2f}, low ${forecast['pred_low']:,.2f}, "
                     f"14-day average range ${forecast['adr14_abs']:,.2f}."
                 ),
@@ -516,13 +553,16 @@ class AppleTrader2:
     ) -> None:
         self.config = config or AppleTrader2Config()
         self.bundles = bundles or {}
+        # Read off the config once: every log line, order and state lookup below
+        # is about this one symbol, and the config is not re-read mid-run.
+        self.ticker = self.config.ticker
         # The momentum settings every regime signal is computed with. They come
         # from whichever momentum bundle the rules named -- the two carry the
         # same numbers -- and fall back to the shipped defaults when no rule
         # names one, which is what lets a price-only rule set run with no model
         # files present at all.
         self.params = persistence_model.momentum_params(self._momentum_bundle())
-        self.forecaster = SessionForecaster()
+        self.forecaster = SessionForecaster(self.ticker)
         # The open long: average entry, the peak the give-back is measured from,
         # and how many bars it has been held. None while flat.
         self.entry: "dict | None" = None
@@ -553,9 +593,15 @@ class AppleTrader2:
     def run_cycle(self, state: AppState, tracker: DecisionTracker) -> str:
         """Read the newest closed bar and act on it. Returns a short outcome tag
         ("bought", "sold", "hold", "warming_up", "closed", "no_data")."""
-        sym_state = state.sym(TICKER)
+        sym_state = state.sym(self.ticker)
         if sym_state is None:
-            _log(state, {"type": "error", "text": f"{TICKER} is not being streamed; nothing to trade."})
+            _log(
+                state,
+                {
+                    "type": "error",
+                    "text": f"{self.ticker} is not being streamed; nothing to trade.",
+                },
+            )
             return "no_data"
 
         if not market_hours.is_market_open():
@@ -567,7 +613,7 @@ class AppleTrader2:
 
         frame = persistence_model.minute_frame(sym_state)
         if not len(frame):
-            _log(state, {"type": "status", "text": f"No {TICKER} bars yet today."})
+            _log(state, {"type": "status", "text": f"No {self.ticker} bars yet today."})
             return "no_data"
 
         ts = frame.index[-1]
@@ -577,7 +623,7 @@ class AppleTrader2:
             self.last_bar_ts = ts
             self.bar_count += 1
 
-        position = tracker.position_for(TICKER)
+        position = tracker.position_for(self.ticker)
         self._reconcile(position, float(frame["close"].iloc[-1]))
         if fresh_bar:
             high = float(frame["high"].iloc[-1])
@@ -702,7 +748,7 @@ class AppleTrader2:
         self, state: AppState, tracker: DecisionTracker, match: apple_rules.Match, bus: SignalBus
     ) -> str:
         decision = tracker.record_trade(
-            TICKER, match.item.action, match.quantity, self._reasoning(match, bus),
+            self.ticker, match.item.action, match.quantity, self._reasoning(match, bus),
             state.api_key, state.api_secret, state.feed,
         )
         _log(
@@ -721,7 +767,7 @@ class AppleTrader2:
             return "hold"
 
         self.fired_at[match.index] = self.bar_count
-        self._book(match.item.action, decision, tracker.position_for(TICKER))
+        self._book(match.item.action, decision, tracker.position_for(self.ticker))
         return "bought" if match.item.action == apple_rules.BUY else "sold"
 
     def _book(self, action: str, decision, position: float) -> None:
@@ -764,7 +810,7 @@ class AppleTrader2:
         entry_price = (self.entry or {}).get("price") or 0.0
         pnl_pct = (bus.price / entry_price - 1) * 100 if entry_price else 0.0
         decision = tracker.record_trade(
-            TICKER, apple_rules.SELL, position,
+            self.ticker, apple_rules.SELL, position,
             (
                 f"Session ends in {to_close / 60:.0f} min. Every signal these rules read is "
                 "intraday, so the book is flattened rather than carried overnight "
@@ -815,7 +861,7 @@ class AppleTrader2:
         _log(state, {"type": "analysis", "text": self._read_summary(bus, position)})
 
     def _read_summary(self, bus: SignalBus, position: float) -> str:
-        parts = [f"{TICKER} {bus.ts:%H:%M} ${bus.price:,.2f}"]
+        parts = [f"{self.ticker} {bus.ts:%H:%M} ${bus.price:,.2f}"]
         # Only the signals the rules actually read this bar, in the order they
         # were read -- so the log shows what the decision was made on, including
         # which conditions were never reached. The two the position line below
@@ -862,7 +908,7 @@ def armed_summary(config: AppleTrader2Config) -> str:
     rules = "\n".join(apple_rules.describe(config.rules))
     models = ", ".join(apple_models.get(k).label for k in config.rules.models()) or "none"
     return (
-        f"Apple Trader 2 armed on {len(config.rules.active)} rule(s) over {TICKER} "
+        f"Apple Trader 2 armed on {len(config.rules.active)} rule(s) over {config.ticker} "
         f"(models needed: {models}). At most one fires per closed bar, first match "
         f"wins, and anything still open is flattened "
         f"{config.flatten_before_close_min} min before the close:\n{rules}"
@@ -915,17 +961,19 @@ def launch_apple_trader2(
 ) -> None:
     """Stop any running agent for this state, then start the Apple Trader 2 loop.
 
-    It trades only `TICKER`, which must already be streamed. No LLM client, no
-    tools and no tactics are involved -- the loop places its own orders through
-    the same `DecisionTracker` as every other personality.
+    It trades only the one symbol its config names, which must already be
+    streamed. No LLM client, no tools and no tactics are involved -- the loop
+    places its own orders through the same `DecisionTracker` as every other
+    personality.
     """
+    config = config or AppleTrader2Config()
     stop_agent(state)
     stop_event = threading.Event()
     state.agent_stop_event = stop_event
     state.agent_running = True
-    scoring.begin_session(state, APPLE_TRADER2_KEY, [TICKER])
+    scoring.begin_session(state, APPLE_TRADER2_KEY, [config.ticker])
     threading.Thread(
         target=_apple_trader2_loop,
-        args=(state, tracker, config or AppleTrader2Config(), cycle_sec, stop_event),
+        args=(state, tracker, config, cycle_sec, stop_event),
         daemon=True,
     ).start()

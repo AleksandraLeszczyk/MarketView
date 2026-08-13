@@ -334,20 +334,24 @@ class SimulationEngine:
         """The selected rule agent's state machine, or a clear failure.
 
         The ticker check catches a configuration mistake that would otherwise
-        show up as an empty run: the one symbol the agent trades not being in
-        the dataset. Whatever else the agent needs (Apple Trader's saved
-        bundle) is the registry's problem, and fails just as loudly.
+        show up as an empty run: the one symbol this run trades not being in the
+        dataset. Which symbol that is comes from the decoded config -- fixed for
+        Apple Trader, a setting for Apple Trader 2 -- so the config is built
+        first. Whatever else the agent needs (Apple Trader's saved bundle) is
+        the registry's problem, and fails just as loudly.
 
         Every indicator these agents read is session-local, so one stored day
         is a complete, like-live run -- there is nothing behind it to miss.
         """
         agent = rule_agent(self.config.personality)
-        if agent.ticker not in self.app.symbols:
+        config = agent.from_record(self.config.rule_config)
+        ticker = agent.ticker(config)
+        if ticker not in self.app.symbols:
             raise RuntimeError(
-                f"{agent.label} only trades {agent.ticker}; this simulation's "
+                f"{agent.label} only trades {ticker}; this simulation's "
                 f"symbols are {', '.join(self.app.symbols) or 'none'}."
             )
-        return agent.build(agent.from_record(self.config.rule_config))
+        return agent.build(config)
 
     def _run_rule_day(self, day: date, trader: Any) -> None:
         """Score every closed bar of the session, in order.

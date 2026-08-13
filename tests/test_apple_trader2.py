@@ -12,15 +12,20 @@ Three layers, pinned separately because they fail separately:
 """
 
 import threading
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from agent_stonks import apple_models
 from agent_stonks import apple_rules as ar
 from agent_stonks import apple_trader2 as at2
 from agent_stonks import clock, persistence_model
 from agent_stonks.apple_rules import ActionItem, Condition, RuleSet
-from agent_stonks.apple_trader2 import TICKER, AppleTrader2, AppleTrader2Config, SignalBus
+from agent_stonks.apple_trader2 import (
+    DEFAULT_TICKER as TICKER,
+)
+from agent_stonks.apple_trader2 import AppleTrader2, AppleTrader2Config, SignalBus
 from agent_stonks.broker import Broker
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState
@@ -314,6 +319,132 @@ class TestValidation:
             assert monkey is None or "cannot answer" in monkey
 
 
+# ----------------------------------------------------------------- instrument
+#
+# What a symbol changes is which model signals exist for it -- nothing else.
+# `UNMODELLED` stands for every ticker nobody fitted anything on, which is the
+# case the tape-only half of the catalogue exists for.
+
+UNMODELLED = "MSFT"
+DAYRANGE_ONLY = "GOOGL"
+
+
+class TestInstrument:
+    def test_the_models_on_offer_follow_the_symbol(self):
+        assert apple_models.keys_for(TICKER) == ["persistence", "nbeats", "dayrange"]
+        assert apple_models.keys_for(DAYRANGE_ONLY) == ["dayrange"]
+        assert apple_models.keys_for("INTC") == ["dayrange"]
+        assert apple_models.keys_for(UNMODELLED) == []
+
+    def test_a_model_is_not_loaded_for_a_symbol_it_was_not_fitted_on(self, monkeypatch):
+        """Cheaper than the file check and more honest: there is no GOOGL
+        N-BEATS file to be missing, because there is no GOOGL N-BEATS model."""
+        called: list = []
+        monkeypatch.setitem(
+            apple_models.MODELS, "nbeats",
+            replace(apple_models.MODELS["nbeats"], load=called.append),
+        )
+        assert apple_models.load("nbeats", DAYRANGE_ONLY) is None
+        assert called == []
+        # ...and the loader is still reached for the symbol it does cover.
+        apple_models.load("nbeats", TICKER)
+        assert called == [TICKER]
+        reason = apple_models.unavailable_reason("nbeats", DAYRANGE_ONLY)
+        assert "no" in reason.lower() and "AAPL" in reason
+
+    def test_the_catalogue_narrows_but_never_below_the_tape(self):
+        every = set(ar.signals_for(TICKER))
+        dayrange_only = set(ar.signals_for(DAYRANGE_ONLY))
+        unmodelled = set(ar.signals_for(UNMODELLED))
+
+        assert every == set(ar.SIGNALS)
+        assert "nbeats.turn_proba" not in dayrange_only
+        assert "persistence.proba" not in dayrange_only
+        assert "dayrange.pred_high_dip_adr" in dayrange_only
+        assert not any("." in key and key.split(".")[0] in apple_models.MODELS
+                       for key in unmodelled)
+        # The model-free half is identical on every symbol: it is computed from
+        # bars, and bars are bars.
+        tape = {key for key, spec in ar.SIGNALS.items() if spec.model is None}
+        assert unmodelled == tape and tape < dayrange_only
+
+    def test_a_rule_naming_an_absent_model_is_refused_with_the_signal_named(self):
+        rules = ar.preset("Momentum — anticipate the turn (Apple Trader's default)")
+        error = ar.ruleset_error(rules, {}, DAYRANGE_ONLY)
+        assert "nbeats.turn_proba" in error and DAYRANGE_ONLY in error
+        # ...and on AAPL the same rules get past this check, on to the ones
+        # about the bundle itself (which a stub cannot satisfy).
+        assert "cannot be read on" not in (
+            ar.ruleset_error(rules, {"nbeats": {"stub": True}}, TICKER) or ""
+        )
+
+    def test_the_missing_model_is_reported_before_the_missing_file(self):
+        """Two different problems: 'GOOGL has no N-BEATS model' sends the reader
+        to the instrument picker, 'the file is not installed' sends them looking
+        for a file that was never meant to exist."""
+        rules = ar.preset("Momentum — anticipate the turn (Apple Trader's default)")
+        error = ar.ruleset_error(rules, {"nbeats": None}, DAYRANGE_ONLY)
+        assert "cannot be read on" in error and "not installed" not in error
+
+    def test_every_preset_offered_for_a_symbol_runs_on_it(self):
+        for symbol in (TICKER, DAYRANGE_ONLY, UNMODELLED):
+            offered = ar.presets_for(symbol)
+            assert offered, symbol
+            for name in offered:
+                rules = ar.preset(name, symbol)
+                bundles = {key: {"stub": True} for key in rules.models()}
+                error = ar.ruleset_error(rules, bundles, symbol)
+                assert error is None or "cannot answer" in error, (symbol, name, error)
+
+    def test_an_unmodelled_symbol_still_has_somewhere_to_start(self):
+        assert ar.presets_for(UNMODELLED) == [ar.MODEL_FREE_PRESET]
+        assert ar.default_preset(UNMODELLED) == ar.MODEL_FREE_PRESET
+        assert ar.preset(None, UNMODELLED).models() == []
+
+    def test_a_preset_that_does_not_apply_falls_back_rather_than_failing(self):
+        """The picker can be pointed at a symbol while holding another's preset
+        name; the fallback is what keeps that from producing an unrunnable set."""
+        rules = ar.preset(
+            "Momentum — anticipate the turn (Apple Trader's default)", UNMODELLED
+        )
+        assert rules.unreadable_on(UNMODELLED) == []
+
+    def test_the_bundles_loaded_are_the_configs_symbols(self, monkeypatch):
+        asked: list = []
+        monkeypatch.setattr(
+            at2.apple_models, "load",
+            lambda key, ticker=None: asked.append((key, ticker)),
+        )
+        config = AppleTrader2Config(
+            rules=ar.preset("Day range — two levels below the predicted high"),
+            ticker=DAYRANGE_ONLY,
+        )
+        at2.load_bundles(config)
+        assert asked == [("dayrange", DAYRANGE_ONLY)]
+
+    def test_the_configured_symbol_is_the_one_traded(self, market_open, monkeypatch):
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        state = AppState()
+        state.set_symbols([DAYRANGE_ONLY])
+        state.api_key, state.api_secret, state.feed = "k", "s", "iex"
+        trader = trader_for(buy_below(99.5), ticker=DAYRANGE_ONLY)
+
+        tape.bar(99.0)
+        assert trader.run_cycle(state, tracker) == "bought"
+        assert tracker.position_for(DAYRANGE_ONLY) > 0
+        assert tracker.position_for(TICKER) == 0
+
+    def test_a_symbol_that_is_not_streamed_says_so(self, state, market_open, monkeypatch):
+        """`state` streams AAPL only."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        Tape(monkeypatch, None)
+        trader = trader_for(buy_below(99.5), ticker=DAYRANGE_ONLY)
+        assert trader.run_cycle(state, tracker) == "no_data"
+        assert DAYRANGE_ONLY in state.agent_log[-1]["text"]
+
+
 # -------------------------------------------------------- record and identity
 
 
@@ -327,10 +458,32 @@ class TestRecordAndSignature:
         assert restored.flatten_before_close_min == 3
         assert restored.to_record() == config.to_record()
 
+    def test_the_instrument_survives_the_round_trip(self):
+        config = AppleTrader2Config(
+            rules=ar.preset(None, DAYRANGE_ONLY), ticker=DAYRANGE_ONLY
+        )
+        assert AppleTrader2Config.from_record(config.to_record()).ticker == DAYRANGE_ONLY
+
+    def test_a_record_written_before_the_instrument_existed_is_an_aapl_run(self):
+        """A stored record describes a run that already happened, so a missing
+        key has to decode to the behaviour of the day it was written."""
+        legacy = {"rules": ar.preset().to_record(), "flatten_before_close_min": 5}
+        assert AppleTrader2Config.from_record(legacy).ticker == TICKER
+
     def test_the_signature_carries_the_numbers(self):
         signature = at2.config_signature(AppleTrader2Config(rules=ar.preset()))
         assert signature.startswith("apple2_AAPL(")
         assert "nbeats.turn_proba>=0.05" in signature
+
+    def test_the_same_rules_on_another_symbol_are_another_configuration(self):
+        """Two tapes are two experiments; filing them together would average
+        them into one row in Results."""
+        rules = ar.preset("Day range — two levels below the predicted high")
+        assert at2.config_signature(
+            AppleTrader2Config(rules=rules, ticker=TICKER)
+        ) != at2.config_signature(
+            AppleTrader2Config(rules=rules, ticker=DAYRANGE_ONLY)
+        )
 
     def test_moving_a_threshold_is_a_different_configuration(self):
         one = ar.preset()
@@ -532,9 +685,12 @@ class Tape:
             self.broker.price = close
 
 
-def trader_for(*items, flatten: int = 5) -> AppleTrader2:
+def trader_for(*items, flatten: int = 5, ticker: str = TICKER) -> AppleTrader2:
     return AppleTrader2(
-        AppleTrader2Config(rules=RuleSet(items=list(items)), flatten_before_close_min=flatten),
+        AppleTrader2Config(
+            rules=RuleSet(items=list(items)), flatten_before_close_min=flatten,
+            ticker=ticker,
+        ),
         bundles={},
     )
 

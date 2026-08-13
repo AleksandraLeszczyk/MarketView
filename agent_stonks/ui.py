@@ -1844,12 +1844,15 @@ def _apple_momentum_params(
     )
 
 
-def _apple_trader2_params() -> AppleTrader2Config:
-    """Apple Trader 2's rules.
+def _apple_trader2_params(symbols: list[str]) -> AppleTrader2Config:
+    """Apple Trader 2's instrument and rules.
 
     No model picker here, unlike Apple Trader: a model is not a strategy in this
     agent, it is a signal a condition may name, and which ones get loaded falls
-    out of what the rules read. The whole configuration is the list.
+    out of what the rules read. What *is* picked is the instrument, because it
+    decides which of those signals exist -- the streamed symbols are offered
+    alongside the modelled ones, since a symbol that is not being streamed has
+    no bars to read.
     """
     with st.expander("Apple Trader 2 rules", expanded=True):
         st.caption(
@@ -1858,9 +1861,9 @@ def _apple_trader2_params() -> AppleTrader2Config:
             "and the first match wins, so the order is the priority. Start from a preset "
             "and edit, or build one from scratch."
         )
-        config = rules_panel("apple_trader2")
-        with st.expander("Every signal a condition can read"):
-            signal_catalogue()
+        config = rules_panel("apple_trader2", symbols=symbols)
+        with st.expander(f"Every signal a condition can read on {config.ticker}"):
+            signal_catalogue(config.ticker)
     return config
 
 
@@ -1941,9 +1944,11 @@ def _agent_panel(
                 "conditions that arm it — a model's forecast, the momentum regime, the "
                 "price, the open position's P&L or give-back, the clock — joined with "
                 "AND or OR. One action per closed bar, first matching rule wins, and the "
-                "book is flattened before the close whatever the list says. It trades "
-                f"{APPLE_TRADER_TICKER} only, for the same reason, and the "
-                "provider/model settings below do not apply to it."
+                "book is flattened before the close whatever the list says. Unlike Apple "
+                "Trader it picks **which symbol** it trades: the saved models decide "
+                "which forecasts are offered for it, and on a symbol none was fitted on "
+                "the rules read the tape alone. The provider/model settings below do not "
+                "apply to it."
             )
         provider = st.selectbox(
             "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
@@ -1967,7 +1972,9 @@ def _agent_panel(
             st.caption(f"⚠️ {env_var} is not set.")
 
     apple_config = _apple_trader_params() if personality == APPLE_TRADER_KEY else None
-    apple2_config = _apple_trader2_params() if personality == APPLE_TRADER2_KEY else None
+    apple2_config = (
+        _apple_trader2_params(symbols) if personality == APPLE_TRADER2_KEY else None
+    )
 
     c1, c2, c3 = st.columns([1.2, 1, 1])
     starting_budget = c1.number_input(
@@ -1987,14 +1994,21 @@ def _agent_panel(
         syms = list(symbols or state.symbols)
         is_apple_trader = personality == APPLE_TRADER_KEY
         is_rule_agent = personality in RULE_AGENT_KEYS
+        # The one symbol this run trades: fixed for Apple Trader, configured for
+        # Apple Trader 2. Either way it has to be streamed, or there are no bars
+        # to read and the agent would idle all session.
+        rule_ticker = (
+            apple2_config.ticker
+            if personality == APPLE_TRADER2_KEY and apple2_config is not None
+            else APPLE_TRADER_TICKER
+        )
         stream_ready = False
         if not syms:
             st.error("Enter at least one symbol in the sidebar first.")
-        elif is_rule_agent and APPLE_TRADER_TICKER not in syms:
+        elif is_rule_agent and rule_ticker not in syms:
             st.error(
-                f"{_personality_label(personality)} only trades {APPLE_TRADER_TICKER} "
-                f"(the one symbol its models were fitted on); add {APPLE_TRADER_TICKER} "
-                "to the symbols in the sidebar."
+                f"{_personality_label(personality)} is configured to trade "
+                f"{rule_ticker}; add {rule_ticker} to the symbols in the sidebar."
             )
         elif not llm_key and not is_rule_agent:
             st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")

@@ -23,6 +23,17 @@ it.
                     matches and can transact fires, and at most one fires per
                     bar.
 
+The catalogue is one thing; what is *readable on a given instrument* is
+another. Every model here was fitted on specific symbols and none of the
+notebooks claims transfer, so `signals_for(ticker)` is the list a builder
+offers: on AAPL it is everything, on GOOGL and INTC it drops the two momentum
+models (TimeToChange2 only ever ran on AAPL) and keeps the day-range forecast,
+and on anything else it is the model-free half -- the bar, the momentum regime,
+the position and the clock, which are computed from the tape and mean the same
+thing on every symbol. `ruleset_error` re-checks the same fact, so a rule set
+carried over from another instrument is refused with the signal named rather
+than quietly running with that condition permanently unmet.
+
 What that buys, concretely: the two shipped strategies both come out of it as
 ordinary rule sets (see `PRESETS`), so the vocabulary is at least as expressive
 as what it replaces -- and everything between and around them is now sayable.
@@ -324,9 +335,31 @@ SIGNAL_GROUPS = (
     GROUP_BAR, GROUP_MOMENTUM, GROUP_MODEL, GROUP_DAYRANGE, GROUP_POSITION, GROUP_CLOCK,
 )
 
+# The symbol every ticker-aware entry point here defaults to, so the whole
+# module still reads as "AAPL, unless told otherwise".
+DEFAULT_TICKER = apple_models.DEFAULT_TICKER
 
-def signals_in(group: str) -> "list[Signal]":
-    return [s for s in SIGNALS.values() if s.group == group]
+
+def readable_on(key: str, ticker: "str | None" = None) -> bool:
+    """Whether one signal can be read on this instrument.
+
+    True for every tape, momentum, position and clock signal on every symbol --
+    those are computed here, from bars. False for a model signal on a symbol
+    that model was not fitted on, which is the whole ticker dimension.
+    """
+    spec = SIGNALS.get(key)
+    if spec is None:
+        return False
+    return spec.model is None or apple_models.covers(spec.model, ticker)
+
+
+def signals_for(ticker: "str | None" = None) -> "dict[str, Signal]":
+    """The catalogue as it applies to one instrument, in catalogue order."""
+    return {key: spec for key, spec in SIGNALS.items() if readable_on(key, ticker)}
+
+
+def signals_in(group: str, ticker: "str | None" = None) -> "list[Signal]":
+    return [s for s in signals_for(ticker).values() if s.group == group]
 
 
 def signal(key: str) -> "Signal | None":
@@ -437,6 +470,16 @@ class RuleSet:
         """The `apple_models` keys whose bundles this rule set needs loaded."""
         needed = {SIGNALS[f].model for f in self.fields()}
         return [k for k in apple_models.keys() if k in needed]
+
+    def unreadable_on(self, ticker: "str | None") -> "list[str]":
+        """The signals this rule set names that do not exist for this symbol.
+
+        Non-empty means the set was written for a different instrument: a
+        `nbeats.turn_proba` condition carried onto GOOGL would never be met and
+        the run would finish clean and empty, which reads like a strategy result.
+        `ruleset_error` turns this into a refusal.
+        """
+        return [key for key in self.fields() if not readable_on(key, ticker)]
 
     def reads_momentum(self) -> bool:
         """Whether anything here depends on the momentum pipeline warming up.
@@ -584,7 +627,11 @@ def first_match(
 # --- validation --------------------------------------------------------------
 
 
-def ruleset_error(ruleset: RuleSet, bundles: "dict[str, dict | None]") -> "str | None":
+def ruleset_error(
+    ruleset: RuleSet,
+    bundles: "dict[str, dict | None]",
+    ticker: "str | None" = None,
+) -> "str | None":
     """Why this rule set cannot run, or None if it can.
 
     Checked once before a run starts rather than per bar, for the reason
@@ -594,8 +641,11 @@ def ruleset_error(ruleset: RuleSet, bundles: "dict[str, dict | None]") -> "str |
     strategy result instead of a missing file.
 
     `bundles` is what `apple_models.load` returned for each key the rule set
-    named -- None for one that could not be assembled.
+    named -- None for one that could not be assembled. `ticker` is the
+    instrument the run is configured for, which decides which signals exist at
+    all.
     """
+    symbol = (ticker or DEFAULT_TICKER).upper()
     if not ruleset.active:
         return (
             "This rule set has no enabled rules, so the agent would watch the tape and "
@@ -617,13 +667,35 @@ def ruleset_error(ruleset: RuleSet, bundles: "dict[str, dict | None]") -> "str |
             "are about. Add a buy rule."
         )
 
+    # Before anything is loaded: signals that do not exist on this instrument.
+    # This is the check a rule set carried over from another symbol trips, and
+    # it comes first because "there is no such model for GOOGL" is a different
+    # problem from "the GOOGL model is not installed" and the second message
+    # would send the reader looking for a file that was never meant to exist.
+    unreadable = ruleset.unreadable_on(symbol)
+    if unreadable:
+        # One model per message, even when two are missing: the fix is per
+        # model, and the second one surfaces on the next check.
+        key = SIGNALS[unreadable[0]].model
+        model = apple_models.get(key)
+        named = ", ".join(
+            f"`{f}`" for f in unreadable if SIGNALS[f].model == key
+        )
+        return (
+            f"{named} cannot be read on {symbol}: {model.label} was fitted on "
+            f"{', '.join(model.tickers)} only. Drop those conditions, or switch the "
+            f"instrument back to one the model covers."
+        )
+
     for key in ruleset.models():
         bundle = bundles.get(key)
         if bundle is None:
             named = ", ".join(
                 f"`{f}`" for f in ruleset.fields() if SIGNALS[f].model == key
             )
-            return f"{apple_models.unavailable_reason(key)} {named} cannot be read."
+            return (
+                f"{apple_models.unavailable_reason(key, symbol)} {named} cannot be read."
+            )
         for field_key in ruleset.fields():
             spec = SIGNALS[field_key]
             if spec.model != key or not spec.needs_forecast:
@@ -858,16 +930,84 @@ def _scale_in_take_half() -> RuleSet:
     )
 
 
+def _tape_turn_trail() -> RuleSet:
+    """The same idea as the notebook's rule with the model taken out: buy the
+    printed change into positive, trail out.
+
+    The one preset that names no model, and therefore the one that runs on
+    *any* instrument. What it drops is the whole question the models answer --
+    whether this particular change is likely to hold — so it takes every change
+    into positive rather than the rated ones, which is a materially different
+    (and untested) strategy rather than a cheaper version of the same one. It is
+    here because an instrument with no saved model still needs somewhere to
+    start, and because it makes the models' contribution measurable: run this
+    against `Momentum — confirm the turn` on AAPL and the difference is what the
+    classifier is worth.
+    """
+    return RuleSet(
+        items=[
+            ActionItem(
+                action=SELL, size_mode=SIZE_PCT, size=100.0,
+                label="Trailing stop",
+                conditions=[Condition("pos.drawdown_pct", OP_BELOW, -0.5)],
+            ),
+            ActionItem(
+                action=BUY, size_mode=SIZE_PCT, size=95.0,
+                label="Buy the change into positive, while flat",
+                conditions=[
+                    Condition("pos.shares", OP_BELOW, 0.0),
+                    Condition("mom.to_positive", OP_ABOVE, 0.5),
+                    Condition("mom.pre_dwell", OP_ABOVE, 15.0),
+                ],
+            ),
+        ]
+    )
+
+
 PRESETS: "dict[str, Callable[[], RuleSet]]" = {
     "Momentum — anticipate the turn (Apple Trader's default)": _momentum_anticipate,
     "Momentum — confirm the turn (the notebook's rule)": _momentum_confirm,
     "Day range — two levels below the predicted high": _dayrange_levels,
     "Scale in, take half off, trail the rest": _scale_in_take_half,
+    "Tape only — buy the regime turn, trail out (no model)": _tape_turn_trail,
 }
 
 DEFAULT_PRESET = "Momentum — anticipate the turn (Apple Trader's default)"
+# What every instrument can run, whatever is installed and whatever was fitted.
+MODEL_FREE_PRESET = "Tape only — buy the regime turn, trail out (no model)"
 
 
-def preset(name: "str | None" = None) -> RuleSet:
-    """A named preset, freshly built (never a shared mutable instance)."""
-    return PRESETS.get(name or DEFAULT_PRESET, PRESETS[DEFAULT_PRESET])()
+def presets_for(ticker: "str | None" = None) -> "list[str]":
+    """The presets whose signals all exist on this instrument.
+
+    A preset is a starting point, and one that cannot run on the instrument it
+    is offered for is a trap rather than a starting point -- on GOOGL that is
+    the day-range pair and the model-free one, on an unmodelled symbol only the
+    model-free one.
+    """
+    return [
+        name for name, build in PRESETS.items()
+        if not build().unreadable_on(ticker)
+    ]
+
+
+def default_preset(ticker: "str | None" = None) -> str:
+    """The preset a fresh builder starts on for this instrument."""
+    available = presets_for(ticker)
+    if DEFAULT_PRESET in available:
+        return DEFAULT_PRESET
+    return available[0] if available else MODEL_FREE_PRESET
+
+
+def preset(name: "str | None" = None, ticker: "str | None" = None) -> RuleSet:
+    """A named preset, freshly built (never a shared mutable instance).
+
+    An unknown name -- or one that does not apply to this instrument -- falls
+    back to `default_preset`, which is what makes switching the instrument in a
+    picker a safe operation rather than one that can leave the builder holding
+    a rule set it refuses to run.
+    """
+    build = PRESETS.get(name or "")
+    if build is None or build().unreadable_on(ticker):
+        build = PRESETS[default_preset(ticker)]
+    return build()

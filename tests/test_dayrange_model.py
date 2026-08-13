@@ -21,22 +21,30 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from agent_stonks import clock
+from agent_stonks import apple_models, clock
 
 D = pytest.importorskip("agent_stonks.dayrange_model")
 
 NOTEBOOK = Path(
     "/Users/aleksandra/Documents/playground/Code/FinNotebooks/TimeToChange3"
 )
-SIM_DATE = pd.Timestamp("2026-08-07")
+
+# Every ticker TimeToChange3 was run for, from the registry rather than a list
+# here -- adding one there should extend the mirror check rather than leave it
+# silently covering the old set.
+TICKERS = list(apple_models.DAYRANGE_TICKERS)
 
 needs_model = pytest.mark.skipif(
     not D.model_path().exists(), reason="the TimeToChange3 bundle is not installed"
 )
-needs_notebook_data = pytest.mark.skipif(
-    not (NOTEBOOK / "data/minute.parquet").exists(),
-    reason="the TimeToChange3 notebook data is not on this machine",
-)
+
+
+def _notebook_data(ticker: str) -> "tuple[Path, Path]":
+    """Where the notebooks keep one ticker's minute and daily frames."""
+    return (
+        NOTEBOOK / "data" / ticker / "minute.parquet",
+        NOTEBOOK / "data" / ticker / "daily.parquet",
+    )
 
 
 def synthetic_daily(n: int = 400, start: str = "2025-01-02") -> pd.DataFrame:
@@ -319,36 +327,47 @@ class TestBundle:
             D.reset_bundle_cache()
 
 
-@needs_model
-@needs_notebook_data
+@pytest.mark.parametrize("ticker", TICKERS)
 class TestAgainstTheNotebook:
-    """The mirror contract, pinned to notebook 05's recorded forecast.
+    """The mirror contract, pinned to notebook 05's recorded forecast -- once
+    per ticker TimeToChange3 was fitted for.
 
     Exact rather than approximate: every step from the raw daily frame to the
     predicted price is deterministic, so any difference at all means this copy
-    and `dayrange/features.py` have diverged.
+    and `dayrange/features.py` have diverged. Running it for all three also
+    pins the thing a single-ticker check cannot: that `model_path(ticker)`
+    reaches the *right* bundle, since the GOOGL model reproducing GOOGL's
+    recorded forecast is only possible if it was the one that loaded.
+
+    The session each one is checked on is the one that bundle recorded
+    (`sim_date_forecast.date`), which is its own held-out day rather than a
+    date fixed here.
     """
 
     @pytest.fixture
-    def inputs(self):
-        minute = pd.read_parquet(NOTEBOOK / "data/minute.parquet")
-        daily = pd.read_parquet(NOTEBOOK / "data/daily.parquet")[
-            ["open", "high", "low", "close", "volume"]
-        ]
-        return minute[minute["date"] == SIM_DATE], daily
+    def inputs(self, ticker):
+        minute_file, daily_file = _notebook_data(ticker)
+        if not minute_file.exists():
+            pytest.skip(f"the TimeToChange3 {ticker} notebook data is not on this machine")
+        bundle = D.load_bundle(ticker)
+        if bundle is None:
+            pytest.skip(f"the TimeToChange3 {ticker} bundle is not installed")
+        day = pd.Timestamp(bundle["metadata"]["sim_date_forecast"]["date"])
+        minute = pd.read_parquet(minute_file)
+        daily = pd.read_parquet(daily_file)[["open", "high", "low", "close", "volume"]]
+        return bundle, day, minute[minute["date"] == day], daily
 
     def test_reproduces_the_recorded_forecast_exactly(self, inputs):
-        bars, daily = inputs
-        bundle = D.load_bundle()
+        bundle, day, bars, daily = inputs
         out = D.forecast_session(
             bundle,
-            daily[daily.index < SIM_DATE],
+            daily[daily.index < day],
             bars.iloc[: D.opening_minutes(bundle)],
-            SIM_DATE,
+            day,
             # The official opening print, which is what
             # `historical.fetch_session_open` supplies live and what the
             # notebook's daily frame carries.
-            open_price=float(daily.loc[SIM_DATE, "open"]),
+            open_price=float(daily.loc[day, "open"]),
         )
         recorded = bundle["metadata"]["sim_date_forecast"]
         for key in ("prev_avg", "pred_high", "pred_low", "adr14_abs"):
@@ -357,13 +376,21 @@ class TestAgainstTheNotebook:
     def test_the_minute_open_fallback_costs_a_few_cents_not_a_different_answer(self, inputs):
         """Without the official print the first minute bar's open stands in.
         The two differ on about half of sessions; this pins the size of that
-        substitution against the model's own $2.12 mean error, so a change that
-        made the fallback matter would show up here."""
-        bars, daily = inputs
-        bundle = D.load_bundle()
+        substitution against the model's own mean error (about $2 on AAPL), so
+        a change that made the fallback matter would show up here."""
+        bundle, day, bars, daily = inputs
         recorded = bundle["metadata"]["sim_date_forecast"]
         fallback = D.forecast_session(
-            bundle, daily[daily.index < SIM_DATE],
-            bars.iloc[: D.opening_minutes(bundle)], SIM_DATE, open_price=None,
+            bundle, daily[daily.index < day],
+            bars.iloc[: D.opening_minutes(bundle)], day, open_price=None,
         )
         assert abs(fallback["pred_high"] - recorded["pred_high"]) < 0.25
+
+    def test_the_bundle_that_loaded_is_the_one_that_was_asked_for(self, ticker):
+        """A path bug that fell back to the default would otherwise show up as
+        a forecast that is merely wrong rather than as a wrong model."""
+        bundle = D.load_bundle(ticker)
+        if bundle is None:
+            pytest.skip(f"the TimeToChange3 {ticker} bundle is not installed")
+        assert bundle["ticker"] == ticker
+        assert D.model_path(ticker).name.endswith(f"_{ticker}.joblib")

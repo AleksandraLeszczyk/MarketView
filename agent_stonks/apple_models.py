@@ -33,6 +33,26 @@ they made *identical* trades. So `nbeats` is a switch, not a promotion.
 number. It answers a different question, on a different horizon, and it brings
 its own trading rules with it.
 
+Which symbols a model exists for
+--------------------------------
+A model is fitted on one ticker and the notebooks make no claim that any of
+them transfers, so "which model" and "which instrument" are one question rather
+than two. `AppleModel.tickers` is the answer, and it is deliberately a property
+of the model rather than of the app:
+
+    persistence, nbeats   AAPL only -- TimeToChange2 was never run on anything
+                          else.
+    dayrange              AAPL, GOOGL and INTC -- TimeToChange3's pipeline was
+                          run per ticker, and each run produced its own bundle.
+
+Everything downstream reads `models_for(ticker)` instead of `MODELS`, which is
+what makes an instrument with no model at all a supported choice rather than a
+broken one: the agent that reads no model still has the tape, the momentum
+regime, the position and the clock, and those are the same everywhere. Adding a
+ticker to a model here (plus its bundle in `Code/Models`) is the whole change
+needed to offer it -- ORCL, for instance, is trained in `FinNotebooks/Models`
+and is one entry away.
+
 What "one interface" means, and where it stops
 ----------------------------------------------
 `persistence` and `nbeats` share everything before the scoring step: bars,
@@ -73,6 +93,15 @@ from .config import APPLE_TRADER_MODEL
 STRATEGY_MOMENTUM = "momentum"
 STRATEGY_DAYRANGE = "dayrange"
 
+# The symbol everything here defaults to: the one every model covers, and the
+# only one Apple Trader (the first) ever trades.
+DEFAULT_TICKER = "AAPL"
+
+# Which symbols each model was fitted on. TimeToChange2 (the two momentum
+# models) was only ever run on AAPL; TimeToChange3 was run per ticker.
+MOMENTUM_TICKERS = (DEFAULT_TICKER,)
+DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
+
 
 @dataclass(frozen=True)
 class AppleModel:
@@ -95,29 +124,39 @@ class AppleModel:
     # fact available before a 200 MB dependency is imported, so a picker can
     # label the choice. Meaningless outside `STRATEGY_MOMENTUM`.
     anticipates: bool
-    # Registry data, not the entry point: everything loads through `load(key)`
-    # below, so there is one seam for tests to replace and one place a caller
-    # can reach a model from.
-    load: Callable[[], "dict | None"]
-    path: Callable[[], Path]
+    # The symbols this model was fitted on. A model is not available for
+    # anything else -- see the module docstring -- and `load`/`path` are only
+    # ever called with one of these.
+    tickers: "tuple[str, ...]"
+    # Registry data, not the entry point: everything loads through
+    # `load(key, ticker)` below, so there is one seam for tests to replace and
+    # one place a caller can reach a model from.
+    load: Callable[[str], "dict | None"]
+    path: Callable[[str], Path]
+
+    def covers(self, ticker: "str | None") -> bool:
+        return (ticker or DEFAULT_TICKER).upper() in self.tickers
 
 
-def _load_persistence() -> "dict | None":
+def _load_persistence(ticker: str = DEFAULT_TICKER) -> "dict | None":
     """The incumbent bundle.
 
     A wrapper rather than `persistence_model.load_bundle` itself, so the lookup
     happens when the model is asked for. Binding the function object into the
     registry at import time would freeze it past any later replacement -- which
     is exactly what a test that stubs out a missing model does.
+
+    The ticker is accepted and ignored: there is one AAPL bundle, and `load`
+    below has already refused every other symbol by the time this is called.
     """
     return persistence_model.load_bundle()
 
 
-def _persistence_path() -> Path:
+def _persistence_path(ticker: str = DEFAULT_TICKER) -> Path:
     return persistence_model.model_path()
 
 
-def _load_nbeats() -> "dict | None":
+def _load_nbeats(ticker: str = DEFAULT_TICKER) -> "dict | None":
     """The N-BEATS bundle, or None if torch is not installed.
 
     Imported here rather than at module scope so that `import apple_models`
@@ -131,7 +170,7 @@ def _load_nbeats() -> "dict | None":
     return nbeats_model.load_bundle()
 
 
-def _nbeats_path() -> Path:
+def _nbeats_path(ticker: str = DEFAULT_TICKER) -> Path:
     try:
         from . import nbeats_model
     except ImportError:
@@ -139,8 +178,9 @@ def _nbeats_path() -> Path:
     return nbeats_model.model_path()
 
 
-def _load_dayrange() -> "dict | None":
-    """The TimeToChange3 bundle, or None if torch/LightGBM are not installed.
+def _load_dayrange(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """The TimeToChange3 bundle for one ticker, or None if torch/LightGBM are
+    not installed.
 
     Imported here rather than at module scope for the same reason `nbeats` is,
     and one more: this module pulls LightGBM in ahead of torch on purpose, and
@@ -151,15 +191,15 @@ def _load_dayrange() -> "dict | None":
         from . import dayrange_model
     except ImportError:
         return None
-    return dayrange_model.load_bundle()
+    return dayrange_model.load_bundle(ticker)
 
 
-def _dayrange_path() -> Path:
+def _dayrange_path(ticker: str = DEFAULT_TICKER) -> Path:
     try:
         from . import dayrange_model
     except ImportError:
-        return Path("timetochange3_dayrange_AAPL.joblib")
-    return dayrange_model.model_path()
+        return Path(f"timetochange3_dayrange_{(ticker or DEFAULT_TICKER).upper()}.joblib")
+    return dayrange_model.model_path(ticker)
 
 
 PERSISTENCE_KEY = "persistence"
@@ -178,6 +218,7 @@ MODELS: "dict[str, AppleModel]" = {
         requires="scikit-learn and joblib",
         strategy=STRATEGY_MOMENTUM,
         anticipates=False,
+        tickers=MOMENTUM_TICKERS,
         load=_load_persistence,
         path=_persistence_path,
     ),
@@ -193,6 +234,7 @@ MODELS: "dict[str, AppleModel]" = {
         requires="PyTorch, plus the residual sidecar beside the checkpoint",
         strategy=STRATEGY_MOMENTUM,
         anticipates=True,
+        tickers=MOMENTUM_TICKERS,
         load=_load_nbeats,
         path=_nbeats_path,
     ),
@@ -213,6 +255,7 @@ MODELS: "dict[str, AppleModel]" = {
         # Not applicable: nothing here forecasts a momentum regime. The entry
         # mode is not part of this strategy's configuration at all.
         anticipates=False,
+        tickers=DAYRANGE_TICKERS,
         load=_load_dayrange,
         path=_dayrange_path,
     ),
@@ -226,6 +269,36 @@ def keys() -> "list[str]":
     return list(MODELS)
 
 
+def keys_for(ticker: "str | None") -> "list[str]":
+    """The model keys that exist for one symbol, in picker order.
+
+    Empty for a symbol nothing was fitted on, which is a supported answer: the
+    rules written on the tape, the momentum regime, the position and the clock
+    need no model at all.
+    """
+    return [key for key, model in MODELS.items() if model.covers(ticker)]
+
+
+def tickers() -> "list[str]":
+    """Every symbol some model covers, with the default first.
+
+    What a picker offers as the *known* instruments. It is not a whitelist --
+    anything that is streamed can be traded on model-free rules -- so callers
+    that offer a free-text choice should union this with what they have.
+    """
+    seen: "list[str]" = []
+    for model in MODELS.values():
+        for symbol in model.tickers:
+            if symbol not in seen:
+                seen.append(symbol)
+    return sorted(seen, key=lambda s: (s != DEFAULT_TICKER, s))
+
+
+def covers(key: "str | None", ticker: "str | None") -> bool:
+    """Whether the named model exists for this symbol at all."""
+    return get(key).covers(ticker)
+
+
 def get(key: "str | None") -> AppleModel:
     """The named model, falling back to the default for an unknown key.
 
@@ -236,16 +309,32 @@ def get(key: "str | None") -> AppleModel:
     return MODELS.get(key or DEFAULT_MODEL) or MODELS[DEFAULT_MODEL]
 
 
-def load(key: "str | None") -> "dict | None":
-    """The named model's bundle, or None when it cannot be assembled."""
-    return get(key).load()
+def load(key: "str | None", ticker: "str | None" = None) -> "dict | None":
+    """The named model's bundle for one symbol, or None when it cannot be
+    assembled.
 
-
-def unavailable_reason(key: "str | None") -> str:
-    """Why `load` returned None, in the terms a user can act on."""
+    A symbol the model was never fitted on is refused here rather than in each
+    loader, so "no such model for this ticker" and "the file is missing" are one
+    answer to the caller and `unavailable_reason` can tell them apart.
+    """
+    symbol = (ticker or DEFAULT_TICKER).upper()
     model = get(key)
+    if not model.covers(symbol):
+        return None
+    return model.load(symbol)
+
+
+def unavailable_reason(key: "str | None", ticker: "str | None" = None) -> str:
+    """Why `load` returned None, in the terms a user can act on."""
+    symbol = (ticker or DEFAULT_TICKER).upper()
+    model = get(key)
+    if not model.covers(symbol):
+        return (
+            f"There is no {model.label} model for {symbol} — it was fitted on "
+            f"{', '.join(model.tickers)} only, and nothing claims it transfers."
+        )
     return (
-        f"No {model.label} model at {model.path()} "
+        f"No {model.label} model at {model.path(symbol)} "
         f"(or {model.requires} are not installed)."
     )
 

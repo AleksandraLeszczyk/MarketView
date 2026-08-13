@@ -212,15 +212,14 @@ def _render_apple2_rules() -> None:
     engine applies around whatever list it is handed, and which of the shipped
     strategies can be reproduced in it (all of them).
     """
-    ticker = rule_agent(APPLE_TRADER2_KEY).ticker
     st.markdown(
-        f"The same fixed loop over **{ticker}** minute bars as Apple Trader, with the "
-        "strategy taken out of the code. A run is configured with a **list of action "
-        "items**, each one a buy or a sell, a size, and the conditions that arm it — "
-        "written in the **Simulate** tab and carried on the experiment record, the way a "
-        "prompt is for an LLM agent. Like Apple Trader it states no reasoning of its own, "
-        "so the judge never scores it: profit, profit efficiency and the oracle ceiling "
-        "are the whole verdict."
+        "The same fixed loop over one symbol's minute bars as Apple Trader, with the "
+        "strategy taken out of the code. A run is configured with an **instrument** and "
+        "a **list of action items**, each one a buy or a sell, a size, and the "
+        "conditions that arm it — written in the **Simulate** tab and carried on the "
+        "experiment record, the way a prompt is for an LLM agent. Like Apple Trader it "
+        "states no reasoning of its own, so the judge never scores it: profit, profit "
+        "efficiency and the oracle ceiling are the whole verdict."
     )
 
     st.markdown("##### What one rule is")
@@ -258,7 +257,18 @@ def _render_apple2_rules() -> None:
         "`persistence.proba` are two models answering the same question and a rule set "
         "may name both. What each number is worth is the same open question it is under "
         "Apple Trader — see that agent's page, and read the AUC caveats there before "
-        "building a rule on one."
+        "building a rule on one. This is the full catalogue, which is what "
+        f"{apple_models.DEFAULT_TICKER} offers; every other instrument gets the subset "
+        "its models cover — "
+        + "; ".join(
+            f"**{symbol}**: "
+            + ", ".join(
+                apple_models.get(k).label for k in apple_models.keys_for(symbol)
+            )
+            for symbol in apple_models.tickers()
+        )
+        + ". Anything else reads the tape, the momentum regime, the position and the "
+        "clock only."
     )
     signal_catalogue()
 
@@ -279,7 +289,7 @@ def _render_apple_rules() -> None:
     asks a question on every bar, the other asks one at 9:35 and then works
     two price levels.
     """
-    ticker = rule_agent(APPLE_TRADER_KEY).ticker
+    ticker = rule_agent(APPLE_TRADER_KEY).default_ticker
     st.markdown(
         f"A fixed loop over **{ticker}** minute bars with no LLM anywhere in it. Which "
         "rules it runs is decided by which saved model it is pointed at, chosen per "
@@ -992,16 +1002,19 @@ def _render_model_picker() -> tuple[list[tuple[str, str]], dict[str, str]]:
 
 
 def _rule_agents_missing_ticker(
-    personalities: list[str], dataset_scope: dict, selected_names: list[str]
+    rule_configs: dict, dataset_scope: dict, selected_names: list[str]
 ) -> dict[str, list[str]]:
-    """Rule agent -> the selected datasets that do not carry its one symbol.
+    """Rule agent -> the selected datasets that do not carry the symbol its
+    configuration trades.
 
     A dataset without it is not a strategy result, it is a run that cannot
-    trade, so it is worth catching before the experiments are queued.
+    trade, so it is worth catching before the experiments are queued. Keyed on
+    the config rather than the agent because Apple Trader 2's symbol is one of
+    its settings.
     """
     missing: dict[str, list[str]] = {}
-    for personality in personalities:
-        ticker = rule_agent(personality).ticker
+    for personality, config in rule_configs.items():
+        ticker = rule_agent(personality).ticker(config)
         names = [
             name for name in selected_names
             if ticker not in (dataset_scope[name]["symbols"] or [])
@@ -1011,21 +1024,30 @@ def _rule_agents_missing_ticker(
     return missing
 
 
-def _render_rule_params(personalities: list[str]) -> dict:
+def _rule_ticker(personality: str, rule_configs: dict) -> str:
+    """The symbol this agent's current configuration trades."""
+    agent = rule_agent(personality)
+    config = rule_configs.get(personality)
+    return agent.ticker(config) if config is not None else agent.default_ticker
+
+
+def _render_rule_params(personalities: list[str], symbols: list[str]) -> dict:
     """One rule set per selected rule agent, the way one prompt per personality
     applies to every LLM combination.
 
     Keyed by personality, since rule agents share no tunables at all -- the
-    returned configs are what the queued experiments carry.
+    returned configs are what the queued experiments carry. `symbols` is every
+    symbol the selected datasets carry, offered to the one agent that picks its
+    own instrument.
     """
     renderers = {
-        APPLE_TRADER_KEY: _render_apple_params,
-        APPLE_TRADER2_KEY: _render_apple2_params,
+        APPLE_TRADER_KEY: lambda: _render_apple_params(),
+        APPLE_TRADER2_KEY: lambda: _render_apple2_params(symbols),
     }
     return {key: renderers[key]() for key in personalities if key in renderers}
 
 
-def _render_apple2_params() -> AppleTrader2Config:
+def _render_apple2_params(symbols: list[str]) -> AppleTrader2Config:
     """Apple Trader 2's rule set for this batch.
 
     The same builder the live dashboard renders, under its own widget prefix --
@@ -1035,17 +1057,21 @@ def _render_apple2_params() -> AppleTrader2Config:
 
     There is no model picker: which bundles a run loads falls out of which
     signals the rules read, so a rule set written on price and momentum queues
-    without needing any saved artifact at all.
+    without needing any saved artifact at all. There *is* an instrument picker,
+    seeded with the symbols the selected datasets carry -- a run reads one
+    symbol's bars and a dataset without it cannot be replayed, which is what
+    `_rule_agents_missing_ticker` checks before anything is queued.
     """
     with st.expander("Apple Trader 2 rules", expanded=True):
         st.caption(
             "One list of buy/sell rules, checked in order on every closed minute bar. "
             "Each rule is an action, a size and the conditions that arm it, joined by "
             "AND or OR; the first rule that matches *and* can transact takes the bar. "
-            "The rule set is the configuration Results groups these runs by, so moving "
-            "one number queues a new configuration to compare rather than a repeat."
+            "The instrument and the rule set together are the configuration Results "
+            "groups these runs by, so moving one number queues a new configuration to "
+            "compare rather than a repeat."
         )
-        return rules_panel("sim_apple_trader2")
+        return rules_panel("sim_apple_trader2", symbols=symbols)
 
 
 def _render_apple_params() -> AppleTraderConfig:
@@ -1277,7 +1303,16 @@ def render_simulate_tab() -> None:
     )
     llm_personalities = [p for p in personalities if sim_prompts.has_prompt(p)]
     rule_personalities = [p for p in personalities if not sim_prompts.has_prompt(p)]
-    rule_configs = _render_rule_params(rule_personalities)
+    # Every symbol the selected datasets carry: what an agent that picks its own
+    # instrument can actually be replayed on.
+    dataset_symbols = sorted(
+        {
+            symbol
+            for name in selected_names
+            for symbol in (dataset_scope[name]["symbols"] or [])
+        }
+    )
+    rule_configs = _render_rule_params(rule_personalities, dataset_symbols)
     # The model picker only sizes the LLM grid: a rule agent runs the same
     # way whatever is selected there, so it is queued once per dataset instead.
     model_choices, api_keys = (
@@ -1353,12 +1388,12 @@ def render_simulate_tab() -> None:
     if overridden:
         labels = ", ".join(_agent_label(p) for p in overridden)
         st.caption(f":material/edit: Runs with a **modified** prompt (Agents tab): {labels}.")
-    missing_ticker = _rule_agents_missing_ticker(rule_personalities, dataset_scope,
+    missing_ticker = _rule_agents_missing_ticker(rule_configs, dataset_scope,
                                                  selected_names)
     for personality, names_missing in missing_ticker.items():
         st.error(
-            f":material/error: {_agent_label(personality)} only trades "
-            f"{rule_agent(personality).ticker}, which is not selected for: "
+            f":material/error: {_agent_label(personality)} is configured to trade "
+            f"{_rule_ticker(personality, rule_configs)}, which is not selected for: "
             f"{', '.join(names_missing)}."
         )
     st.caption(
@@ -1407,7 +1442,7 @@ def render_simulate_tab() -> None:
         elif missing_ticker:
             personality, names_missing = next(iter(missing_ticker.items()))
             st.error(
-                f"Add {rule_agent(personality).ticker} to the symbols of "
+                f"Add {_rule_ticker(personality, rule_configs)} to the symbols of "
                 f"{', '.join(names_missing)}, or deselect "
                 f"{_agent_label(personality)}."
             )

@@ -527,7 +527,7 @@ def _dayrange():
     return dayrange_model
 
 
-def fetch_opening_window(state: AppState, frame, want: int):
+def fetch_opening_window(state: AppState, frame, want: int, ticker: str = TICKER):
     """The first `want` regular-session bars of today, or a clear failure.
 
     The live buffer normally holds them -- it keeps the whole session -- but an
@@ -541,7 +541,9 @@ def fetch_opening_window(state: AppState, frame, want: int):
     Module-level rather than a method because both day-range consumers need it
     and they are not related by inheritance: `DayRangeTrader` here, and Apple
     Trader 2's `SessionForecaster`, which makes the same forecast only when some
-    rule asks for it.
+    rule asks for it. `ticker` exists for that second caller -- this agent only
+    ever trades AAPL, that one picks its instrument -- and only matters on the
+    re-fetch path, since `frame` is already the right symbol's bars.
     """
     first = frame.iloc[:want]
     if float(first["minutes_from_open"].iloc[0]) < 1.0:
@@ -552,7 +554,7 @@ def fetch_opening_window(state: AppState, frame, want: int):
     if open_utc is not None and state.api_key and state.api_secret:
         try:
             window = agent_mod.fetch_bars_window(
-                TICKER, "1Min", open_utc,
+                ticker, "1Min", open_utc,
                 open_utc + timedelta(minutes=want),
                 state.api_key, state.api_secret, state.feed,
             )

@@ -865,7 +865,7 @@ class TestDayRangeEngine:
             seen["open_price"] = open_price
             return dict(self.FORECAST)
 
-        monkeypatch.setattr(dayrange, "load_bundle", lambda: bundle)
+        monkeypatch.setattr(dayrange, "load_bundle", lambda ticker=None: bundle)
         monkeypatch.setattr(dayrange, "forecast_session", forecast)
         return seen
 
@@ -938,7 +938,7 @@ class TestDayRangeEngine:
 
     def test_a_missing_bundle_fails_loudly(self, dayrange_store, monkeypatch):
         dayrange = pytest.importorskip("agent_stonks.dayrange_model")
-        monkeypatch.setattr(dayrange, "load_bundle", lambda: None)
+        monkeypatch.setattr(dayrange, "load_bundle", lambda ticker=None: None)
         market = SimMarket(["AAPL"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
@@ -1012,11 +1012,11 @@ class TestAppleTrader2Engine:
         }
     }
 
-    def _run(self, rule_config: "dict | None" = None):
-        market = SimMarket(["AAPL"], [DAY])
+    def _run(self, rule_config: "dict | None" = None, symbol: str = "AAPL"):
+        market = SimMarket([symbol], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER2_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=["AAPL"], days=[DAY], starting_cash=10_000.0,
+            api_key="", symbols=[symbol], days=[DAY], starting_cash=10_000.0,
             rule_config=rule_config or self.RULES,
         )
         return SimulationEngine(market, config).run()
@@ -1056,6 +1056,32 @@ class TestAppleTrader2Engine:
         )
         assert "only trades AAPL" in (SimulationEngine(market, config).run().error or "")
 
+    def test_the_symbol_it_trades_comes_from_the_record(self, tmp_path, monkeypatch):
+        """The same rules over another instrument. Nothing about the day loop
+        changes -- which is the claim worth pinning, since the ticker moved from
+        a constant on the agent to a field on the config."""
+        monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
+        monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
+        prices = (
+            [100.0 + 0.03 * (i + 1) for i in range(40)]
+            + [101.2 - 0.06 * (i + 1) for i in range(20)]
+        )
+        sim_data._write_gz(
+            sim_data.bars_path("GOOGL", DAY),
+            [_bar(OPEN_UTC + timedelta(minutes=i), price) for i, price in enumerate(prices)],
+        )
+
+        result = self._run({**self.RULES, "ticker": "GOOGL"}, symbol="GOOGL")
+        assert result.error is None
+        assert [d["symbol"] for d in result.decisions][:2] == ["GOOGL", "GOOGL"]
+        assert result.config_summary["rule_config"]["ticker"] == "GOOGL"
+
+    def test_the_dataset_is_checked_against_the_configured_symbol(self, apple_store):
+        """An AAPL dataset and a GOOGL rule set is a run that cannot trade, and
+        it is caught before it produces an empty ledger."""
+        result = self._run({**self.RULES, "ticker": "GOOGL"})
+        assert "only trades GOOGL" in (result.error or "")
+
 
 class TestRuleAgentRegistry:
     """What the engine, the runner and the UI rely on being true of *every*
@@ -1065,7 +1091,11 @@ class TestRuleAgentRegistry:
         assert set(RULE_AGENTS) == {APPLE_TRADER_KEY, APPLE_TRADER2_KEY}
         for key, agent in RULE_AGENTS.items():
             assert agent.key == key
-            assert agent.ticker and agent.label
+            assert agent.default_ticker and agent.label
+            # The symbol is asked of a config, not of the agent: one of the two
+            # has it fixed and the other configurable, and the engine's dataset
+            # check has to work the same way for both.
+            assert agent.ticker(agent.from_record(None)) == agent.default_ticker
             # Prompt-driven and rule-driven are the two kinds of agent, and no
             # agent is both: the UI splits the picker on exactly this.
             assert not sim_prompts.has_prompt(key)

@@ -135,10 +135,17 @@ from . import market_hours  # noqa: E402
 # the momentum bundles and the LevelsML pack already live. The path names the
 # joblib; the two checkpoints and the metadata sit beside it under the same
 # stem, exactly as `dayrange.modeling.save_bundle` wrote them.
+#
+# One bundle per ticker, because TimeToChange3 fits one per ticker: the same
+# pipeline was run over AAPL, GOOGL and INTC and each produced its own daily
+# models, its own opening ridge and its own metadata. Nothing here is shared
+# between them but the code, so the ticker is an argument rather than a setting
+# -- `apple_models.DAYRANGE_TICKERS` is the list, and `apple_trader2` passes the
+# one its config names.
 MODEL_PATH_ENV = "APPLE_DAYRANGE_MODEL"
-DEFAULT_MODEL_PATH = (
-    Path(__file__).resolve().parents[2] / "Models" / "timetochange3_dayrange_AAPL.joblib"
-)
+DEFAULT_TICKER = "AAPL"
+MODEL_DIR = Path(__file__).resolve().parents[2] / "Models"
+DEFAULT_MODEL_PATH = MODEL_DIR / f"timetochange3_dayrange_{DEFAULT_TICKER}.joblib"
 
 # How many minutes of the open the forecast is allowed to look at. Not a
 # tunable: the opening ridge was fitted on exactly this window.
@@ -166,7 +173,11 @@ MIN_DAILY_SESSIONS = 253
 EPS = 1e-12
 
 _lock = threading.Lock()
-_cache: dict = {"path": None, "bundle": None}
+# Keyed by path rather than a single slot, so a session that runs GOOGL after
+# AAPL does not evict and re-load a 1 MB bundle each time it switches. Failures
+# are cached under the same key (as None), which is what stops a per-minute loop
+# from re-hitting the filesystem for a file that is not there.
+_cache: "dict[Path, dict | None]" = {}
 
 
 # --- features (mirrors dayrange.features) -----------------------------------
@@ -623,13 +634,24 @@ def _register_unpickle_alias() -> None:
     sys.modules["dayrange.modeling"] = module
 
 
-def model_path() -> Path:
-    """Where the saved joblib is expected to live.
+def model_path(ticker: str = DEFAULT_TICKER) -> Path:
+    """Where one ticker's saved joblib is expected to live.
 
-    One file per stem, not one per ticker: TimeToChange3 fitted a single AAPL
-    model and its own results do not claim to transfer.
+    One file per ticker: TimeToChange3 fits the whole pipeline per symbol and
+    makes no claim that one transfers to another, so `timetochange3_dayrange_
+    GOOGL.joblib` is a different model rather than the same one pointed
+    elsewhere.
+
+    Two env overrides, and the difference matters. `APPLE_DAYRANGE_MODEL_<TICKER>`
+    relocates one ticker's bundle. The bare `APPLE_DAYRANGE_MODEL` names a single
+    file, so it can only mean the default ticker's -- letting it answer for every
+    symbol would hand a GOOGL run the AAPL model without saying so.
     """
-    return Path(os.environ.get(MODEL_PATH_ENV) or DEFAULT_MODEL_PATH)
+    symbol = (ticker or DEFAULT_TICKER).upper()
+    override = os.environ.get(f"{MODEL_PATH_ENV}_{symbol}")
+    if not override and symbol == DEFAULT_TICKER:
+        override = os.environ.get(MODEL_PATH_ENV)
+    return Path(override or MODEL_DIR / f"timetochange3_dayrange_{symbol}.joblib")
 
 
 def checkpoint_path(kind: str, path: "Path | None" = None) -> Path:
@@ -659,8 +681,9 @@ def _restore_seq(path: Path) -> SeqRegressor:
     return reg
 
 
-def load_bundle() -> "dict | None":
-    """The saved model plus its metadata, or None when it cannot be assembled.
+def load_bundle(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """One ticker's saved model plus its metadata, or None when it cannot be
+    assembled.
 
     Refuses rather than degrades in three cases, each of which would otherwise
     produce a forecast that looks fine and is not the model that was measured:
@@ -671,14 +694,14 @@ def load_bundle() -> "dict | None":
     * a checkpoint whose weights refuse to load onto these definitions, which
       is what a drifted mirror looks like from here.
 
-    Cached after the first load, including the failure, so a loop that asks
-    every minute doesn't re-hit the filesystem.
+    Cached per path after the first load, including the failure, so a loop that
+    asks every minute doesn't re-hit the filesystem.
     """
-    path = model_path()
+    path = model_path(ticker)
     with _lock:
-        if _cache["path"] == path:
-            return _cache["bundle"]
-        _cache.update(path=path, bundle=None)
+        if path in _cache:
+            return _cache[path]
+        _cache[path] = None
         try:
             import joblib
         except ImportError:
@@ -709,7 +732,7 @@ def load_bundle() -> "dict | None":
             use_constraint=bool(sk.get("use_constraint", True)), lookback=int(sk["lookback"]),
             daily_cols=sk["daily_cols"], metadata=metadata,
         )
-        _cache["bundle"] = {
+        _cache[path] = {
             "model": model,
             "metadata": metadata,
             "daily_models": list(models),
@@ -717,14 +740,18 @@ def load_bundle() -> "dict | None":
             "lookback": model.lookback,
             "trained_at": metadata.get("created"),
             "path": str(path),
+            # Which symbol this bundle was fitted on, as the file itself
+            # recorded it -- not the ticker that asked for it. A mismatch is
+            # worth being able to see rather than inferring from the filename.
+            "ticker": str(metadata.get("ticker") or "").upper() or None,
         }
-        return _cache["bundle"]
+        return _cache[path]
 
 
 def reset_bundle_cache() -> None:
-    """Drop the cached bundle (used by tests that swap the model file)."""
+    """Drop every cached bundle (used by tests that swap the model file)."""
     with _lock:
-        _cache.update(path=None, bundle=None)
+        _cache.clear()
 
 
 def opening_minutes(bundle: "dict | None" = None) -> int:
