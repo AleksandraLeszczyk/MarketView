@@ -527,6 +527,47 @@ def _dayrange():
     return dayrange_model
 
 
+def fetch_opening_window(state: AppState, frame, want: int):
+    """The first `want` regular-session bars of today, or a clear failure.
+
+    The live buffer normally holds them -- it keeps the whole session -- but an
+    agent started after 9:35 has a buffer that begins wherever the stream did,
+    and `frame.iloc[:want]` would then hand the model five bars from the middle
+    of the day as though they were the open. Rather than produce a confident
+    forecast off the wrong five minutes, the 09:30 window is re-fetched, exactly
+    as `agent._opening_range_for` does for the same reason and through the same
+    (simulation-patched) call.
+
+    Module-level rather than a method because both day-range consumers need it
+    and they are not related by inheritance: `DayRangeTrader` here, and Apple
+    Trader 2's `SessionForecaster`, which makes the same forecast only when some
+    rule asks for it.
+    """
+    first = frame.iloc[:want]
+    if float(first["minutes_from_open"].iloc[0]) < 1.0:
+        return first
+
+    open_utc = market_hours.session_open()
+    window = []
+    if open_utc is not None and state.api_key and state.api_secret:
+        try:
+            window = agent_mod.fetch_bars_window(
+                TICKER, "1Min", open_utc,
+                open_utc + timedelta(minutes=want),
+                state.api_key, state.api_secret, state.feed,
+            )
+        except Exception:
+            window = []
+    recovered = persistence_model.frame_from_bars(window)
+    if len(recovered) < want or float(recovered["minutes_from_open"].iloc[0]) >= 1.0:
+        raise ValueError(
+            f"the first {want} minutes of the session are not in the bar buffer "
+            f"(it starts at {frame.index[0]:%H:%M}) and could not be re-fetched; "
+            "the forecast is built on the 09:30 window and cannot be made without it."
+        )
+    return recovered.iloc[:want]
+
+
 def _order_quantity(cash: float, price: float, position_pct: float) -> float:
     """Shares that `position_pct` of `cash` buys at `price`, rounded down.
 
@@ -1100,39 +1141,7 @@ class DayRangeTrader:
         return True
 
     def _opening_window(self, state: AppState, frame, want: int):
-        """The first `want` regular-session bars of today, or a clear failure.
-
-        The live buffer normally holds them -- it keeps the whole session -- but
-        an agent started after 9:35 has a buffer that begins wherever the stream
-        did, and `frame.iloc[:want]` would then hand the model five bars from
-        the middle of the day as though they were the open. Rather than produce
-        a confident forecast off the wrong five minutes, the 09:30 window is
-        re-fetched, exactly as `agent._opening_range_for` does for the same
-        reason and through the same (simulation-patched) call.
-        """
-        first = frame.iloc[:want]
-        if float(first["minutes_from_open"].iloc[0]) < 1.0:
-            return first
-
-        open_utc = market_hours.session_open()
-        window = []
-        if open_utc is not None and state.api_key and state.api_secret:
-            try:
-                window = agent_mod.fetch_bars_window(
-                    TICKER, "1Min", open_utc,
-                    open_utc + timedelta(minutes=want),
-                    state.api_key, state.api_secret, state.feed,
-                )
-            except Exception:
-                window = []
-        recovered = persistence_model.frame_from_bars(window)
-        if len(recovered) < want or float(recovered["minutes_from_open"].iloc[0]) >= 1.0:
-            raise ValueError(
-                f"the first {want} minutes of the session are not in the bar buffer "
-                f"(it starts at {frame.index[0]:%H:%M}) and could not be re-fetched; "
-                "the forecast is built on the 09:30 window and cannot be made without it."
-            )
-        return recovered.iloc[:want]
+        return fetch_opening_window(state, frame, want)
 
     # --- the check on an open position -------------------------------------
 

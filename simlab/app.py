@@ -21,6 +21,7 @@ from agent_stonks import observability as obs
 from agent_stonks.agent import (
     AGENT_PERSONALITIES,
     PERSONALITY_TOOLS,
+    PREMARKET_PERSONALITY,
     _dispatch_tool,
     selectable_personalities,
 )
@@ -34,6 +35,8 @@ from agent_stonks.apple_trader import (
     RULE_PROVIDER,
     AppleTraderConfig,
 )
+from agent_stonks.apple_rules_ui import rules_panel, signal_catalogue
+from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY, AppleTrader2Config
 from agent_stonks.config import PALETTE
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
 from agent_stonks.market_hours import MARKET_TZ
@@ -55,8 +58,16 @@ _UNTESTABLE_TOOLS = {"submit_decision", "set_tactics", "stand_down"}
 
 def _testable_agents() -> list[str]:
     """Every agent SimLab can replay, in picker order: the LLM personalities
-    first, the rule-based ones last."""
-    return [*selectable_personalities(), *RULE_AGENTS]
+    first, the rule-based ones last.
+
+    The Premarket Analyst is hidden from SimLab only -- it stays wired
+    everywhere else (the app, the Automatic pre-open handoff, and the engine's
+    own premarket day loop), and past premarket runs still resolve their label,
+    avatar and prompt. Re-offering it is a one-line change here."""
+    return [
+        *(p for p in selectable_personalities() if p != PREMARKET_PERSONALITY),
+        *RULE_AGENTS,
+    ]
 
 
 def _agent_label(key: "str | None") -> str:
@@ -178,15 +189,86 @@ def _render_rule_agent(personality: str) -> None:
     """A rule agent's "prompt": its rules, and whatever they depend on.
 
     There is nothing to edit here the way a system prompt is edited -- the
-    thresholds are per-simulation settings, picked in the Simulate tab -- so
-    this is a read-only description of what the loop does.
+    thresholds (Apple Trader) and the rule list (Apple Trader 2) are
+    per-simulation settings, picked in the Simulate tab -- so this is a
+    read-only description of what the loop does.
     """
     st.subheader(_agent_label(personality))
     st.caption(
         ":material/function: Rule-based — no LLM, no prompt, no tools. The same tape "
         "always produces the same trades."
     )
+    if personality == APPLE_TRADER2_KEY:
+        _render_apple2_rules()
+        return
     _render_apple_rules()
+
+
+def _render_apple2_rules() -> None:
+    """What Apple Trader 2 is: a vocabulary, and whatever list is written in it.
+
+    Nothing to describe as *the* strategy, because there isn't one -- so what
+    this page owes the reader instead is the vocabulary itself, the rules the
+    engine applies around whatever list it is handed, and which of the shipped
+    strategies can be reproduced in it (all of them).
+    """
+    ticker = rule_agent(APPLE_TRADER2_KEY).ticker
+    st.markdown(
+        f"The same fixed loop over **{ticker}** minute bars as Apple Trader, with the "
+        "strategy taken out of the code. A run is configured with a **list of action "
+        "items**, each one a buy or a sell, a size, and the conditions that arm it — "
+        "written in the **Simulate** tab and carried on the experiment record, the way a "
+        "prompt is for an LLM agent. Like Apple Trader it states no reasoning of its own, "
+        "so the judge never scores it: profit, profit efficiency and the oracle ceiling "
+        "are the whole verdict."
+    )
+
+    st.markdown("##### What one rule is")
+    st.markdown(
+        "- **An action** — buy or sell.\n"
+        "- **A size** — a percentage (of cash on a buy, of the position on a sell), a "
+        "dollar amount, or a share count. Every mode is clipped to what the ledger can "
+        "do, so a rule set is portable across starting balances.\n"
+        "- **Conditions** — one or more, each a signal against a number, joined by "
+        "**AND** or **OR**. One joiner per rule: `A and B or C` has no meaning without "
+        "precedence rules, and a genuine mix is two rules.\n"
+        "- Optionally a **cooldown**: bars the rule sits out after firing, so a "
+        "condition that stays true ladders in only if that was the intent."
+    )
+
+    st.markdown("##### What the engine adds")
+    st.markdown(
+        "- **At most one action per closed bar**, and the **first matching rule wins** — "
+        "the list is a priority order. A rule that matches but cannot transact (a sell "
+        "with the book flat, a buy with no cash) is passed over rather than eating the "
+        "bar, so an exit written above an entry does not block it.\n"
+        "- **An absent signal never matches** — not in an AND and not in an OR. A model "
+        "asked about a bar it was not fitted for, a day-range forecast before 9:35, a "
+        "P&L with no position: all read as nothing, and nothing fires a rule.\n"
+        "- **The flatten before the close is not a rule** and cannot be deleted. Every "
+        "signal here is intraday and none survives the overnight gap.\n"
+        "- **Nothing is computed that no rule reads.** The bundles loaded are the ones "
+        "the conditions name, the day-range forecast is made only if something asks, and "
+        "conditions short-circuit within a rule."
+    )
+
+    st.markdown("##### The signals a condition can read")
+    st.caption(
+        "The models are here as *signals*, not as strategies: `nbeats.turn_proba` and "
+        "`persistence.proba` are two models answering the same question and a rule set "
+        "may name both. What each number is worth is the same open question it is under "
+        "Apple Trader — see that agent's page, and read the AUC caveats there before "
+        "building a rule on one."
+    )
+    signal_catalogue()
+
+    st.info(
+        ":material/lightbulb: Apple Trader's two strategies are both expressible here, "
+        "and ship as presets — so a rule set can be compared against the thing it was "
+        "meant to improve on rather than against an intuition. What the vocabulary adds "
+        "beyond them is partial exits, scaled entries, and conditions from one model "
+        "crossed with another's."
+    )
 
 
 def _render_apple_rules() -> None:
@@ -938,8 +1020,32 @@ def _render_rule_params(personalities: list[str]) -> dict:
     """
     renderers = {
         APPLE_TRADER_KEY: _render_apple_params,
+        APPLE_TRADER2_KEY: _render_apple2_params,
     }
     return {key: renderers[key]() for key in personalities if key in renderers}
+
+
+def _render_apple2_params() -> AppleTrader2Config:
+    """Apple Trader 2's rule set for this batch.
+
+    The same builder the live dashboard renders, under its own widget prefix --
+    the two apps run in separate processes, but the prefix is what keeps a rule
+    set edited here from being confused with one edited there if they ever do
+    not.
+
+    There is no model picker: which bundles a run loads falls out of which
+    signals the rules read, so a rule set written on price and momentum queues
+    without needing any saved artifact at all.
+    """
+    with st.expander("Apple Trader 2 rules", expanded=True):
+        st.caption(
+            "One list of buy/sell rules, checked in order on every closed minute bar. "
+            "Each rule is an action, a size and the conditions that arm it, joined by "
+            "AND or OR; the first rule that matches *and* can transact takes the bar. "
+            "The rule set is the configuration Results groups these runs by, so moving "
+            "one number queues a new configuration to compare rather than a repeat."
+        )
+        return rules_panel("sim_apple_trader2")
 
 
 def _render_apple_params() -> AppleTraderConfig:

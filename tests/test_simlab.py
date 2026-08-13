@@ -15,6 +15,7 @@ from agent_stonks.apple_trader import (
     AppleTraderConfig,
     config_signature,
 )
+from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY
 from simlab import data as sim_data
 from simlab import prompts as sim_prompts
 from simlab import results as sim_results
@@ -959,12 +960,109 @@ class TestDayRangeEngine:
         ).startswith("dayrange_AAPL(buy=")
 
 
+class TestAppleTrader2Engine:
+    """Apple Trader 2 on the same rule day loop, driven by a rule list.
+
+    The rule sets here are written on price and the position alone, which is
+    the point: a strategy that names no model needs no bundle on disk, so these
+    exercise the engine wiring rather than a stubbed forecast.
+    """
+
+    @pytest.fixture()
+    def apple_store(self, tmp_path, monkeypatch):
+        """A stored AAPL session that climbs, then gives back."""
+        monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
+        monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
+        prices = (
+            [100.0 + 0.03 * (i + 1) for i in range(40)]
+            + [101.2 - 0.06 * (i + 1) for i in range(20)]
+        )
+        bars = [
+            _bar(OPEN_UTC + timedelta(minutes=i), price, volume=1000.0 + 37 * (i % 13))
+            for i, price in enumerate(prices)
+        ]
+        sim_data._write_gz(sim_data.bars_path("AAPL", DAY), bars)
+        sim_data._write_gz(sim_data.daily_path("AAPL"), {
+            "symbol": "AAPL", "start": "2026-05-16", "end": "2026-06-15", "bars": [],
+        })
+        return tmp_path
+
+    RULES = {
+        "rules": {
+            "items": [
+                {
+                    "action": "sell", "size_mode": "pct", "size": 100.0, "join": "all",
+                    "label": "Trailing stop", "enabled": True, "cooldown_bars": 0,
+                    "conditions": [
+                        {"field": "pos.drawdown_pct", "op": "below", "value": -0.5}
+                    ],
+                },
+                {
+                    "action": "buy", "size_mode": "pct", "size": 95.0, "join": "all",
+                    "label": "Buy the dip", "enabled": True, "cooldown_bars": 0,
+                    # "while flat" is a condition here rather than a property of
+                    # the agent -- without it the same rule would add on every
+                    # later bar its price condition still holds.
+                    "conditions": [
+                        {"field": "pos.shares", "op": "below", "value": 0.0},
+                        {"field": "bar.price", "op": "above", "value": 100.5},
+                    ],
+                },
+            ]
+        }
+    }
+
+    def _run(self, rule_config: "dict | None" = None):
+        market = SimMarket(["AAPL"], [DAY])
+        config = SimulationConfig(
+            personality=APPLE_TRADER2_KEY, provider=RULE_PROVIDER, model="rules",
+            api_key="", symbols=["AAPL"], days=[DAY], starting_cash=10_000.0,
+            rule_config=rule_config or self.RULES,
+        )
+        return SimulationEngine(market, config).run()
+
+    def test_a_rule_list_replays_with_no_llm_and_no_model(self, apple_store):
+        result = self._run()
+        assert result.error is None
+        assert result.prompt_used is None and result.tool_names == []
+        assert result.cycles_run == 60
+
+    def test_it_buys_on_its_entry_rule_and_exits_on_its_stop(self, apple_store):
+        result = self._run()
+        actions = [(d["action"], d["status"]) for d in result.decisions]
+        assert actions[:2] == [("buy", "filled"), ("sell", "filled")]
+        buy, sell = result.decisions[0], result.decisions[1]
+        assert "Buy the dip" in buy["reasoning"] and "Rule 2" in buy["reasoning"]
+        assert "Trailing stop" in sell["reasoning"] and "Rule 1" in sell["reasoning"]
+        assert float(buy["price"]) < float(sell["price"])
+
+    def test_the_rule_list_is_what_the_record_carries(self, apple_store):
+        result = self._run()
+        assert result.config_summary["rule_based"] is True
+        stored = result.config_summary["rule_config"]
+        assert stored["rules"]["items"][1]["conditions"][1]["field"] == "bar.price"
+
+    def test_a_rule_set_that_cannot_work_fails_loudly(self, apple_store):
+        """Before the run, not after: an unrunnable set would otherwise finish
+        clean with an empty ledger that reads like a strategy result."""
+        result = self._run({"rules": {"items": []}})
+        assert "no enabled rules" in (result.error or "")
+
+    def test_a_dataset_without_the_ticker_fails_loudly(self, store):
+        market = SimMarket(["TEST"], [DAY])
+        config = SimulationConfig(
+            personality=APPLE_TRADER2_KEY, provider=RULE_PROVIDER, model="rules",
+            api_key="", symbols=["TEST"], days=[DAY], rule_config=self.RULES,
+        )
+        assert "only trades AAPL" in (SimulationEngine(market, config).run().error or "")
+
+
 class TestRuleAgentRegistry:
     """What the engine, the runner and the UI rely on being true of *every*
     rule agent, so adding one cannot half-wire it."""
 
     def test_every_rule_agent_is_replayable(self):
-        assert set(RULE_AGENTS) == {APPLE_TRADER_KEY}
+        assert set(RULE_AGENTS) == {APPLE_TRADER_KEY, APPLE_TRADER2_KEY}
         for key, agent in RULE_AGENTS.items():
             assert agent.key == key
             assert agent.ticker and agent.label

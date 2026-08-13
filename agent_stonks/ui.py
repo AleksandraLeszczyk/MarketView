@@ -33,6 +33,14 @@ from .apple_trader import (
     launch_apple_trader,
 )
 from .apple_trader import TICKER as APPLE_TRADER_TICKER
+from .apple_rules_ui import rules_panel, signal_catalogue
+from .apple_trader2 import (
+    APPLE_TRADER2_AVATAR,
+    APPLE_TRADER2_KEY,
+    APPLE_TRADER2_LABEL,
+    AppleTrader2Config,
+    launch_apple_trader2,
+)
 from .automatic import AUTOMATIC_AVATAR, AUTOMATIC_KEY, AUTOMATIC_LABEL, launch_automatic
 from .charts import (
     build_analysis_gauges,
@@ -143,12 +151,17 @@ def _effective_symbols(state: AppState, symbols_input: str) -> list[str]:
 
 
 # Agents that aren't LLM personalities and so have no entry in
-# AGENT_PERSONALITIES: the Automatic orchestrator and the rule-based Apple
-# Trader. They still need a label and a face in the picker.
+# AGENT_PERSONALITIES: the Automatic orchestrator and the two rule-based Apple
+# Traders. They still need a label and a face in the picker.
 _NON_LLM_AGENTS: dict[str, tuple[str, str]] = {
     AUTOMATIC_KEY: (AUTOMATIC_LABEL, AUTOMATIC_AVATAR),
     APPLE_TRADER_KEY: (APPLE_TRADER_LABEL, APPLE_TRADER_AVATAR),
+    APPLE_TRADER2_KEY: (APPLE_TRADER2_LABEL, APPLE_TRADER2_AVATAR),
 }
+
+# The agents that place their own orders from a fixed loop: no LLM key needed,
+# one symbol only, and their own parameter panel instead of provider/model.
+RULE_AGENT_KEYS = (APPLE_TRADER_KEY, APPLE_TRADER2_KEY)
 
 
 def _personality_label(key: str) -> str:
@@ -1831,6 +1844,26 @@ def _apple_momentum_params(
     )
 
 
+def _apple_trader2_params() -> AppleTrader2Config:
+    """Apple Trader 2's rules.
+
+    No model picker here, unlike Apple Trader: a model is not a strategy in this
+    agent, it is a signal a condition may name, and which ones get loaded falls
+    out of what the rules read. The whole configuration is the list.
+    """
+    with st.expander("Apple Trader 2 rules", expanded=True):
+        st.caption(
+            "Each rule is one action — buy or sell, how much, and the conditions that "
+            "arm it, joined by AND or OR. At most one rule fires per closed minute bar "
+            "and the first match wins, so the order is the priority. Start from a preset "
+            "and edit, or build one from scratch."
+        )
+        config = rules_panel("apple_trader2")
+        with st.expander("Every signal a condition can read"):
+            signal_catalogue()
+    return config
+
+
 def _agent_panel(
     symbols: list[str], alpaca_key: str = "", alpaca_secret: str = "", feed: str = "iex"
 ) -> None:
@@ -1848,14 +1881,17 @@ def _agent_panel(
         "always wakes up early when fresh news breaks for any of its tickers. No real "
         "orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}. "
-        "The one exception is Apple Trader, which has no LLM at all: it is a fixed loop "
-        "over a saved momentum-persistence model."
+        "The exceptions are the two Apple Traders, which have no LLM at all: one is a "
+        "fixed loop over a saved momentum-persistence model, the other runs a list of "
+        "buy/sell rules written in this panel."
     )
     with st.expander("LLM", expanded=True):
         # Automatic first: it's the regime-adaptive orchestrator that picks and
         # switches between the individual strategies on its own; the rule-based
         # Apple Trader last, since it is the odd one out (no model reasoning).
-        personality_keys = [AUTOMATIC_KEY, *selectable_personalities(), APPLE_TRADER_KEY]
+        personality_keys = [
+            AUTOMATIC_KEY, *selectable_personalities(), *RULE_AGENT_KEYS
+        ]
         personality = st.selectbox(
             "Personality",
             personality_keys,
@@ -1897,6 +1933,18 @@ def _agent_panel(
                 f"{APPLE_TRADER_TICKER} only — that is the one symbol the models were "
                 "fitted on — and the provider/model settings below do not apply to it."
             )
+        if personality == APPLE_TRADER2_KEY:
+            st.caption(
+                "🍏 Apple Trader 2 runs no LLM either, and no fixed strategy: it runs a "
+                "list of **buy/sell rules you write**. Each rule is an action (buy or "
+                "sell), a size (a percentage, a dollar amount or a share count) and the "
+                "conditions that arm it — a model's forecast, the momentum regime, the "
+                "price, the open position's P&L or give-back, the clock — joined with "
+                "AND or OR. One action per closed bar, first matching rule wins, and the "
+                "book is flattened before the close whatever the list says. It trades "
+                f"{APPLE_TRADER_TICKER} only, for the same reason, and the "
+                "provider/model settings below do not apply to it."
+            )
         provider = st.selectbox(
             "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
         )
@@ -1915,10 +1963,11 @@ def _agent_panel(
         state.llm_provider = provider
         state.llm_model = model
         env_var = ENV_KEYS[provider]
-        if not os.getenv(env_var) and personality != APPLE_TRADER_KEY:
+        if not os.getenv(env_var) and personality not in RULE_AGENT_KEYS:
             st.caption(f"⚠️ {env_var} is not set.")
 
     apple_config = _apple_trader_params() if personality == APPLE_TRADER_KEY else None
+    apple2_config = _apple_trader2_params() if personality == APPLE_TRADER2_KEY else None
 
     c1, c2, c3 = st.columns([1.2, 1, 1])
     starting_budget = c1.number_input(
@@ -1937,15 +1986,17 @@ def _agent_panel(
     if start_clicked:
         syms = list(symbols or state.symbols)
         is_apple_trader = personality == APPLE_TRADER_KEY
+        is_rule_agent = personality in RULE_AGENT_KEYS
         stream_ready = False
         if not syms:
             st.error("Enter at least one symbol in the sidebar first.")
-        elif is_apple_trader and APPLE_TRADER_TICKER not in syms:
+        elif is_rule_agent and APPLE_TRADER_TICKER not in syms:
             st.error(
-                f"Apple Trader only trades {APPLE_TRADER_TICKER} (the one symbol its model was "
-                f"fitted on); add {APPLE_TRADER_TICKER} to the symbols in the sidebar."
+                f"{_personality_label(personality)} only trades {APPLE_TRADER_TICKER} "
+                f"(the one symbol its models were fitted on); add {APPLE_TRADER_TICKER} "
+                "to the symbols in the sidebar."
             )
-        elif not llm_key and not is_apple_trader:
+        elif not llm_key and not is_rule_agent:
             st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")
         else:
             # The live stream feeds every tool the agent reads. If it isn't
@@ -1976,9 +2027,9 @@ def _agent_panel(
                     "tactics, other strategies study structure and arm plans for the "
                     "open instead of trading the stale tape."
                     + (
-                        " Apple Trader simply idles until the bell — it scores closed "
-                        "minute bars and there are none."
-                        if is_apple_trader
+                        " The Apple Traders simply idle until the bell — they score "
+                        "closed minute bars and there are none."
+                        if is_rule_agent
                         else ""
                     )
                 )
@@ -1992,6 +2043,13 @@ def _agent_panel(
                     state,
                     state.decision_tracker,
                     config=apple_config or AppleTraderConfig(),
+                    cycle_sec=APPLE_TRADER_CYCLE_SEC,
+                )
+            elif personality == APPLE_TRADER2_KEY:
+                launch_apple_trader2(
+                    state,
+                    state.decision_tracker,
+                    config=apple2_config or AppleTrader2Config(),
                     cycle_sec=APPLE_TRADER_CYCLE_SEC,
                 )
             elif personality == AUTOMATIC_KEY:
